@@ -1,50 +1,25 @@
+#![allow(dead_code)]
 mod crypto;
+mod dbus_api;
 
-use crypto::{decrypt_database, encrypt_database, KeyringDatabase, SecretItem};
-use std::collections::HashMap;
+use dbus_api::ServiceInterface;
+use std::error::Error;
 
-fn main() {
-    println!("=== VasakOS Keyring - Demo de Cifrado ===\n");
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let conn = zbus::connection::Builder::session()?
+        .name("org.freedesktop.Secrets")?
+        .build()
+        .await?;
 
-    let mut db = KeyringDatabase {
-        items: Vec::new(),
-    };
+    let service = ServiceInterface::new(conn.clone());
+    conn.object_server()
+        .at("/org/freedesktop/secrets", service)
+        .await
+        .map(|_| ())?;
 
-    let mut attrs = HashMap::new();
-    attrs.insert("service".into(), "github.com".into());
-    attrs.insert("username".into(), "vasak-user".into());
+    println!("vasak-keyring: D-Bus service 'org.freedesktop.Secrets' ready");
 
-    let item = SecretItem {
-        label: "GitHub Token".into(),
-        attributes: attrs,
-        secret: b"ghp_fakeToken12345abcdefghijklmnopqrstuv".to_vec(),
-    };
-
-    db.items.push(item);
-
-    println!("[+] Llavero creado con {} secreto(s).", db.items.len());
-    println!("    label ..: {}", db.items[0].label);
-    println!("    secret .: ({} bytes protegidos)\n", db.items[0].secret.len());
-
-    let password = "MiClaveMaestraSuperSegura2026!";
-    let encrypted = encrypt_database(&db, password).expect("Error al cifrar");
-
-    println!("[+] Cifrado exitoso ({} bytes en disco).\n", encrypted.len());
-
-    let decrypted = decrypt_database(&encrypted, password).expect("Error al descifrar");
-
-    println!("[+] Descifrado con contraseña CORRECTA:");
-    println!("    label .: {}", decrypted.items[0].label);
-    println!("    secret : {} (hex)", hex::encode(&decrypted.items[0].secret));
-
-    drop(decrypted);
-
-    println!();
-
-    match decrypt_database(&encrypted, "ContraseñaIncorrecta") {
-        Ok(_) => println!("[-] ERROR: descifrado con contraseña incorrecta"),
-        Err(e) => println!("[+] Fallo esperado con contraseña incorrecta: {}", e),
-    }
-
-    println!("\n=== Fin de la demostración ===");
+    std::future::pending::<()>().await;
+    Ok(())
 }

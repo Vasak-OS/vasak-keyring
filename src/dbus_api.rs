@@ -143,7 +143,7 @@ struct CollectionInfo {
     modified: u64,
 }
 
-struct KeyringState {
+pub struct KeyringState {
     sessions: HashMap<String, SessionInfo>,
     collections: HashMap<String, CollectionInfo>,
     items: HashMap<String, ItemInfo>,
@@ -153,7 +153,7 @@ struct KeyringState {
 }
 
 impl KeyringState {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
             collections: HashMap::new(),
@@ -484,11 +484,12 @@ pub struct ServiceInterface {
 }
 
 impl ServiceInterface {
-    pub fn new(conn: Connection) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(KeyringState::new())),
-            conn,
-        }
+    pub fn new(conn: Connection, state: Arc<Mutex<KeyringState>>) -> Self {
+        Self { state, conn }
+    }
+
+    pub fn new_default(conn: Connection) -> Self {
+        Self::new(conn, Arc::new(Mutex::new(KeyringState::new())))
     }
 
     pub async fn register_default_collection(&self) -> Result<(), zbus::fdo::Error> {
@@ -785,5 +786,96 @@ impl ServiceInterface {
             }
         }
         Ok(result)
+    }
+}
+
+// ── PAM unlock interface (called by pam_vasak_keyring.so) ──
+
+pub struct PamUnlockInterface {
+    state: Arc<Mutex<KeyringState>>,
+    conn: Connection,
+}
+
+impl PamUnlockInterface {
+    pub fn new(state: Arc<Mutex<KeyringState>>, conn: Connection) -> Self {
+        Self { state, conn }
+    }
+}
+
+#[interface(name = "org.vasak.Keyring")]
+impl PamUnlockInterface {
+    async fn unlock(&mut self, password: &str) -> Result<bool, zbus::fdo::Error> {
+        let path = match keyring_path() {
+            Some(p) => p,
+            None => return Ok(false),
+        };
+        if !path.exists() {
+            return Ok(false);
+        }
+        let raw = std::fs::read(&path).map_err(|e| dbus_err(format!("{e}")))?;
+        let db = match crypto::decrypt_database(&raw, password) {
+            Ok(db) => db,
+            Err(_) => return Ok(false),
+        };
+
+        let coll_path = "/org/freedesktop/secrets/collection/login".to_string();
+        let item_paths: Vec<String>;
+
+        {
+            let mut state = self.state.lock().await;
+
+            if !state.collections.contains_key(&coll_path) {
+                state.collections.insert(coll_path.clone(), CollectionInfo {
+                    label: "Default collection".into(),
+                    locked: false,
+                    items: vec![],
+                    created: now(),
+                    modified: now(),
+                });
+            }
+
+            let mut paths = Vec::new();
+            for (i, si) in db.items.iter().enumerate() {
+                let ip = format!("{coll_path}/items/{i}");
+                let info = ItemInfo {
+                    label: si.label.clone(),
+                    attributes: si.attributes.clone(),
+                    secret: si.secret.clone(),
+                    content_type: "text/plain".into(),
+                    created: now(),
+                    modified: now(),
+                };
+                state.items.insert(ip.clone(), info);
+                paths.push(ip);
+            }
+
+            if let Some(col) = state.collections.get_mut(&coll_path) {
+                col.items = paths.clone();
+            }
+            item_paths = paths;
+        }
+
+        for ip in &item_paths {
+            let iface = ItemInterface {
+                state: self.state.clone(),
+                conn: self.conn.clone(),
+                path: ip.clone(),
+            };
+            self.conn.object_server().at(ip.clone(), iface).await
+                .map(|_| ())
+                .map_err(|e| dbus_err(format!("{e}")))?;
+        }
+
+        let iface = CollectionInterface {
+            state: self.state.clone(),
+            conn: self.conn.clone(),
+            path: coll_path.clone(),
+            alias: "login".into(),
+        };
+        self.conn.object_server().at(coll_path, iface).await
+            .map(|_| ())
+            .map_err(|e| dbus_err(format!("{e}")))?;
+
+        Ok(true)
     }
 }

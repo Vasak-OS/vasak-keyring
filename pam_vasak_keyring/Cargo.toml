@@ -1,0 +1,13 @@
+[package]
+name = "pam-vasak-keyring"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+name = "pam_vasak_keyring"
+
+[dependencies]
+libc = "0.2"
+zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
+zeroize = "1"

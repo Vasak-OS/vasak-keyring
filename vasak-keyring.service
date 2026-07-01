@@ -1,0 +1,14 @@
+[Unit]
+Description=VasakOS Secret Service keyring daemon
+Documentation=https://github.com/Vasak-OS/vasak-keyring
+Requires=dbus.socket
+After=dbus.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/vasak-keyring
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

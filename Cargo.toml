@@ -1,3 +1,7 @@
+[workspace]
+members = ["pam_vasak_keyring"]
+resolver = "2"
+
 [package]
 name = "vasak-keyring"
 version = "0.1.0"

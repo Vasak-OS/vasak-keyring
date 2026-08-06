@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::{Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 use zbus::{interface, Connection};
 use zbus::zvariant::{self, OwnedObjectPath, OwnedValue, Value, Type};
 use serde::{Deserialize, Serialize};
@@ -57,23 +59,45 @@ fn keyring_path() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(data).join("vasak-keyring").join("keyring.db"))
 }
 
-fn master_password() -> Option<String> {
-    if let Ok(pwd) = std::env::var("VASAK_KEYRING_PASSWORD") {
-        return Some(pwd);
+/// In-memory master password (used to derive the DB key via Argon2). It is set
+/// at login by `pam_vasak_keyring` through the PAM unlock interface and is
+/// NEVER written to disk.
+fn master_store() -> &'static StdMutex<Option<Zeroizing<String>>> {
+    static STORE: OnceLock<StdMutex<Option<Zeroizing<String>>>> = OnceLock::new();
+    STORE.get_or_init(|| StdMutex::new(None))
+}
+
+/// Adopt `password` as the in-memory master password for this session.
+fn set_master_password(password: &str) {
+    if let Ok(mut guard) = master_store().lock() {
+        *guard = Some(Zeroizing::new(password.to_string()));
     }
-    let home = std::env::var("HOME").ok()?;
-    let cfg = std::env::var("XDG_CONFIG_HOME")
-        .unwrap_or_else(|_| format!("{home}/.config"));
-    let key_file = std::path::PathBuf::from(cfg).join("vasak-keyring").join("master.key");
-    if key_file.exists() {
-        return std::fs::read_to_string(&key_file).ok();
+}
+
+/// Return the master password held in memory.
+///
+/// Falls back to the `VASAK_KEYRING_PASSWORD` environment variable for
+/// headless/testing scenarios only. The old plaintext
+/// `~/.config/vasak-keyring/master.key` file is deliberately NOT read: keeping
+/// the key next to the encrypted database defeats the encryption entirely.
+fn master_password() -> Option<Zeroizing<String>> {
+    if let Ok(guard) = master_store().lock() {
+        if let Some(pw) = guard.as_ref() {
+            return Some(pw.clone());
+        }
     }
-    None
+    std::env::var("VASAK_KEYRING_PASSWORD").ok().map(Zeroizing::new)
 }
 
 fn save_db(items: &[ItemInfo]) {
     let path = match keyring_path() { Some(p) => p, None => return };
-    let pwd = match master_password() { Some(p) => p, None => return };
+    let pwd = match master_password() {
+        Some(p) => p,
+        None => {
+            eprintln!("[vasak-keyring] llavero bloqueado (sin master password); no se persiste");
+            return;
+        }
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -86,7 +110,7 @@ fn save_db(items: &[ItemInfo]) {
         })
         .collect();
     let db = crypto::KeyringDatabase { items: db_items };
-    match crypto::encrypt_database(&db, &pwd) {
+    match crypto::encrypt_database(&db, pwd.as_str()) {
         Ok(data) => {
             if let Err(e) = std::fs::write(&path, &data) {
                 eprintln!("[vasak-keyring] write keyring.db failed: {e}");
@@ -505,7 +529,7 @@ impl ServiceInterface {
             if db_path.exists() {
                 if let Ok(raw) = std::fs::read(&db_path) {
                     if let Some(pwd) = master_password() {
-                        match crypto::decrypt_database(&raw, &pwd) {
+                        match crypto::decrypt_database(&raw, pwd.as_str()) {
                             Ok(db) => {
                                 let items = &db.items;
                                 for si in items {
@@ -809,14 +833,22 @@ impl PamUnlockInterface {
             Some(p) => p,
             None => return Ok(false),
         };
-        if !path.exists() {
-            return Ok(false);
-        }
-        let raw = std::fs::read(&path).map_err(|e| dbus_err(format!("{e}")))?;
-        let db = match crypto::decrypt_database(&raw, password) {
-            Ok(db) => db,
-            Err(_) => return Ok(false),
+
+        // Decrypt the existing DB, or start empty on a fresh system. In both
+        // cases the login password becomes the in-memory master, so the first
+        // stored secret can create/persist the database. A wrong password for
+        // an existing DB is rejected and NOT adopted.
+        let db = if path.exists() {
+            let raw = std::fs::read(&path).map_err(|e| dbus_err(format!("{e}")))?;
+            match crypto::decrypt_database(&raw, password) {
+                Ok(db) => db,
+                Err(_) => return Ok(false),
+            }
+        } else {
+            crypto::KeyringDatabase { items: vec![] }
         };
+
+        set_master_password(password);
 
         let coll_path = "/org/freedesktop/secrets/collection/login".to_string();
         let item_paths: Vec<String>;

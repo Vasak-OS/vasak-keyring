@@ -338,6 +338,7 @@ impl ItemInterface {
                 let _ = CollectionInterface::item_changed(&emitter, item).await;
             }
         }
+        self.persist_all().await;
         Ok(())
     }
 
@@ -359,7 +360,21 @@ impl ItemInterface {
                 let _ = CollectionInterface::item_deleted(&emitter, item).await;
             }
         }
+        self.persist_all().await;
         Ok(owned_path("/"))
+    }
+}
+
+impl ItemInterface {
+    /// Persist the full in-memory item set to the encrypted DB. Used after
+    /// mutations (set_secret/delete) so changes survive a daemon restart;
+    /// no-ops if the keyring is locked (no master password in memory).
+    async fn persist_all(&self) {
+        let items: Vec<ItemInfo> = {
+            let state = self.state.lock().await;
+            state.items.values().cloned().collect()
+        };
+        save_db(&items);
     }
 }
 

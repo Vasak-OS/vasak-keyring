@@ -4,6 +4,7 @@ use std::sync::{Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 use zbus::{interface, Connection};
+use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{self, OwnedObjectPath, OwnedValue, Value, Type};
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
@@ -272,6 +273,10 @@ impl ItemInterface {
 
     async fn get_secret(&self, session: OwnedObjectPath) -> Result<SecretStruct, zbus::fdo::Error> {
         let state = self.state.lock().await;
+        // Never release a secret from a locked collection.
+        if state.collections.values().any(|c| c.locked && c.items.contains(&self.path)) {
+            return Err(dbus_err("collection is locked"));
+        }
         let item = state.items.get(&self.path)
             .ok_or_else(|| dbus_err("item not found"))?;
         let ses = state.sessions.get(session.as_str())
@@ -314,22 +319,45 @@ impl ItemInterface {
     }
 
     async fn set_secret(&mut self, secret: SecretStruct) -> Result<(), zbus::fdo::Error> {
-        let mut state = self.state.lock().await;
-        if let Some(item) = state.items.get_mut(&self.path) {
-            item.secret = secret.value;
-            item.content_type = secret.content_type;
-            item.modified = now();
-            Ok(())
-        } else {
-            Err(dbus_err("item not found"))
+        let col_path = {
+            let mut state = self.state.lock().await;
+            match state.items.get_mut(&self.path) {
+                Some(item) => {
+                    item.secret = secret.value;
+                    item.content_type = secret.content_type;
+                    item.modified = now();
+                }
+                None => return Err(dbus_err("item not found")),
+            }
+            state.collections.iter()
+                .find(|(_, c)| c.items.contains(&self.path))
+                .map(|(cp, _)| cp.clone())
+        };
+        if let (Some(cp), Ok(item)) = (col_path, owned_path_try(&self.path)) {
+            if let Ok(emitter) = SignalEmitter::new(&self.conn, cp.as_str()) {
+                let _ = CollectionInterface::item_changed(&emitter, item).await;
+            }
         }
+        Ok(())
     }
 
     async fn delete(&mut self) -> Result<OwnedObjectPath, zbus::fdo::Error> {
-        let mut state = self.state.lock().await;
-        state.items.remove(&self.path);
-        for col in state.collections.values_mut() {
-            col.items.retain(|p| p != &self.path);
+        let col_path = {
+            let mut state = self.state.lock().await;
+            state.items.remove(&self.path);
+            let mut owner = None;
+            for (cp, col) in state.collections.iter_mut() {
+                if col.items.contains(&self.path) {
+                    col.items.retain(|p| p != &self.path);
+                    owner = Some(cp.clone());
+                }
+            }
+            owner
+        };
+        if let (Some(cp), Ok(item)) = (col_path, owned_path_try(&self.path)) {
+            if let Ok(emitter) = SignalEmitter::new(&self.conn, cp.as_str()) {
+                let _ = CollectionInterface::item_deleted(&emitter, item).await;
+            }
         }
         Ok(owned_path("/"))
     }
@@ -346,6 +374,15 @@ struct CollectionInterface {
 
 #[interface(name = "org.freedesktop.Secret.Collection")]
 impl CollectionInterface {
+    #[zbus(signal)]
+    async fn item_created(emitter: &SignalEmitter<'_>, item: OwnedObjectPath) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn item_deleted(emitter: &SignalEmitter<'_>, item: OwnedObjectPath) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn item_changed(emitter: &SignalEmitter<'_>, item: OwnedObjectPath) -> zbus::Result<()>;
+
     #[zbus(property)]
     async fn label(&self) -> Result<String, zbus::fdo::Error> {
         self.state.lock().await
@@ -489,14 +526,27 @@ impl CollectionInterface {
 
         self.persist().await;
 
+        if let Ok(emitter) = SignalEmitter::new(&self.conn, self.path.as_str()) {
+            let _ = CollectionInterface::item_created(&emitter, owned.clone()).await;
+        }
+
         Ok((owned, owned_path("/")))
     }
 
     async fn delete(&mut self) -> Result<OwnedObjectPath, zbus::fdo::Error> {
-        let mut state = self.state.lock().await;
-        if let Some(col) = state.collections.remove(&self.path) {
-            for ip in &col.items {
-                state.items.remove(ip);
+        {
+            let mut state = self.state.lock().await;
+            if let Some(col) = state.collections.remove(&self.path) {
+                for ip in &col.items {
+                    state.items.remove(ip);
+                }
+            }
+            // Drop any aliases (e.g. "default") that pointed at this collection.
+            state.aliases.retain(|_, v| v != &self.path);
+        }
+        if let Ok(item) = owned_path_try(&self.path) {
+            if let Ok(emitter) = SignalEmitter::new(&self.conn, "/org/freedesktop/secrets") {
+                let _ = ServiceInterface::collection_deleted(&emitter, item).await;
             }
         }
         Ok(owned_path("/"))
@@ -626,6 +676,15 @@ impl ServiceInterface {
 
 #[interface(name = "org.freedesktop.Secret.Service")]
 impl ServiceInterface {
+    #[zbus(signal)]
+    async fn collection_created(emitter: &SignalEmitter<'_>, collection: OwnedObjectPath) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn collection_deleted(emitter: &SignalEmitter<'_>, collection: OwnedObjectPath) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn collection_changed(emitter: &SignalEmitter<'_>, collection: OwnedObjectPath) -> zbus::Result<()>;
+
     #[zbus(property)]
     async fn collections(&self) -> Vec<OwnedObjectPath> {
         let state = self.state.lock().await;
@@ -739,6 +798,9 @@ impl ServiceInterface {
         self.spawn_collection(&path, alias, &label).await?;
 
         let owned = owned_path_try(&path)?;
+        if let Ok(emitter) = SignalEmitter::new(&self.conn, "/org/freedesktop/secrets") {
+            let _ = ServiceInterface::collection_created(&emitter, owned.clone()).await;
+        }
         Ok((owned, owned_path("/")))
     }
 
@@ -835,6 +897,11 @@ impl ServiceInterface {
         let state = self.state.lock().await;
         let mut result = HashMap::new();
         for ip in &items {
+            let ip_str = ip.as_str();
+            // Skip items whose collection is locked.
+            if state.collections.values().any(|c| c.locked && c.items.iter().any(|p| p == ip_str)) {
+                continue;
+            }
             if let Some(item) = state.items.get(ip.as_str()) {
                 if let Some(ses) = state.sessions.get(session.as_str()) {
                     let secret = match ses.algorithm.as_str() {

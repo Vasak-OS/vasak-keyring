@@ -171,6 +171,8 @@ pub struct KeyringState {
     sessions: HashMap<String, SessionInfo>,
     collections: HashMap<String, CollectionInfo>,
     items: HashMap<String, ItemInfo>,
+    // alias -> collection object path (e.g. "default" -> the login collection).
+    aliases: HashMap<String, String>,
     next_session: u64,
     next_collection: u64,
     next_item: u64,
@@ -182,6 +184,7 @@ impl KeyringState {
             sessions: HashMap::new(),
             collections: HashMap::new(),
             items: HashMap::new(),
+            aliases: HashMap::new(),
             next_session: 0,
             next_collection: 0,
             next_item: 0,
@@ -375,6 +378,21 @@ impl CollectionInterface {
             .ok_or_else(|| dbus_err("collection not found"))
     }
 
+    #[zbus(property)]
+    async fn items(&self) -> Vec<OwnedObjectPath> {
+        let state = self.state.lock().await;
+        state
+            .collections
+            .get(&self.path)
+            .map(|c| {
+                c.items
+                    .iter()
+                    .filter_map(|ip| owned_path_try(ip).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     // Per the Secret Service spec, Collection.SearchItems returns a single
     // array of matching items (unlike Service.SearchItems, which splits them
     // into unlocked/locked).
@@ -564,6 +582,12 @@ impl ServiceInterface {
             modified: now(),
         };
         state.collections.insert(path.to_string(), col_info);
+        state.aliases.insert(alias.to_string(), path.to_string());
+        // The login collection is the default keyring; libsecret resolves the
+        // "default" alias when storing/looking up passwords.
+        if alias == "login" {
+            state.aliases.insert("default".to_string(), path.to_string());
+        }
 
         let mut item_paths = Vec::new();
         for (i, si) in loaded.into_iter().enumerate() {
@@ -602,6 +626,16 @@ impl ServiceInterface {
 
 #[interface(name = "org.freedesktop.Secret.Service")]
 impl ServiceInterface {
+    #[zbus(property)]
+    async fn collections(&self) -> Vec<OwnedObjectPath> {
+        let state = self.state.lock().await;
+        state
+            .collections
+            .keys()
+            .filter_map(|p| owned_path_try(p).ok())
+            .collect()
+    }
+
     async fn open_session(
         &mut self,
         algorithm: &str,
@@ -731,6 +765,10 @@ impl ServiceInterface {
 
     async fn read_alias(&self, alias: &str) -> Result<OwnedObjectPath, zbus::fdo::Error> {
         let state = self.state.lock().await;
+        if let Some(path) = state.aliases.get(alias) {
+            return owned_path_try(path);
+        }
+        // Fall back to the path convention for collections without an alias.
         let p = format!("/org/freedesktop/secrets/collection/{alias}");
         if state.collections.contains_key(&p) {
             owned_path_try(&p)
@@ -741,14 +779,16 @@ impl ServiceInterface {
 
     async fn set_alias(
         &mut self,
-        _alias: &str,
+        alias: &str,
         collection: OwnedObjectPath,
     ) -> Result<OwnedObjectPath, zbus::fdo::Error> {
+        let mut state = self.state.lock().await;
         if collection.as_str() == "/" {
+            state.aliases.remove(alias);
             return Ok(owned_path("/"));
         }
-        let state = self.state.lock().await;
         if state.collections.contains_key(collection.as_str()) {
+            state.aliases.insert(alias.to_string(), collection.as_str().to_string());
             Ok(owned_path("/"))
         } else {
             Err(dbus_err("collection not found"))

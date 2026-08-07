@@ -19,6 +19,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let state = Arc::new(Mutex::new(KeyringState::new()));
 
     let service = ServiceInterface::new(conn.clone(), state.clone());
+    // Register the default "login" collection (and its "default"/"login"
+    // aliases) up front so libsecret can resolve ReadAlias("default") before the
+    // PAM unlock populates it.
+    service.register_default_collection().await?;
     conn.object_server()
         .at("/org/freedesktop/secrets", service)
         .await

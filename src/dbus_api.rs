@@ -206,7 +206,7 @@ struct SessionInterface {
     path: String,
 }
 
-#[interface(name = "org.freedesktop.Secrets.Session")]
+#[interface(name = "org.freedesktop.Secret.Session")]
 impl SessionInterface {
     async fn close(&mut self) -> Result<(), zbus::fdo::Error> {
         self.state.lock().await.sessions.remove(&self.path);
@@ -222,7 +222,7 @@ struct ItemInterface {
     path: String,
 }
 
-#[interface(name = "org.freedesktop.Secrets.Item")]
+#[interface(name = "org.freedesktop.Secret.Item")]
 impl ItemInterface {
     #[zbus(property)]
     async fn label(&self) -> Result<String, zbus::fdo::Error> {
@@ -341,7 +341,7 @@ struct CollectionInterface {
     alias: String,
 }
 
-#[interface(name = "org.freedesktop.Secrets.Collection")]
+#[interface(name = "org.freedesktop.Secret.Collection")]
 impl CollectionInterface {
     #[zbus(property)]
     async fn label(&self) -> Result<String, zbus::fdo::Error> {
@@ -375,25 +375,26 @@ impl CollectionInterface {
             .ok_or_else(|| dbus_err("collection not found"))
     }
 
+    // Per the Secret Service spec, Collection.SearchItems returns a single
+    // array of matching items (unlike Service.SearchItems, which splits them
+    // into unlocked/locked).
     async fn search_items(
         &self,
         attributes: HashMap<String, String>,
-    ) -> Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>), zbus::fdo::Error> {
+    ) -> Result<Vec<OwnedObjectPath>, zbus::fdo::Error> {
         let state = self.state.lock().await;
-        let mut unlocked = Vec::new();
-        let mut locked = Vec::new();
+        let mut results = Vec::new();
 
         if let Some(col) = state.collections.get(&self.path) {
             for ip in &col.items {
                 if let Some(item) = state.items.get(ip) {
                     if attributes.iter().all(|(k, v)| item.attributes.get(k) == Some(v)) {
-                        let o = owned_path_try(ip).unwrap_or_else(|_| owned_path("/"));
-                        if col.locked { locked.push(o) } else { unlocked.push(o) }
+                        results.push(owned_path_try(ip).unwrap_or_else(|_| owned_path("/")));
                     }
                 }
             }
         }
-        Ok((unlocked, locked))
+        Ok(results)
     }
 
     async fn create_item(
@@ -403,12 +404,12 @@ impl CollectionInterface {
         replace: bool,
     ) -> Result<(OwnedObjectPath, OwnedObjectPath), zbus::fdo::Error> {
         let label = properties
-            .get("org.freedesktop.Secrets.Item.Label")
+            .get("org.freedesktop.Secret.Item.Label")
             .and_then(value_to_string)
             .unwrap_or_else(|| "Unnamed".to_string());
 
         let attributes = properties
-            .get("org.freedesktop.Secrets.Item.Attributes")
+            .get("org.freedesktop.Secret.Item.Attributes")
             .and_then(value_to_attrmap)
             .unwrap_or_default();
 
@@ -599,7 +600,7 @@ impl ServiceInterface {
     }
 }
 
-#[interface(name = "org.freedesktop.Secrets")]
+#[interface(name = "org.freedesktop.Secret.Service")]
 impl ServiceInterface {
     async fn open_session(
         &mut self,
@@ -696,7 +697,7 @@ impl ServiceInterface {
         }
 
         let label = properties
-            .get("org.freedesktop.Secrets.Collection.Label")
+            .get("org.freedesktop.Secret.Collection.Label")
             .and_then(value_to_string)
             .unwrap_or_else(|| alias.to_string());
 

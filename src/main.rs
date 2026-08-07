@@ -9,8 +9,10 @@ use std::error::Error;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // Secret Service well-known name is lowercase per the freedesktop spec;
+    // libsecret/gnome-keyring clients look this exact name up.
     let conn = zbus::connection::Builder::session()?
-        .name("org.freedesktop.Secrets")?
+        .name("org.freedesktop.secrets")?
         .build()
         .await?;
 

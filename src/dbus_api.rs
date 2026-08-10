@@ -8,8 +8,10 @@ use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{self, OwnedObjectPath, OwnedValue, Value, Type};
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use crate::crypto;
+use crate::session_crypto;
 
 fn dbus_err(msg: impl Into<String>) -> zbus::fdo::Error {
     zbus::fdo::Error::Failed(msg.into())
@@ -90,17 +92,33 @@ fn master_password() -> Option<Zeroizing<String>> {
     std::env::var("VASAK_KEYRING_PASSWORD").ok().map(Zeroizing::new)
 }
 
-fn save_db(items: &[ItemInfo]) {
-    let path = match keyring_path() { Some(p) => p, None => return };
-    let pwd = match master_password() {
-        Some(p) => p,
-        None => {
-            eprintln!("[vasak-keyring] llavero bloqueado (sin master password); no se persiste");
-            return;
-        }
-    };
+/// Message shown when the keyring cannot be written because it was never
+/// unlocked. Checked before a write mutates anything, so a rejected store
+/// leaves no half-created item behind that a later lookup would find.
+const LOCKED_MESSAGE: &str = "el llavero está bloqueado: no hay contraseña maestra en memoria. \
+     Se establece al iniciar sesión mediante pam_vasak_keyring; \
+     si el demonio se reinició, hay que volver a iniciar sesión.";
+
+fn ensure_unlocked() -> Result<(), zbus::fdo::Error> {
+    match master_password() {
+        Some(_) => Ok(()),
+        None => Err(dbus_err(LOCKED_MESSAGE)),
+    }
+}
+
+/// Writes every item to the encrypted database.
+///
+/// Returns an error instead of only logging one: a store that cannot reach the
+/// disk used to answer the client with success, so an application believed a
+/// password was saved and only found out at the next login that it was gone.
+fn save_db(items: &[ItemInfo]) -> Result<(), String> {
+    let path = keyring_path().ok_or("no se pudo determinar la ruta del llavero (¿falta HOME?)")?;
+    let pwd = master_password().ok_or(LOCKED_MESSAGE)?;
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
+        // The directory name alone leaks nothing, but its listing shouldn't be
+        // readable by other local users either.
+        let _ = std::fs::set_permissions(parent, PermissionsExt::from_mode(0o700));
     }
     let db_items: Vec<crypto::SecretItem> = items
         .iter()
@@ -111,43 +129,77 @@ fn save_db(items: &[ItemInfo]) {
         })
         .collect();
     let db = crypto::KeyringDatabase { items: db_items };
-    match crypto::encrypt_database(&db, pwd.as_str()) {
-        Ok(data) => {
-            if let Err(e) = std::fs::write(&path, &data) {
-                eprintln!("[vasak-keyring] write keyring.db failed: {e}");
-            }
-        }
-        Err(e) => eprintln!("[vasak-keyring] encrypt failed: {e}"),
-    }
+    let data = crypto::encrypt_database(&db, pwd.as_str())
+        .map_err(|e| format!("no se pudo cifrar el llavero: {e}"))?;
+
+    write_atomically(&path, &data)
+        .map_err(|e| format!("no se pudo escribir {}: {e}", path.display()))
 }
 
-// ── DH 1024 (Oakley Group 2, RFC 2409) ────────────────────
+/// Replaces the database in one step, so an interrupted write can never leave a
+/// truncated file behind — the database is the only copy of every stored
+/// password, and a partial one decrypts to nothing.
+///
+/// The temporary file is created 0600 from the start rather than fixed up
+/// afterwards, so the ciphertext is never briefly world-readable.
+fn write_atomically(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
 
-const DH_1024_PRIME: [u8; 128] = [
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0xC9, 0x0F, 0xDA, 0xA2, 0x21, 0x68, 0xC2, 0x34,
-    0xC4, 0xC6, 0x62, 0x8B, 0x80, 0xDC, 0x1C, 0xD1,
-    0x29, 0x02, 0x4E, 0x08, 0x8A, 0x67, 0xCC, 0x74,
-    0x02, 0x0B, 0xBE, 0xA6, 0x3B, 0x13, 0x9B, 0x22,
-    0x51, 0x4A, 0x08, 0x79, 0x8E, 0x34, 0x04, 0xDD,
-    0xEF, 0x95, 0x19, 0xB3, 0xCD, 0x3A, 0x43, 0x1B,
-    0x30, 0x2B, 0x0A, 0x6D, 0xF2, 0x5F, 0x14, 0x37,
-    0x4F, 0xE1, 0x35, 0x6D, 0x6D, 0x51, 0xC2, 0x45,
-    0xE4, 0x85, 0xB5, 0x76, 0x62, 0x5E, 0x7E, 0xC6,
-    0xF4, 0x4C, 0x42, 0xE9, 0xA6, 0x37, 0xED, 0x6B,
-    0x0B, 0xFF, 0x5C, 0xB6, 0xF4, 0x06, 0xB7, 0xED,
-    0xEE, 0x38, 0x6B, 0xFB, 0x5A, 0x89, 0x9F, 0xA5,
-    0xAE, 0x9F, 0x24, 0x11, 0x7C, 0x4B, 0x1F, 0xE6,
-    0x49, 0x28, 0x66, 0x51, 0xEC, 0xE4, 0x5B, 0x3D,
-    0xC2, 0x00, 0x7C, 0xB8, 0xA1, 0x63, 0xBF, 0x05,
-];
+    let temp = path.with_extension("tmp");
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temp)?;
+
+    // fsync before the rename: without it the rename can land while the
+    // contents are still in the page cache, and a power cut leaves an empty
+    // file where the keyring used to be.
+    let written = file.write_all(data).and_then(|_| file.sync_all());
+    drop(file);
+
+    let result = written.and_then(|_| std::fs::rename(&temp, path));
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
 
 // ── shared state ──────────────────────────────────────────
 
 struct SessionInfo {
     algorithm: String,
+    /// `None` for a plain session; the AES-128 transport key for a DH one.
     shared_key: Option<Vec<u8>>,
     created: u64,
+}
+
+impl SessionInfo {
+    /// Prepares a stored secret for delivery over this session, returning
+    /// `(parameters, value)`.
+    fn encode(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), zbus::fdo::Error> {
+        match self.shared_key.as_deref() {
+            None => Ok((Vec::new(), plaintext.to_vec())),
+            Some(key) => session_crypto::encrypt(key, plaintext)
+                .map_err(|e| dbus_err(format!("could not encrypt the secret: {e}"))),
+        }
+    }
+
+    /// Recovers a secret a client sent over this session.
+    ///
+    /// Without this, secrets arrived encrypted and were stored verbatim while
+    /// `GetSecret` encrypted them again on the way out — so anything written
+    /// through a DH session came back as ciphertext of ciphertext.
+    fn decode(&self, parameters: &[u8], value: Vec<u8>) -> Result<Vec<u8>, zbus::fdo::Error> {
+        match self.shared_key.as_deref() {
+            None => Ok(value),
+            Some(key) => session_crypto::decrypt(key, parameters, &value)
+                .map_err(|e| dbus_err(format!("could not decrypt the secret: {e}"))),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -190,6 +242,18 @@ impl KeyringState {
             next_collection: 0,
             next_item: 0,
         }
+    }
+
+    /// Reserves the next free item id.
+    ///
+    /// Every item path must go through this. Loading used to number items from
+    /// `enumerate()` without advancing the counter, so the first secret stored
+    /// after a restart was handed id 0 and silently overwrote the oldest loaded
+    /// one — while `CreateItem` still returned success.
+    fn take_item_id(&mut self) -> u64 {
+        let id = self.next_item;
+        self.next_item += 1;
+        id
     }
 }
 
@@ -271,7 +335,16 @@ impl ItemInterface {
             .ok_or_else(|| dbus_err("item not found"))
     }
 
-    async fn get_secret(&self, session: OwnedObjectPath) -> Result<SecretStruct, zbus::fdo::Error> {
+    /// Returns the secret as a single struct argument.
+    ///
+    /// The one-element tuple is load-bearing: returning `SecretStruct` bare
+    /// made zbus flatten it into four separate out-arguments (`oayays`), and
+    /// libsecret rejected every reply as a signature mismatch against the
+    /// `((oayays))` the spec declares.
+    async fn get_secret(
+        &self,
+        session: OwnedObjectPath,
+    ) -> Result<(SecretStruct,), zbus::fdo::Error> {
         let state = self.state.lock().await;
         // Never release a secret from a locked collection.
         if state.collections.values().any(|c| c.locked && c.items.contains(&self.path)) {
@@ -282,48 +355,31 @@ impl ItemInterface {
         let ses = state.sessions.get(session.as_str())
             .ok_or_else(|| dbus_err("session not found"))?;
 
-        match ses.algorithm.as_str() {
-            "plain" => Ok(SecretStruct {
-                session: session.clone(),
-                parameters: vec![],
-                value: item.secret.clone(),
-                content_type: item.content_type.clone(),
-            }),
-            "dh-ietf1024-sha256" => {
-                let key = ses.shared_key.as_deref()
-                    .ok_or_else(|| dbus_err("session has no key"))?;
-                let mut key32 = [0u8; 32];
-                let len = key.len().min(32);
-                key32[..len].copy_from_slice(&key[..len]);
+        let (parameters, value) = ses.encode(&item.secret)?;
 
-                let mut nonce = [0u8; 12];
-                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-
-                use aes_gcm::aead::{Aead, KeyInit};
-                let cipher = aes_gcm::Aes256Gcm::new(
-                    aes_gcm::Key::<aes_gcm::Aes256Gcm>::from_slice(&key32),
-                );
-                let ctxt = cipher
-                    .encrypt(aes_gcm::Nonce::from_slice(&nonce), item.secret.as_ref())
-                    .map_err(|_| dbus_err("encryption failed"))?;
-
-                Ok(SecretStruct {
-                    session: session.clone(),
-                    parameters: nonce.to_vec(),
-                    value: ctxt,
-                    content_type: item.content_type.clone(),
-                })
-            }
-            a => Err(dbus_err(format!("unknown algorithm: {a}"))),
-        }
+        Ok((SecretStruct {
+            session: session.clone(),
+            parameters,
+            value,
+            content_type: item.content_type.clone(),
+        },))
     }
 
     async fn set_secret(&mut self, secret: SecretStruct) -> Result<(), zbus::fdo::Error> {
+        ensure_unlocked()?;
+
         let col_path = {
             let mut state = self.state.lock().await;
+
+            let plaintext = state
+                .sessions
+                .get(secret.session.as_str())
+                .ok_or_else(|| dbus_err("session not found"))?
+                .decode(&secret.parameters, secret.value)?;
+
             match state.items.get_mut(&self.path) {
                 Some(item) => {
-                    item.secret = secret.value;
+                    item.secret = plaintext;
                     item.content_type = secret.content_type;
                     item.modified = now();
                 }
@@ -338,7 +394,7 @@ impl ItemInterface {
                 let _ = CollectionInterface::item_changed(&emitter, item).await;
             }
         }
-        self.persist_all().await;
+        self.persist_all().await?;
         Ok(())
     }
 
@@ -360,7 +416,7 @@ impl ItemInterface {
                 let _ = CollectionInterface::item_deleted(&emitter, item).await;
             }
         }
-        self.persist_all().await;
+        self.persist_all().await?;
         Ok(owned_path("/"))
     }
 }
@@ -369,12 +425,12 @@ impl ItemInterface {
     /// Persist the full in-memory item set to the encrypted DB. Used after
     /// mutations (set_secret/delete) so changes survive a daemon restart;
     /// no-ops if the keyring is locked (no master password in memory).
-    async fn persist_all(&self) {
+    async fn persist_all(&self) -> Result<(), zbus::fdo::Error> {
         let items: Vec<ItemInfo> = {
             let state = self.state.lock().await;
             state.items.values().cloned().collect()
         };
-        save_db(&items);
+        save_db(&items).map_err(dbus_err)
     }
 }
 
@@ -473,6 +529,8 @@ impl CollectionInterface {
         secret: SecretStruct,
         replace: bool,
     ) -> Result<(OwnedObjectPath, OwnedObjectPath), zbus::fdo::Error> {
+        ensure_unlocked()?;
+
         let label = properties
             .get("org.freedesktop.Secret.Item.Label")
             .and_then(value_to_string)
@@ -484,6 +542,14 @@ impl CollectionInterface {
             .unwrap_or_default();
 
         let mut state = self.state.lock().await;
+
+        // Decrypt before anything else: a client that opened a DH session sends
+        // ciphertext, and storing that verbatim would corrupt the item.
+        let plaintext = state
+            .sessions
+            .get(secret.session.as_str())
+            .ok_or_else(|| dbus_err("session not found"))?
+            .decode(&secret.parameters, secret.value)?;
 
         if replace {
             let existing: Vec<String> = {
@@ -507,14 +573,12 @@ impl CollectionInterface {
             }
         }
 
-        let id = state.next_item;
-        state.next_item += 1;
-        let item_path = format!("{}/items/{id}", self.path);
+        let item_path = format!("{}/items/{}", self.path, state.take_item_id());
 
         let info = ItemInfo {
             label,
             attributes,
-            secret: secret.value,
+            secret: plaintext,
             content_type: secret.content_type,
             created: now(),
             modified: now(),
@@ -539,7 +603,7 @@ impl CollectionInterface {
             .map(|_| ())
             .map_err(|e| dbus_err(format!("{e}")))?;
 
-        self.persist().await;
+        self.persist().await?;
 
         if let Ok(emitter) = SignalEmitter::new(&self.conn, self.path.as_str()) {
             let _ = CollectionInterface::item_created(&emitter, owned.clone()).await;
@@ -549,16 +613,39 @@ impl CollectionInterface {
     }
 
     async fn delete(&mut self) -> Result<OwnedObjectPath, zbus::fdo::Error> {
+        let orphaned_aliases: Vec<String>;
+        let removed_items: Vec<String>;
         {
             let mut state = self.state.lock().await;
-            if let Some(col) = state.collections.remove(&self.path) {
-                for ip in &col.items {
-                    state.items.remove(ip);
-                }
+            removed_items = match state.collections.remove(&self.path) {
+                Some(col) => col.items,
+                None => Vec::new(),
+            };
+            for ip in &removed_items {
+                state.items.remove(ip);
             }
             // Drop any aliases (e.g. "default") that pointed at this collection.
+            orphaned_aliases = state
+                .aliases
+                .iter()
+                .filter(|(_, v)| *v == &self.path)
+                .map(|(k, _)| k.clone())
+                .collect();
             state.aliases.retain(|_, v| v != &self.path);
         }
+
+        // Take the objects off the bus too. Leaving them registered would let a
+        // client keep calling into a collection that no longer exists.
+        let server = self.conn.object_server();
+        for ip in &removed_items {
+            let _ = server.remove::<ItemInterface, _>(ip.as_str()).await;
+        }
+        for alias in &orphaned_aliases {
+            let _ = server
+                .remove::<CollectionInterface, _>(ServiceInterface::alias_path(alias).as_str())
+                .await;
+        }
+
         if let Ok(item) = owned_path_try(&self.path) {
             if let Ok(emitter) = SignalEmitter::new(&self.conn, "/org/freedesktop/secrets") {
                 let _ = ServiceInterface::collection_deleted(&emitter, item).await;
@@ -569,18 +656,18 @@ impl CollectionInterface {
 }
 
 impl CollectionInterface {
-    async fn persist(&self) {
-        let state = self.state.lock().await;
-        let mut all = Vec::new();
-        if let Some(col) = state.collections.get(&self.path) {
-            for ip in &col.items {
-                if let Some(info) = state.items.get(ip) {
-                    all.push(info.clone());
-                }
-            }
-        }
-        drop(state);
-        save_db(&all);
+    /// Writes the whole keyring, not just this collection.
+    ///
+    /// The database is a single flat item list, so saving only this
+    /// collection's items used to erase every other collection's secrets from
+    /// disk the moment an item was added here — the loss only became visible
+    /// after the next restart.
+    async fn persist(&self) -> Result<(), zbus::fdo::Error> {
+        let items: Vec<ItemInfo> = {
+            let state = self.state.lock().await;
+            state.items.values().cloned().collect()
+        };
+        save_db(&items).map_err(dbus_err)
     }
 }
 
@@ -603,6 +690,40 @@ impl ServiceInterface {
     pub async fn register_default_collection(&self) -> Result<(), zbus::fdo::Error> {
         self.spawn_collection("/org/freedesktop/secrets/collection/login",
             "login", "Default collection").await
+    }
+
+    /// Object path an alias is addressed by, per the Secret Service spec.
+    fn alias_path(alias: &str) -> String {
+        format!("/org/freedesktop/secrets/aliases/{alias}")
+    }
+
+    /// Publishes a collection at its alias path as well as its real one.
+    ///
+    /// libsecret does not call `ReadAlias` to find the default keyring: it
+    /// addresses `/org/freedesktop/secrets/aliases/default` directly. With
+    /// nothing served there, every store and lookup failed outright with
+    /// `Unknown object '/org/freedesktop/secrets/aliases/default'` — so
+    /// `secret-tool`, and every app using the `keyring` crate, could not use
+    /// the keyring at all.
+    ///
+    /// The interface keeps pointing at the collection's real path, so items
+    /// created through the alias land in the collection itself and signals are
+    /// emitted on the canonical path.
+    async fn publish_alias(&self, alias: &str, collection_path: &str)
+        -> Result<(), zbus::fdo::Error>
+    {
+        let iface = CollectionInterface {
+            state: self.state.clone(),
+            conn: self.conn.clone(),
+            path: collection_path.to_string(),
+            alias: alias.to_string(),
+        };
+        self.conn
+            .object_server()
+            .at(Self::alias_path(alias), iface)
+            .await
+            .map(|_| ())
+            .map_err(|e| dbus_err(format!("{e}")))
     }
 
     async fn spawn_collection(&self, path: &str, alias: &str, label: &str)
@@ -655,8 +776,8 @@ impl ServiceInterface {
         }
 
         let mut item_paths = Vec::new();
-        for (i, si) in loaded.into_iter().enumerate() {
-            let ip = format!("{path}/items/{i}");
+        for si in loaded {
+            let ip = format!("{path}/items/{}", state.take_item_id());
             state.items.insert(ip.clone(), si);
             item_paths.push(ip);
         }
@@ -685,7 +806,13 @@ impl ServiceInterface {
         };
         self.conn.object_server().at(path.to_string(), iface).await
             .map(|_| ())
-            .map_err(|e| dbus_err(format!("{e}")))
+            .map_err(|e| dbus_err(format!("{e}")))?;
+
+        self.publish_alias(alias, path).await?;
+        if alias == "login" {
+            self.publish_alias("default", path).await?;
+        }
+        Ok(())
     }
 }
 
@@ -715,80 +842,54 @@ impl ServiceInterface {
         algorithm: &str,
         input: Value<'_>,
     ) -> Result<(OwnedValue, OwnedObjectPath), zbus::fdo::Error> {
-        match algorithm {
-            "plain" => {
-                let mut state = self.state.lock().await;
-                let id = state.next_session;
-                state.next_session += 1;
-                let path = format!("/org/freedesktop/secrets/session/s{id}");
+        // `output` is the server's DH public value, or an empty array for a
+        // plain session.
+        let (shared_key, output) = match algorithm {
+            session_crypto::PLAIN_ALGORITHM => (None, Vec::new()),
 
-                state.sessions.insert(path.clone(), SessionInfo {
-                    algorithm: "plain".into(),
-                    shared_key: None,
-                    created: now(),
-                });
-                drop(state);
-
-                let iface = SessionInterface {
-                    state: self.state.clone(),
-                    path: path.clone(),
-                };
-                self.conn.object_server().at(path.clone(), iface).await
-                    .map(|_| ())
-                    .map_err(|e| dbus_err(format!("{e}")))?;
-
-                let owned_path = owned_path_try(&path)?;
-                Ok((u8_array_value(vec![]), owned_path))
+            session_crypto::DH_ALGORITHM => {
+                let client_public = extract_bytes(&input)?;
+                let dh = session_crypto::negotiate(&client_public)
+                    .map_err(zbus::fdo::Error::InvalidArgs)?;
+                (Some(dh.session_key), dh.server_public)
             }
 
-            "dh-ietf1024-sha256" => {
-                let client_pub = extract_bytes(&input)?;
-
-                let p = num_bigint::BigUint::from_bytes_be(&DH_1024_PRIME);
-                let g = num_bigint::BigUint::from(2u64);
-                let client_val = num_bigint::BigUint::from_bytes_be(&client_pub);
-
-                let mut priv_bytes = [0u8; 32];
-                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut priv_bytes);
-                let server_priv = num_bigint::BigUint::from_bytes_be(&priv_bytes);
-
-                let server_pub = g.modpow(&server_priv, &p);
-                let shared = client_val.modpow(&server_priv, &p);
-
-                let session_key = {
-                    let raw = shared.to_bytes_be();
-                    use sha2::Digest;
-                    let mut h = sha2::Sha256::new();
-                    h.update(&raw);
-                    h.finalize().to_vec()
-                };
-
-                let mut state = self.state.lock().await;
-                let id = state.next_session;
-                state.next_session += 1;
-                let path = format!("/org/freedesktop/secrets/session/s{id}");
-
-                state.sessions.insert(path.clone(), SessionInfo {
-                    algorithm: "dh-ietf1024-sha256".into(),
-                    shared_key: Some(session_key),
-                    created: now(),
-                });
-                drop(state);
-
-                let iface = SessionInterface {
-                    state: self.state.clone(),
-                    path: path.clone(),
-                };
-                self.conn.object_server().at(path.clone(), iface).await
-                    .map(|_| ())
-                    .map_err(|e| dbus_err(format!("{e}")))?;
-
-                let owned_path = owned_path_try(&path)?;
-                Ok((u8_array_value(server_pub.to_bytes_be()), owned_path))
+            // Clients try the algorithms they support in order and fall back on
+            // this error, so it has to be NotSupported: Failed reads as "the
+            // keyring is broken" and they give up instead of retrying plain.
+            other => {
+                return Err(zbus::fdo::Error::NotSupported(format!(
+                    "unsupported algorithm: {other}"
+                )))
             }
+        };
 
-            other => Err(dbus_err(format!("unsupported algorithm: {other}"))),
-        }
+        let path = {
+            let mut state = self.state.lock().await;
+            let id = state.next_session;
+            state.next_session += 1;
+            let path = format!("/org/freedesktop/secrets/session/s{id}");
+
+            state.sessions.insert(
+                path.clone(),
+                SessionInfo {
+                    algorithm: algorithm.to_string(),
+                    shared_key,
+                    created: now(),
+                },
+            );
+            path
+        };
+
+        let iface = SessionInterface {
+            state: self.state.clone(),
+            path: path.clone(),
+        };
+        self.conn.object_server().at(path.clone(), iface).await
+            .map(|_| ())
+            .map_err(|e| dbus_err(format!("{e}")))?;
+
+        Ok((u8_array_value(output), owned_path_try(&path)?))
     }
 
     async fn create_collection(
@@ -859,17 +960,32 @@ impl ServiceInterface {
         alias: &str,
         collection: OwnedObjectPath,
     ) -> Result<OwnedObjectPath, zbus::fdo::Error> {
-        let mut state = self.state.lock().await;
-        if collection.as_str() == "/" {
-            state.aliases.remove(alias);
-            return Ok(owned_path("/"));
+        let target = {
+            let mut state = self.state.lock().await;
+            if collection.as_str() == "/" {
+                state.aliases.remove(alias);
+                None
+            } else if state.collections.contains_key(collection.as_str()) {
+                state.aliases.insert(alias.to_string(), collection.as_str().to_string());
+                Some(collection.as_str().to_string())
+            } else {
+                return Err(dbus_err("collection not found"));
+            }
+        };
+
+        // The alias object has to follow the map, or clients keep reaching the
+        // collection the alias used to point at.
+        let _ = self
+            .conn
+            .object_server()
+            .remove::<CollectionInterface, _>(Self::alias_path(alias).as_str())
+            .await;
+
+        if let Some(path) = target {
+            self.publish_alias(alias, &path).await?;
         }
-        if state.collections.contains_key(collection.as_str()) {
-            state.aliases.insert(alias.to_string(), collection.as_str().to_string());
-            Ok(owned_path("/"))
-        } else {
-            Err(dbus_err("collection not found"))
-        }
+
+        Ok(owned_path("/"))
     }
 
     async fn unlock(
@@ -908,7 +1024,9 @@ impl ServiceInterface {
         &self,
         items: Vec<OwnedObjectPath>,
         session: OwnedObjectPath,
-    ) -> Result<HashMap<String, SecretStruct>, zbus::fdo::Error> {
+        // Keyed by object path, not string: the spec declares `a{o(oayays)}`
+        // and libsecret refuses the `a{s(oayays)}` a String key produces.
+    ) -> Result<HashMap<OwnedObjectPath, SecretStruct>, zbus::fdo::Error> {
         let state = self.state.lock().await;
         let mut result = HashMap::new();
         for ip in &items {
@@ -919,16 +1037,19 @@ impl ServiceInterface {
             }
             if let Some(item) = state.items.get(ip.as_str()) {
                 if let Some(ses) = state.sessions.get(session.as_str()) {
-                    let secret = match ses.algorithm.as_str() {
-                        "plain" => SecretStruct {
+                    // Encrypted sessions used to be skipped outright here, so a
+                    // client that opened one got an empty map back from
+                    // GetSecrets and concluded it had no stored passwords.
+                    let (parameters, value) = ses.encode(&item.secret)?;
+                    result.insert(
+                        ip.clone(),
+                        SecretStruct {
                             session: session.clone(),
-                            parameters: vec![],
-                            value: item.secret.clone(),
+                            parameters,
+                            value,
                             content_type: item.content_type.clone(),
                         },
-                        _ => continue,
-                    };
-                    result.insert(ip.as_str().to_string(), secret);
+                    );
                 }
             }
         }
@@ -975,6 +1096,7 @@ impl PamUnlockInterface {
 
         let coll_path = "/org/freedesktop/secrets/collection/login".to_string();
         let item_paths: Vec<String>;
+        let stale_paths: Vec<String>;
 
         {
             let mut state = self.state.lock().await;
@@ -989,9 +1111,22 @@ impl PamUnlockInterface {
                 });
             }
 
+            // Unlocking reloads the collection from disk, so whatever it held
+            // before is replaced. Item ids are never reused now, so the old
+            // paths have to be dropped explicitly or they linger on the bus as
+            // duplicates that no longer belong to any collection.
+            stale_paths = state
+                .collections
+                .get(&coll_path)
+                .map(|col| col.items.clone())
+                .unwrap_or_default();
+            for ip in &stale_paths {
+                state.items.remove(ip);
+            }
+
             let mut paths = Vec::new();
-            for (i, si) in db.items.iter().enumerate() {
-                let ip = format!("{coll_path}/items/{i}");
+            for si in db.items.iter() {
+                let ip = format!("{coll_path}/items/{}", state.take_item_id());
                 let info = ItemInfo {
                     label: si.label.clone(),
                     attributes: si.attributes.clone(),
@@ -1008,6 +1143,14 @@ impl PamUnlockInterface {
                 col.items = paths.clone();
             }
             item_paths = paths;
+        }
+
+        for ip in &stale_paths {
+            let _ = self
+                .conn
+                .object_server()
+                .remove::<ItemInterface, _>(ip.as_str())
+                .await;
         }
 
         for ip in &item_paths {

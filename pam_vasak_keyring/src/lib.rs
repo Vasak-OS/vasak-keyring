@@ -67,25 +67,50 @@ unsafe extern "C" fn password_cleanup(
 
 // ── D-Bus: send password to the daemon ─────────────────────
 
-fn send_to_daemon(password: &str) -> bool {
+/// The daemon's well-known name, lowercase as the freedesktop spec defines it.
+/// This used to ask for `org.freedesktop.Secrets`, which nothing owns — D-Bus
+/// names are case-sensitive, so every unlock failed and the keyring stayed
+/// locked for the whole session with no error the user could see.
+const KEYRING_SERVICE: &str = "org.freedesktop.secrets";
+const KEYRING_PATH: &str = "/org/vasak/keyring";
+const KEYRING_INTERFACE: &str = "org.vasak.Keyring";
+/// zbus exports methods in CamelCase; the lowercase `unlock` did not exist.
+const UNLOCK_METHOD: &str = "Unlock";
+
+/// How long to keep trying while the daemon starts.
+///
+/// PAM opens the session before the user's systemd units are up, so the very
+/// first attempt at login usually finds no daemon. This only costs time when
+/// the daemon really is absent; the normal case answers on the first attempt.
+const UNLOCK_ATTEMPTS: u32 = 10;
+const UNLOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(150);
+
+fn try_unlock(password: &str) -> Result<bool, zbus::Error> {
     use zbus::blocking::Connection;
-    let conn = match Connection::session() {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
 
-    let reply = match conn.call_method(
-        Some("org.freedesktop.Secrets"),
-        "/org/vasak/keyring",
-        Some("org.vasak.Keyring"),
-        "unlock",
+    let conn = Connection::session()?;
+    let reply = conn.call_method(
+        Some(KEYRING_SERVICE),
+        KEYRING_PATH,
+        Some(KEYRING_INTERFACE),
+        UNLOCK_METHOD,
         &(password,),
-    ) {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
+    )?;
 
-    reply.body().deserialize::<bool>().unwrap_or(false)
+    Ok(reply.body().deserialize::<bool>().unwrap_or(false))
+}
+
+fn send_to_daemon(password: &str) -> bool {
+    for attempt in 0..UNLOCK_ATTEMPTS {
+        match try_unlock(password) {
+            // A `false` reply is a real answer — the password was wrong for the
+            // existing database. Retrying cannot change that.
+            Ok(unlocked) => return unlocked,
+            Err(_) if attempt + 1 < UNLOCK_ATTEMPTS => std::thread::sleep(UNLOCK_RETRY),
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 // ════════════════════════════════════════════════════════════
@@ -170,5 +195,35 @@ pub extern "C" fn pam_sm_open_session(
 
     // password zeroized automatically on drop (Zeroizing)
 
+    PAM_SUCCESS
+}
+
+/// Required by PAM whenever the module appears in an `auth` stack.
+///
+/// PAM calls this after a successful authentication; a module that does not
+/// export it makes the whole stack fail with "symbol not found", which is why
+/// this returns success rather than being omitted. There are no credentials to
+/// establish here — the password is handed over in `pam_sm_open_session`.
+#[no_mangle]
+pub extern "C" fn pam_sm_setcred(
+    _pamh: *mut pam_handle_t,
+    _flags: c_int,
+    _argc: c_int,
+    _argv: *mut *const c_char,
+) -> c_int {
+    PAM_SUCCESS
+}
+
+/// Counterpart to `pam_sm_open_session`, required for the same reason.
+///
+/// Nothing to tear down: the daemon holds the master password for as long as it
+/// runs, and it is never written to disk.
+#[no_mangle]
+pub extern "C" fn pam_sm_close_session(
+    _pamh: *mut pam_handle_t,
+    _flags: c_int,
+    _argc: c_int,
+    _argv: *mut *const c_char,
+) -> c_int {
     PAM_SUCCESS
 }

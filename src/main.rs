@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 mod crypto;
 mod dbus_api;
+mod session_crypto;
 
 use std::sync::Arc;
 use tokio::sync::Mutex;

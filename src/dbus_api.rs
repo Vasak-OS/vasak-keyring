@@ -106,6 +106,21 @@ fn ensure_unlocked() -> Result<(), zbus::fdo::Error> {
     }
 }
 
+/// Whether a collection (or an item inside it) can serve secrets right now.
+///
+/// There are two independent notions of "locked": the per-collection flag that
+/// `Service.Lock`/`Unlock` toggles, and whether a master password is held in
+/// memory. Only the first one used to reach the `Locked` property, and it
+/// starts out `false` when the default collection is registered — so the
+/// property answered "unlocked" while every operation failed with
+/// `LOCKED_MESSAGE`. libsecret reads exactly this property to decide whether it
+/// has to unlock before using the keyring; seeing `false` it went straight to
+/// the operation and surfaced the raw error, which is why applications reported
+/// that there was no keyring service instead of asking to unlock it.
+fn effectively_locked(collection_locked: bool) -> bool {
+    collection_locked || master_password().is_none()
+}
+
 /// Writes every item to the encrypted database.
 ///
 /// Returns an error instead of only logging one: a store that cannot reach the
@@ -313,10 +328,10 @@ impl ItemInterface {
         let state = self.state.lock().await;
         for col in state.collections.values() {
             if col.items.contains(&self.path) {
-                return Ok(col.locked);
+                return Ok(effectively_locked(col.locked));
             }
         }
-        Ok(false)
+        Ok(effectively_locked(false))
     }
 
     #[zbus(property)]
@@ -347,7 +362,7 @@ impl ItemInterface {
     ) -> Result<(SecretStruct,), zbus::fdo::Error> {
         let state = self.state.lock().await;
         // Never release a secret from a locked collection.
-        if state.collections.values().any(|c| c.locked && c.items.contains(&self.path)) {
+        if state.collections.values().any(|c| effectively_locked(c.locked) && c.items.contains(&self.path)) {
             return Err(dbus_err("collection is locked"));
         }
         let item = state.items.get(&self.path)
@@ -466,7 +481,7 @@ impl CollectionInterface {
     async fn locked(&self) -> Result<bool, zbus::fdo::Error> {
         self.state.lock().await
             .collections.get(&self.path)
-            .map(|c| c.locked)
+            .map(|c| effectively_locked(c.locked))
             .ok_or_else(|| dbus_err("collection not found"))
     }
 
@@ -933,7 +948,7 @@ impl ServiceInterface {
                 if let Some(item) = state.items.get(ip) {
                     if attributes.iter().all(|(k, v)| item.attributes.get(k) == Some(v)) {
                         let o = owned_path_try(ip).unwrap_or_else(|_| owned_path("/"));
-                        if col.locked { locked.push(o) } else { unlocked.push(o) }
+                        if effectively_locked(col.locked) { locked.push(o) } else { unlocked.push(o) }
                     }
                 }
             }
@@ -992,6 +1007,15 @@ impl ServiceInterface {
         &mut self,
         objects: Vec<OwnedObjectPath>,
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath), zbus::fdo::Error> {
+        // Clearing the per-collection flag cannot unlock anything while there is
+        // no master password in memory: adopting one is the PAM module's job.
+        // Reporting the objects as unlocked made clients carry on and hit
+        // LOCKED_MESSAGE instead of reporting the keyring as locked. An empty
+        // list with no prompt is the honest answer: nothing could be unlocked.
+        if master_password().is_none() {
+            return Ok((Vec::new(), owned_path("/")));
+        }
+
         let mut state = self.state.lock().await;
         let mut out = Vec::new();
         for obj in &objects {
@@ -1032,7 +1056,7 @@ impl ServiceInterface {
         for ip in &items {
             let ip_str = ip.as_str();
             // Skip items whose collection is locked.
-            if state.collections.values().any(|c| c.locked && c.items.iter().any(|p| p == ip_str)) {
+            if state.collections.values().any(|c| effectively_locked(c.locked) && c.items.iter().any(|p| p == ip_str)) {
                 continue;
             }
             if let Some(item) = state.items.get(ip.as_str()) {
@@ -1067,6 +1091,25 @@ pub struct PamUnlockInterface {
 impl PamUnlockInterface {
     pub fn new(state: Arc<Mutex<KeyringState>>, conn: Connection) -> Self {
         Self { state, conn }
+    }
+
+    /// Emits `PropertiesChanged` for every `Locked` property that just flipped.
+    /// Lives outside the `#[interface]` block on purpose: it is an internal
+    /// helper, not something to expose on the bus. Failures are ignored because
+    /// the keyring is already usable by then, and a client that misses the
+    /// signal still gets the right answer next time it reads the property.
+    async fn announce_unlocked(&self, coll_path: &str, item_paths: &[String]) {
+        let server = self.conn.object_server();
+
+        if let Ok(iface) = server.interface::<_, CollectionInterface>(coll_path).await {
+            let _ = iface.get().await.locked_changed(iface.signal_emitter()).await;
+        }
+
+        for ip in item_paths {
+            if let Ok(iface) = server.interface::<_, ItemInterface>(ip.as_str()).await {
+                let _ = iface.get().await.locked_changed(iface.signal_emitter()).await;
+            }
+        }
     }
 }
 
@@ -1170,9 +1213,15 @@ impl PamUnlockInterface {
             path: coll_path.clone(),
             alias: "login".into(),
         };
-        self.conn.object_server().at(coll_path, iface).await
+        self.conn.object_server().at(coll_path.clone(), iface).await
             .map(|_| ())
             .map_err(|e| dbus_err(format!("{e}")))?;
+
+        // Everything above changed the answer of the `Locked` properties from
+        // true to false. Applications started before the unlock cached the old
+        // value, so without a change notification they keep believing the
+        // keyring is unusable for the rest of the session.
+        self.announce_unlocked(&coll_path, &item_paths).await;
 
         Ok(true)
     }

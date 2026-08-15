@@ -52,8 +52,13 @@ const submit = async () => {
 		password.value = '';
 		await nextTick();
 		field.value?.focus();
-	} catch {
-		error.value = 'El servicio del llavero no respondió.';
+	} catch (reason) {
+		// After three wrong passwords the daemon stops answering for a while and
+		// says so. That is worth reading as written, instead of being flattened
+		// into "it did not answer" — which would send someone looking for a
+		// problem that is not there.
+		error.value = String(reason) || 'El servicio del llavero no respondió.';
+		password.value = '';
 	} finally {
 		working.value = false;
 	}

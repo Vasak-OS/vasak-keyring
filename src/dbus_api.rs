@@ -1220,6 +1220,101 @@ impl PromptInterface {
     ) -> zbus::Result<()>;
 }
 
+// ── Rate limiting ──────────────────────────────────────────
+
+/// Wrong passwords in a row before the daemon stops answering for a while.
+const UNLOCK_MAX_ATTEMPTS: u32 = 3;
+/// How long it stays shut after that.
+const UNLOCK_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Failed attempts, and until when to refuse.
+///
+/// Anything running in the session can call `Unlock`, and without a limit it can
+/// sit there trying passwords as fast as the daemon answers. That is not a new
+/// exposure — whoever is in the session can also read the database file and
+/// attack it offline — but at least it should not be the fastest way in, and a
+/// program grinding away at it now has to wait like everyone else.
+///
+/// Only wrong answers count. Unlocking correctly clears the record, and so does
+/// letting the cooldown expire.
+struct UnlockAttempts {
+    failures: u32,
+    blocked_until: Option<std::time::Instant>,
+}
+
+fn unlock_attempts() -> &'static StdMutex<UnlockAttempts> {
+    static ATTEMPTS: OnceLock<StdMutex<UnlockAttempts>> = OnceLock::new();
+    ATTEMPTS.get_or_init(|| {
+        StdMutex::new(UnlockAttempts {
+            failures: 0,
+            blocked_until: None,
+        })
+    })
+}
+
+/// Seconds left of the cooldown, or `None` when there is none.
+fn unlock_blocked_for() -> Option<u64> {
+    let mut attempts = unlock_attempts().lock().ok()?;
+    let until = attempts.blocked_until?;
+    let left = until.saturating_duration_since(std::time::Instant::now());
+
+    if left.is_zero() {
+        attempts.blocked_until = None;
+        attempts.failures = 0;
+        return None;
+    }
+
+    Some(left.as_secs().max(1))
+}
+
+fn note_failed_unlock() {
+    if let Ok(mut attempts) = unlock_attempts().lock() {
+        attempts.failures += 1;
+        if attempts.failures >= UNLOCK_MAX_ATTEMPTS {
+            attempts.failures = 0;
+            attempts.blocked_until = Some(std::time::Instant::now() + UNLOCK_COOLDOWN);
+        }
+    }
+}
+
+fn note_successful_unlock() {
+    if let Ok(mut attempts) = unlock_attempts().lock() {
+        attempts.failures = 0;
+        attempts.blocked_until = None;
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+
+    /// One test for the whole thing on purpose: the counter is process-wide, as
+    /// it has to be, so two tests touching it in parallel would fight over it.
+    #[test]
+    fn three_wrong_passwords_close_the_door_and_the_right_one_opens_it() {
+        assert_eq!(unlock_blocked_for(), None, "arranca sin bloqueo");
+
+        for _ in 0..UNLOCK_MAX_ATTEMPTS - 1 {
+            note_failed_unlock();
+            assert_eq!(unlock_blocked_for(), None, "todavía quedan intentos");
+        }
+
+        note_failed_unlock();
+        let left = unlock_blocked_for().expect("el tercer fallo bloquea");
+        assert!(left <= UNLOCK_COOLDOWN.as_secs() && left > 0);
+
+        // Unlocking is what clears it — including the wait, so somebody who
+        // remembers the password is not left sitting out a cooldown.
+        note_successful_unlock();
+        assert_eq!(unlock_blocked_for(), None);
+
+        // And the count starts over, rather than the next mistake locking again.
+        note_failed_unlock();
+        assert_eq!(unlock_blocked_for(), None);
+        note_successful_unlock();
+    }
+}
+
 // ── PAM unlock interface (called by pam_vasak_keyring.so) ──
 
 pub struct PamUnlockInterface {
@@ -1255,6 +1350,15 @@ impl PamUnlockInterface {
 #[interface(name = "org.vasak.Keyring")]
 impl PamUnlockInterface {
     async fn unlock(&mut self, password: &str) -> Result<bool, zbus::fdo::Error> {
+        // Refused rather than answered `false`: the caller is being told to stop
+        // trying, which is a different thing from the password being wrong, and
+        // the dialog says so instead of blaming the password.
+        if let Some(seconds) = unlock_blocked_for() {
+            return Err(dbus_err(format!(
+                "demasiados intentos fallidos: probá de nuevo en {seconds} s"
+            )));
+        }
+
         let path = match keyring_path() {
             Some(p) => p,
             None => return Ok(false),
@@ -1268,13 +1372,17 @@ impl PamUnlockInterface {
             let raw = std::fs::read(&path).map_err(|e| dbus_err(format!("{e}")))?;
             match crypto::decrypt_database(&raw, password) {
                 Ok(db) => db,
-                Err(_) => return Ok(false),
+                Err(_) => {
+                    note_failed_unlock();
+                    return Ok(false);
+                }
             }
         } else {
             crypto::KeyringDatabase { items: vec![] }
         };
 
         set_master_password(password);
+        note_successful_unlock();
 
         let coll_path = "/org/freedesktop/secrets/collection/login".to_string();
         let item_paths: Vec<String>;

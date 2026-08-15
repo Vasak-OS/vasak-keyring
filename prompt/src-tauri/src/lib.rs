@@ -47,7 +47,13 @@ async fn unlock(password: String) -> Result<bool, String> {
             &(password.as_str(),),
         )
         .await
-        .map_err(|error| format!("{error}"))?;
+        .map_err(|error| match error {
+            // What the daemon says is meant to be read: after three wrong
+            // passwords it answers with how long the wait is, and putting
+            // "the keyring did not answer" in front of that would be a lie.
+            zbus::Error::MethodError(_, Some(message), _) => message,
+            other => format!("{other}"),
+        })?;
 
     reply.body().deserialize::<bool>().map_err(|error| format!("{error}"))
 }

@@ -144,6 +144,11 @@ fn send_to_daemon(uid: u32, password: &str) -> bool {
             // A `false` reply is a real answer — the password was wrong for the
             // existing database. Retrying cannot change that.
             Ok(unlocked) => return unlocked,
+            // Neither is an error the daemon itself sent, such as the one it
+            // answers with after too many failed attempts. Only being unable to
+            // reach it is worth waiting for, since at login the daemon is often
+            // still starting.
+            Err(zbus::Error::MethodError(..)) => return false,
             Err(_) if attempt + 1 < UNLOCK_ATTEMPTS => std::thread::sleep(UNLOCK_RETRY),
             Err(_) => return false,
         }

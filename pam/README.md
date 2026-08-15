@@ -10,13 +10,18 @@ con qué descifrar la base.
 
 ## Qué agregar
 
-En `/etc/pam.d/system-login`, que es el stack que comparten greetd y los inicios
-por consola, **después** de los `include system-auth`:
+Desde 0.3.0 **el paquete lo hace solo** al instalarse, y sólo si
+`/etc/pam.d/system-login` es el archivo que espera; si no, no lo toca y explica
+qué falta. Esto es lo que agrega, y lo que hay que poner a mano en ese caso:
 
 ```
-auth       optional   pam_vasak_keyring.so
-session    optional   pam_vasak_keyring.so
+auth       optional   pam_vasak_keyring.so     ← después del "auth include system-auth"
+session    optional   pam_vasak_keyring.so     ← al final, después de pam_systemd
 ```
+
+`system-login` es el stack que comparten greetd (a través de
+`system-local-login`) y los inicios por consola, o sea todas las formas de
+entrar al sistema.
 
 ## Por qué las dos líneas
 
@@ -26,7 +31,9 @@ Hacen falta ambas y en ese orden:
   contraseña que el usuario acaba de escribir, guardándola en el contexto de PAM.
   Va después de `system-auth` porque para entonces la contraseña ya se pidió.
 - `session` corre al abrir la sesión, recupera esa contraseña del contexto y se
-  la pasa al demonio por D-Bus.
+  la pasa al demonio por D-Bus. Va **al final**, después de `pam_systemd`: ese es
+  el módulo que crea `/run/user/<uid>`, y ahí adentro vive el socket del bus por
+  donde se entrega la contraseña. Antes de él no hay dónde entregarla.
 
 Con `session` sola el módulo no encuentra nada guardado y no hace nada: el
 llavero queda bloqueado igual que si no estuviera configurado.

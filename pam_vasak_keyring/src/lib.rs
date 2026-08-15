@@ -43,6 +43,12 @@ extern "C" {
     ) -> c_int;
 
     fn pam_syslog(pamh: *mut pam_handle_t, priority: c_int, format: *const c_char, ...) -> c_int;
+
+    fn pam_get_user(
+        pamh: *mut pam_handle_t,
+        user: *mut *const c_char,
+        prompt: *const c_char,
+    ) -> c_int;
 }
 
 // ── Logging helper ─────────────────────────────────────────
@@ -85,10 +91,42 @@ const UNLOCK_METHOD: &str = "Unlock";
 const UNLOCK_ATTEMPTS: u32 = 10;
 const UNLOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(150);
 
-fn try_unlock(password: &str) -> Result<bool, zbus::Error> {
-    use zbus::blocking::Connection;
+/// The uid the login is for, which is not the one this code runs as.
+///
+/// PAM modules run as root, in the login manager's process, before anything of
+/// the user's session exists.
+fn target_uid(pamh: *mut pam_handle_t) -> Option<u32> {
+    let mut user: *const c_char = std::ptr::null();
 
-    let conn = Connection::session()?;
+    if unsafe { pam_get_user(pamh, &mut user, std::ptr::null()) } != PAM_SUCCESS || user.is_null() {
+        return None;
+    }
+
+    let name = unsafe { CStr::from_ptr(user) };
+    let name = CString::new(name.to_bytes()).ok()?;
+    let entry = unsafe { libc::getpwnam(name.as_ptr()) };
+
+    if entry.is_null() {
+        None
+    } else {
+        Some(unsafe { (*entry).pw_uid })
+    }
+}
+
+/// The bus the daemon is on: the user's, addressed explicitly.
+///
+/// `Connection::session()` reads the environment of the current process, and at
+/// this point that process is the login manager running as root — with no
+/// XDG_RUNTIME_DIR of the user in it, and often none at all. So it either found
+/// root's bus or nothing, never the one the daemon is sitting on, and the unlock
+/// could not have worked no matter how the PAM stack was configured.
+fn session_bus(uid: u32) -> Result<zbus::blocking::Connection, zbus::Error> {
+    zbus::blocking::connection::Builder::address(format!("unix:path=/run/user/{uid}/bus").as_str())?
+        .build()
+}
+
+fn try_unlock(uid: u32, password: &str) -> Result<bool, zbus::Error> {
+    let conn = session_bus(uid)?;
     let reply = conn.call_method(
         Some(KEYRING_SERVICE),
         KEYRING_PATH,
@@ -100,9 +138,9 @@ fn try_unlock(password: &str) -> Result<bool, zbus::Error> {
     Ok(reply.body().deserialize::<bool>().unwrap_or(false))
 }
 
-fn send_to_daemon(password: &str) -> bool {
+fn send_to_daemon(uid: u32, password: &str) -> bool {
     for attempt in 0..UNLOCK_ATTEMPTS {
-        match try_unlock(password) {
+        match try_unlock(uid, password) {
             // A `false` reply is a real answer — the password was wrong for the
             // existing database. Retrying cannot change that.
             Ok(unlocked) => return unlocked,
@@ -186,8 +224,13 @@ pub extern "C" fn pam_sm_open_session(
         bx.clone()
     };
 
+    let Some(uid) = target_uid(pamh) else {
+        log(pamh, "pam_vasak_keyring: could not resolve the user of this login");
+        return PAM_IGNORE;
+    };
+
     // Send to daemon
-    if password.len() > 0 && send_to_daemon(&password) {
+    if password.len() > 0 && send_to_daemon(uid, &password) {
         log(pamh, "pam_vasak_keyring: keyring unlocked successfully");
     } else {
         log(pamh, "pam_vasak_keyring: could not unlock keyring (daemon unavailable or wrong password)");

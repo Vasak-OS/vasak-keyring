@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the keyring unlock dialog",
+  "windows": [
+    "unlock-dialog"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:window:allow-close",
+    "vicons:default",
+    "config-manager:default"
+  ]
+}

@@ -1,0 +1,24 @@
+[package]
+name = "vasak-keyring-prompt"
+description = "VasakOS keyring unlock dialog"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "vasak_keyring_prompt_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "vasak-keyring-prompt"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-config-manager = "2"
+tauri-plugin-vicons = "2"
+serde = { version = "1", features = ["derive"] }
+zbus = { version = "5", features = ["tokio"] }
+zeroize = "1"

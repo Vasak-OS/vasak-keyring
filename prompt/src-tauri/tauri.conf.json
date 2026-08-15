@@ -1,0 +1,50 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "vasak-keyring-prompt",
+  "version": "0.1.0",
+  "identifier": "ar.net.vasak.os.keyring-prompt",
+  "build": {
+    "beforeDevCommand": "bun run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "bun run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "deb",
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": false,
+        "files": {}
+      },
+      "deb": {
+        "depends": [
+          "libcairo2",
+          "desktop-file-utils",
+          "libgdk-pixbuf-2.0-0",
+          "libglib2.0-0t64",
+          "libgtk-3-0t64",
+          "hicolor-icon-theme",
+          "libsoup2.4-1",
+          "libsoup-3.0-0",
+          "libpango-1.0-0",
+          "libwebkit2gtk-4.1-0"
+        ],
+        "files": {}
+      }
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

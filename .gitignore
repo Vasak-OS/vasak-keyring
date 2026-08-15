@@ -1,2 +1,12 @@
+# Build output. The Cargo workspace lives at the repository root, so its target
+# directory does too — prompt/src-tauri/.gitignore would not cover it.
 /target
 Cargo.lock
+
+# The unlock dialog is a Tauri application: its JavaScript half brings the usual
+# build artefacts along.
+node_modules
+dist
+dist-ssr
+*.local
+prompt/src-tauri/gen

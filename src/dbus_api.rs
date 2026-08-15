@@ -741,6 +741,37 @@ impl ServiceInterface {
             .map_err(|e| dbus_err(format!("{e}")))
     }
 
+    /// The object a client is told to prompt on when an unlock cannot happen
+    /// right away, or "/" when asking would be a bad idea.
+    ///
+    /// It is a bad idea when there is no database on disk yet: whatever is typed
+    /// would become the master password of a brand new keyring, and a typo there
+    /// creates one that the login password will never open again. The first
+    /// unlock has to come from the login, where the password is not typed into a
+    /// dialog but already known to be the account's.
+    async fn spawn_unlock_prompt(&self, objects: Vec<OwnedObjectPath>) -> OwnedObjectPath {
+        if !keyring_path().map(|p| p.exists()).unwrap_or(false) {
+            return owned_path("/");
+        }
+
+        static NEXT_PROMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT_PROMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = format!("/org/freedesktop/secrets/prompt/u{id}");
+
+        let iface = PromptInterface {
+            conn: self.conn.clone(),
+            path: path.clone(),
+            objects,
+        };
+
+        match self.conn.object_server().at(path.as_str(), iface).await {
+            Ok(_) => owned_path(&path),
+            // Without an object to prompt on, "/" at least tells the client the
+            // truth: nothing was unlocked and nothing is going to ask.
+            Err(_) => owned_path("/"),
+        }
+    }
+
     async fn spawn_collection(&self, path: &str, alias: &str, label: &str)
         -> Result<(), zbus::fdo::Error>
     {
@@ -1008,12 +1039,13 @@ impl ServiceInterface {
         objects: Vec<OwnedObjectPath>,
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath), zbus::fdo::Error> {
         // Clearing the per-collection flag cannot unlock anything while there is
-        // no master password in memory: adopting one is the PAM module's job.
-        // Reporting the objects as unlocked made clients carry on and hit
-        // LOCKED_MESSAGE instead of reporting the keyring as locked. An empty
-        // list with no prompt is the honest answer: nothing could be unlocked.
+        // no master password in memory. The spec's answer for "not now, ask the
+        // user" is a prompt object: the client calls Prompt() on it and waits
+        // for Completed, which is the flow libsecret already drives on its own.
+        // Reporting the objects as unlocked instead made clients carry on and
+        // hit LOCKED_MESSAGE.
         if master_password().is_none() {
-            return Ok((Vec::new(), owned_path("/")));
+            return Ok((Vec::new(), self.spawn_unlock_prompt(objects).await));
         }
 
         let mut state = self.state.lock().await;
@@ -1079,6 +1111,113 @@ impl ServiceInterface {
         }
         Ok(result)
     }
+}
+
+// ── Unlock prompt ──────────────────────────────────────────
+
+/// The dialog that asks for the password when the login did not provide it.
+const PROMPTER: &str = "/usr/bin/vasak-keyring-prompt";
+
+/// One `org.freedesktop.Secret.Prompt`, alive for a single unlock request.
+///
+/// The Secret Service spec puts asking the user behind this object: a client
+/// that finds the keyring locked calls `Service.Unlock`, gets a prompt back,
+/// calls `Prompt()` on it and waits for `Completed`. libsecret does all of that
+/// on its own, so implementing it here is what makes every application — the
+/// Vasak ones, browsers, editors — able to offer the unlock instead of failing.
+///
+/// The daemon does not draw anything: it runs the dialog, which unlocks through
+/// the same private interface the PAM module uses, and then reports what
+/// happened. Whether the password was right is not something this object needs
+/// to know — only whether a master password ended up in memory.
+pub struct PromptInterface {
+    conn: Connection,
+    path: String,
+    /// What the caller asked to unlock, echoed back in `Completed`.
+    objects: Vec<OwnedObjectPath>,
+}
+
+impl PromptInterface {
+    /// Runs the dialog and answers the waiting client.
+    async fn run(conn: Connection, path: String, objects: Vec<OwnedObjectPath>) {
+        let unlocked = Self::ask().await && master_password().is_some();
+
+        if let Ok(emitter) = SignalEmitter::new(&conn, path.as_str()) {
+            let result = if unlocked { objects } else { Vec::new() };
+            let value = Value::Array(zvariant::Array::from(result));
+            let _ = Self::completed(&emitter, !unlocked, value).await;
+        }
+
+        // A prompt is good for one answer, and the client already has it.
+        let _ = conn
+            .object_server()
+            .remove::<PromptInterface, _>(path.as_str())
+            .await;
+    }
+
+    /// Shows the dialog and waits for it. `true` means the person went through
+    /// with it; a cancel, a missing binary or a crash all mean `false`.
+    ///
+    /// It goes through `systemd-run --user` on purpose: the daemon starts with
+    /// the session, usually before the compositor, so its own environment has no
+    /// WAYLAND_DISPLAY and anything graphical it spawned directly would fail to
+    /// open a window. The systemd user manager does have it, put there by
+    /// `uwsm finalize` when the session came up.
+    async fn ask() -> bool {
+        let via_systemd = tokio::process::Command::new("systemd-run")
+            .args(["--user", "--wait", "--collect", "--quiet", "--pipe", PROMPTER])
+            .status()
+            .await;
+
+        match via_systemd {
+            Ok(status) => status.success(),
+            Err(_) => tokio::process::Command::new(PROMPTER)
+                .status()
+                .await
+                .map(|status| status.success())
+                .unwrap_or(false),
+        }
+    }
+}
+
+#[interface(name = "org.freedesktop.Secret.Prompt")]
+impl PromptInterface {
+    /// Returns as soon as the dialog is on its way, per the spec: the answer
+    /// travels in `Completed`. Blocking here instead would hold the client's
+    /// method call open for as long as somebody takes to type.
+    async fn prompt(&mut self, _window_id: String) -> Result<(), zbus::fdo::Error> {
+        let conn = self.conn.clone();
+        let path = self.path.clone();
+        let objects = self.objects.clone();
+
+        tokio::spawn(async move { Self::run(conn, path, objects).await });
+        Ok(())
+    }
+
+    async fn dismiss(&mut self) -> Result<(), zbus::fdo::Error> {
+        if let Ok(emitter) = SignalEmitter::new(&self.conn, self.path.as_str()) {
+            let empty = Value::Array(zvariant::Array::from(Vec::<OwnedObjectPath>::new()));
+            let _ = Self::completed(&emitter, true, empty).await;
+        }
+
+        let conn = self.conn.clone();
+        let path = self.path.clone();
+        tokio::spawn(async move {
+            let _ = conn
+                .object_server()
+                .remove::<PromptInterface, _>(path.as_str())
+                .await;
+        });
+
+        Ok(())
+    }
+
+    #[zbus(signal)]
+    async fn completed(
+        emitter: &SignalEmitter<'_>,
+        dismissed: bool,
+        result: Value<'_>,
+    ) -> zbus::Result<()>;
 }
 
 // ── PAM unlock interface (called by pam_vasak_keyring.so) ──

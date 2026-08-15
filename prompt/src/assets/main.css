@@ -1,0 +1,180 @@
+@import "tailwindcss";
+
+:root {
+  /* general */
+  --corner-radius: 10px;
+
+  /* Colores de Marca */
+  --primary: #dd7878;
+  --secondary: #8839ef;
+  --primary-dark: #eba0ac;
+  --secondary-dark: #cba6f7;
+
+  /* Colores de Interfaz (UI) */
+  --ui-background: #eff1f5;
+  --ui-surface: #ccd0da;
+  --ui-border: #dce0e8;
+  --ui-background-dark: #1e1e2e;
+  --ui-surface-dark: #313244;
+  --ui-border-dark: #11111b;
+
+  /* Colores de Texto */
+  --text-main: #4c4f69;
+  --text-muted: #6c6f85;
+  --text-on-primary: #5c5f77;
+  --text-main-dark: #cdd6f4;
+  --text-muted-dark: #a6adc8;
+  --text-on-primary-dark: #cdd6f4;
+
+  /* Status */
+  --status-error: #d20f39;
+  --status-success: #40a02b;
+  --status-warning: #df8e1d;
+  --status-error-dark: #f38ba8;
+  --status-success-dark: #a6e3a1;
+  --status-warning-dark: #f9e2af;
+
+  /* Terminal Colors */
+  --terminal-foreground: #4c4f69;
+  --terminal-background: #eff1f5;
+  --terminal-cursor: #dd7878;
+  --terminal-foreground-dark: #dddddd;
+  --terminal-background-dark: #1a1a1a;
+  --terminal-cursor-dark: #d4885c;
+
+  --terminal-ansi-black: #4c4f69;
+  --terminal-ansi-red: #d20f39;
+  --terminal-ansi-green: #40a02b;
+  --terminal-ansi-yellow: #df8e1d;
+  --terminal-ansi-blue: #1e66f5;
+  --terminal-ansi-magenta: #8839ef;
+  --terminal-ansi-cyan: #04a5e5;
+  --terminal-ansi-white: #e6e9ef;
+
+  --terminal-ansi-bright-black: #4c4f69;
+  --terminal-ansi-bright-red: #d20f39;
+  --terminal-ansi-bright-green: #40a02b;
+  --terminal-ansi-bright-yellow: #df8e1d;
+  --terminal-ansi-bright-blue: #1e66f5;
+  --terminal-ansi-bright-magenta: #8839ef;
+  --terminal-ansi-bright-cyan: #04a5e5;
+  --terminal-ansi-bright-white: #e6e9ef;
+
+  --terminal-ansi-black-dark: #181825;
+  --terminal-ansi-red-dark: #f38ba8;
+  --terminal-ansi-green-dark: #a6e3a1;
+  --terminal-ansi-yellow-dark: #f9e2af;
+  --terminal-ansi-blue-dark: #89b4fa;
+  --terminal-ansi-magenta-dark: #eba0ac;
+  --terminal-ansi-cyan-dark: #89dceb;
+  --terminal-ansi-white-dark: #cdd6f4;
+
+  --terminal-ansi-bright-black-dark: #181825;
+  --terminal-ansi-bright-red-dark: #f38ba8;
+  --terminal-ansi-bright-green-dark: #a6e3a1;
+  --terminal-ansi-bright-yellow-dark: #f9e2af;
+  --terminal-ansi-bright-blue-dark: #89b4fa;
+  --terminal-ansi-bright-magenta-dark: #eba0ac;
+  --terminal-ansi-bright-cyan-dark: #89dceb;
+  --terminal-ansi-bright-white-dark: #cdd6f4;
+
+  /* Logic Assignments */
+  --use-primary: var(--primary);
+  --use-secondary: var(--secondary);
+  --use-ui-background: var(--ui-background);
+  --use-ui-surface: var(--ui-surface);
+  --use-ui-border: var(--ui-border);
+  --use-text-main: var(--text-main);
+  --use-text-muted: var(--text-muted);
+  --use-text-on-primary: var(--text-on-primary);
+  --use-status-error: var(--status-error);
+  --use-status-success: var(--status-success);
+  --use-status-warning: var(--status-warning);
+}
+
+.dark {
+  /* Override logic assignments in dark mode */
+  --use-primary: var(--primary-dark);
+  --use-secondary: var(--secondary-dark);
+  --use-ui-background: var(--ui-background-dark);
+  --use-ui-surface: var(--ui-surface-dark);
+  --use-ui-border: var(--ui-border-dark);
+  --use-text-main: var(--text-main-dark);
+  --use-text-muted: var(--text-muted-dark);
+  --use-text-on-primary: var(--text-on-primary-dark);
+  --use-status-error: var(--status-error-dark);
+  --use-status-success: var(--status-success-dark);
+  --use-status-warning: var(--status-warning-dark);
+}
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  /* radius */
+  --radius-corner: var(--corner-radius);
+  --radius-corner-window: calc(var(--corner-radius) + 2px);
+
+  /* Colores de Marca - responsive a dark mode */
+  --color-primary: var(--use-primary);
+  --color-secondary: var(--use-secondary);
+
+  /* Colores de Interfaz (UI) - responsive a dark mode */
+  --color-ui-bg: var(--use-ui-background);
+  --color-ui-surface: var(--use-ui-surface);
+  --color-ui-border: var(--use-ui-border);
+
+  /* Colores de Texto - responsive a dark mode */
+  --color-tx-main: var(--use-text-main);
+  --color-tx-muted: var(--use-text-muted);
+  --color-tx-on-primary: var(--use-text-on-primary);
+
+  /* Status - responsive a dark mode */
+  --color-status-error: var(--use-status-error);
+  --color-status-success: var(--use-status-success);
+  --color-status-warning: var(--use-status-warning);
+}
+
+
+::view-transition-old(root) {
+  animation-delay: 500ms;
+}
+
+::view-transition-new(root) {
+  animation: circle-in 500ms;
+}
+
+body * {
+  @apply text-tx-main transition-colors duration-300;
+}
+
+.background {
+  @apply bg-ui-bg/80;
+}
+
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentColor);
+  }
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}

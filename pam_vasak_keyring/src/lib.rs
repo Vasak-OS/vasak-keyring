@@ -88,8 +88,27 @@ const UNLOCK_METHOD: &str = "Unlock";
 /// PAM opens the session before the user's systemd units are up, so the very
 /// first attempt at login usually finds no daemon. This only costs time when
 /// the daemon really is absent; the normal case answers on the first attempt.
-const UNLOCK_ATTEMPTS: u32 = 10;
-const UNLOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(150);
+const UNLOCK_ATTEMPTS: u32 = 15;
+const UNLOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Whether a D-Bus error means «todavía no arrancó» rather than «no».
+///
+/// Un demonio que aún no reclamó su nombre no da un error de conexión: el bus
+/// contesta por él con ServiceUnknown, y eso es un MethodError como cualquier
+/// otro. Tratarlos a todos como respuesta definitiva desactivaba justo el
+/// reintento escrito para este caso: al iniciar sesión, PAM corre un segundo
+/// después de que systemd lanza el demonio y se rendía en el primer intento.
+/// El llavero quedaba cerrado toda la sesión y, en una máquina nueva, ni
+/// siquiera llegaba a crearse.
+fn todavia_arrancando(error_name: &str) -> bool {
+    matches!(
+        error_name,
+        "org.freedesktop.DBus.Error.ServiceUnknown"
+            | "org.freedesktop.DBus.Error.NameHasNoOwner"
+            | "org.freedesktop.DBus.Error.NoReply"
+            | "org.freedesktop.DBus.Error.Disconnected"
+    )
+}
 
 /// The uid the login is for, which is not the one this code runs as.
 ///
@@ -144,11 +163,15 @@ fn send_to_daemon(uid: u32, password: &str) -> bool {
             // A `false` reply is a real answer — the password was wrong for the
             // existing database. Retrying cannot change that.
             Ok(unlocked) => return unlocked,
-            // Neither is an error the daemon itself sent, such as the one it
-            // answers with after too many failed attempts. Only being unable to
-            // reach it is worth waiting for, since at login the daemon is often
-            // still starting.
-            Err(zbus::Error::MethodError(..)) => return false,
+            // Un error que mandó el demonio de verdad —por ejemplo el de
+            // demasiados intentos fallidos— también es una respuesta. Los que
+            // dicen que no hay nadie escuchando, no: al iniciar sesión el
+            // demonio suele estar arrancando todavía.
+            Err(zbus::Error::MethodError(name, ..))
+                if !todavia_arrancando(name.as_str()) =>
+            {
+                return false
+            }
             Err(_) if attempt + 1 < UNLOCK_ATTEMPTS => std::thread::sleep(UNLOCK_RETRY),
             Err(_) => return false,
         }
@@ -238,7 +261,12 @@ pub extern "C" fn pam_sm_open_session(
     if password.len() > 0 && send_to_daemon(uid, &password) {
         log(pamh, "pam_vasak_keyring: keyring unlocked successfully");
     } else {
-        log(pamh, "pam_vasak_keyring: could not unlock keyring (daemon unavailable or wrong password)");
+        log(
+            pamh,
+            "pam_vasak_keyring: no se pudo abrir el llavero. O la contraseña no \
+             corresponde a la base existente, o el demonio no llegó a arrancar \
+             en los 3 segundos que se lo espera.",
+        );
     }
 
     // password zeroized automatically on drop (Zeroizing)
@@ -274,4 +302,27 @@ pub extern "C" fn pam_sm_close_session(
     _argv: *mut *const c_char,
 ) -> c_int {
     PAM_SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// El error que rompía el inicio de sesión: el demonio arranca junto con la
+    /// sesión y el bus contesta por él hasta que reclama su nombre. Si eso
+    /// cuenta como «no», el llavero nunca se abre —y en una máquina nueva ni
+    /// siquiera se crea, porque se crea al abrirlo por primera vez.
+    #[test]
+    fn un_demonio_que_todavia_no_arranco_no_es_una_negativa() {
+        assert!(todavia_arrancando("org.freedesktop.DBus.Error.ServiceUnknown"));
+        assert!(todavia_arrancando("org.freedesktop.DBus.Error.NameHasNoOwner"));
+    }
+
+    /// Lo que contesta el demonio sí es una respuesta: insistir después de tres
+    /// contraseñas incorrectas es exactamente lo que la espera quiere evitar.
+    #[test]
+    fn lo_que_contesta_el_demonio_es_definitivo() {
+        assert!(!todavia_arrancando("org.freedesktop.DBus.Error.Failed"));
+        assert!(!todavia_arrancando("org.freedesktop.DBus.Error.AccessDenied"));
+    }
 }

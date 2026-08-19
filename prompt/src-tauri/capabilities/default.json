@@ -3,7 +3,8 @@
   "identifier": "default",
   "description": "Capability for the keyring unlock dialog",
   "windows": [
-    "unlock-dialog"
+    "unlock-dialog",
+    "ssh-askpass"
   ],
   "permissions": [
     "core:default",

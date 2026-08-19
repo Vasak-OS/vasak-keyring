@@ -12,6 +12,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "vasak-keyring-prompt"
 path = "src/main.rs"
 
+# El programa que ssh ejecuta cuando necesita la frase de una clave. Comparte
+# la interfaz con el diálogo del llavero —es el mismo diálogo con otro texto—
+# y por eso vive en el mismo paquete.
+[[bin]]
+name = "vasak-ssh-askpass"
+path = "src/ssh_main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -22,3 +29,6 @@ tauri-plugin-vicons = "2"
 serde = { version = "1", features = ["derive"] }
 zbus = { version = "5", features = ["tokio"] }
 zeroize = "1"
+libc = "0.2"
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+futures-util = "0.3"

@@ -207,7 +207,9 @@ pub extern "C" fn pam_sm_authenticate(
     let owned = Zeroizing::new(password.to_string_lossy().into_owned());
     let stored = Box::new(owned);
 
-    let key = CString::new("vasak_keyring_password").unwrap();
+    // Literal `c""`: no hay nada que construir ni desenvolver, y en un módulo
+    // PAM un panic se lleva puesto el inicio de sesión.
+    let key = c"vasak_keyring_password";
     let ret = unsafe {
         pam_set_data(
             pamh,
@@ -237,7 +239,9 @@ pub extern "C" fn pam_sm_open_session(
     _argc: c_int,
     _argv: *mut *const c_char,
 ) -> c_int {
-    let key = CString::new("vasak_keyring_password").unwrap();
+    // Literal `c""`: no hay nada que construir ni desenvolver, y en un módulo
+    // PAM un panic se lleva puesto el inicio de sesión.
+    let key = c"vasak_keyring_password";
     let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
 
     let ret = unsafe { pam_get_data(pamh, key.as_ptr(), &mut data) };

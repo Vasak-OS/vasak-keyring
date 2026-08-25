@@ -17,8 +17,17 @@ fn dbus_err(msg: impl Into<String>) -> zbus::fdo::Error {
     zbus::fdo::Error::Failed(msg.into())
 }
 
+/// Ruta de objeto de D-Bus, cayendo a la raíz si no es válida.
+///
+/// Todos los llamadores actuales pasan `"/"` o una ruta armada acá, así que el
+/// `unwrap` que había no podía fallar. Pero un demonio de D-Bus que paniquea por
+/// una ruta mal formada es un servicio que se puede tirar desde afuera el día
+/// que alguien pase un valor de otro origen, y al lado vive `owned_path_try`
+/// para cuando la entrada sí es ajena.
 fn owned_path(s: &str) -> OwnedObjectPath {
-    OwnedObjectPath::try_from(s).unwrap()
+    OwnedObjectPath::try_from(s).unwrap_or_else(|_| {
+        OwnedObjectPath::try_from("/").expect("la raíz siempre es una ruta válida")
+    })
 }
 
 fn owned_path_try(s: &str) -> Result<OwnedObjectPath, zbus::fdo::Error> {
@@ -30,10 +39,14 @@ fn owned_path_try(s: &str) -> Result<OwnedObjectPath, zbus::fdo::Error> {
 // ── helpers ───────────────────────────────────────────────
 
 fn now() -> u64 {
+    // Cero y no un panic si el reloj está antes de 1970. Pasa con una pila RTC
+    // muerta o un arranque sin red, y acá tiraba el demonio del llavero entero
+    // —o sea, dejaba la sesión sin contraseñas— por una marca de tiempo que
+    // sólo se usa para informar cuándo se creó o modificó una entrada.
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn u8_array_value(v: Vec<u8>) -> OwnedValue {
@@ -813,14 +826,14 @@ impl ServiceInterface {
             created: now(),
             modified: now(),
         };
-        state.collections.insert(path.to_string(), col_info);
-        state.aliases.insert(alias.to_string(), path.to_string());
-        // The login collection is the default keyring; libsecret resolves the
-        // "default" alias when storing/looking up passwords.
-        if alias == "login" {
-            state.aliases.insert("default".to_string(), path.to_string());
-        }
-
+        // Las entradas se arman **antes** de insertar la colección, así se
+        // inserta ya completa.
+        //
+        // Estaba al revés —insertar, llenar, y volver a buscarla con
+        // `get_mut().unwrap()`— para sortear el préstamo mutable de
+        // `take_item_id()`. Correcto, pero el `unwrap` dependía de que las dos
+        // partes usaran la misma clave: cualquier cambio en el medio lo
+        // convertía en un panic dentro del demonio del llavero.
         let mut item_paths = Vec::new();
         for si in loaded {
             let ip = format!("{path}/items/{}", state.take_item_id());
@@ -828,8 +841,17 @@ impl ServiceInterface {
             item_paths.push(ip);
         }
 
-        let col = state.collections.get_mut(path).unwrap();
-        col.items = item_paths.clone();
+        let col_info = CollectionInfo {
+            items: item_paths.clone(),
+            ..col_info
+        };
+        state.collections.insert(path.to_string(), col_info);
+        state.aliases.insert(alias.to_string(), path.to_string());
+        // The login collection is the default keyring; libsecret resolves the
+        // "default" alias when storing/looking up passwords.
+        if alias == "login" {
+            state.aliases.insert("default".to_string(), path.to_string());
+        }
 
         // Register item interfaces
         for ip in &item_paths {

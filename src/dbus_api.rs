@@ -1533,6 +1533,23 @@ pub const ESQUEMA_PORTAL: &str = "org.freedesktop.portal.Secret";
 /// sea larga. 64 bytes es lo que usan las otras implementaciones del portal.
 const LARGO_SECRETO_PORTAL: usize = 64;
 
+/// Serializa la creación de secretos maestros.
+///
+/// Sin esto, dos pedidos simultáneos para la misma aplicación pasan los dos por
+/// el «¿ya existe?», los dos generan, y los dos insertan **con rutas distintas**
+/// —el contador de items da ids distintos— así que quedan dos entradas con los
+/// mismos atributos. Después, `find` recorre un `HashMap`: devuelve una o la otra
+/// según el orden interno, que no es estable. Lo que la aplicación cifró con la
+/// que recibió primero deja de abrirse.
+///
+/// Un único candado global y no uno por aplicación: un secreto maestro se crea
+/// una vez en la vida de cada programa, así que serializarlos todos no cuesta
+/// nada y no hay que mantener un mapa de candados.
+fn candado_de_creacion() -> &'static Mutex<()> {
+    static CANDADO: OnceLock<Mutex<()>> = OnceLock::new();
+    CANDADO.get_or_init(|| Mutex::new(()))
+}
+
 /// El secreto maestro de una aplicación, creándolo la primera vez.
 ///
 /// La especificación del portal pide que sea **único por aplicación y estable
@@ -1564,19 +1581,15 @@ pub async fn secreto_maestro_de_app(
         ("app_id".to_string(), app_id.to_string()),
     ]);
 
-    // ¿Ya existe?
-    {
-        let estado = state.lock().await;
-        if let Some(item) = estado
-            .items
-            .values()
-            .find(|item| item.attributes == atributos)
-        {
-            return Ok(item.secret.clone());
-        }
+    // Todo el «buscar, y si no está crear» va bajo un mismo candado: si dos
+    // pedidos simultáneos pasaran los dos por la búsqueda, crearían dos secretos
+    // distintos para la misma aplicación. Ver `candado_de_creacion`.
+    let _guardia = candado_de_creacion().lock().await;
+
+    if let Some(existente) = buscar_secreto(state, &atributos).await {
+        return Ok(existente);
     }
 
-    // No: se crea uno.
     use rand::RngCore;
     let mut secreto = vec![0u8; LARGO_SECRETO_PORTAL];
     rand::thread_rng().fill_bytes(&mut secreto);
@@ -1604,24 +1617,51 @@ pub async fn secreto_maestro_de_app(
         ruta
     };
 
-    // Se publica en el bus como cualquier otra entrada.
+    // Se guarda **antes** de publicarlo y antes de devolverlo. Si el disco falla,
+    // la aplicación no debe recibir un secreto que en el próximo arranque no va a
+    // existir: cifraría sus datos con una clave que se pierde.
+    let items: Vec<ItemInfo> = {
+        let estado = state.lock().await;
+        estado.items.values().cloned().collect()
+    };
+    if let Err(e) = save_db(&items) {
+        // Y si falló, el secreto se deshace. Dejándolo en memoria, el próximo
+        // pedido lo encontraría y lo devolvería sin volver a intentar escribir:
+        // un error transitorio de disco alcanzaría para que la aplicación cifre
+        // con una clave que desaparece al reiniciar.
+        let mut estado = state.lock().await;
+        estado.items.remove(&ruta);
+        if let Some(col) = estado.collections.get_mut(coleccion) {
+            col.items.retain(|p| p != &ruta);
+        }
+        return Err(e);
+    }
+
+    // Recién ahora se publica en el bus, con el secreto ya en disco.
     let iface = ItemInterface {
         state: state.clone(),
         conn: conn.clone(),
         path: ruta.clone(),
     };
     if let Err(e) = conn.object_server().at(ruta.clone(), iface).await {
+        // No es fatal: el secreto existe y está guardado. Lo único que se pierde
+        // es que aparezca como entrada del Secret Service hasta el próximo
+        // arranque, donde se registra al cargar la base.
         eprintln!("vasak-keyring: no se pudo publicar {ruta}: {e}");
     }
 
-    // Y se guarda **antes** de entregarlo. Si el disco falla, la aplicación no
-    // debe recibir un secreto que en el próximo arranque no va a existir: cifraría
-    // sus datos con una clave que se pierde.
-    let items: Vec<ItemInfo> = {
-        let estado = state.lock().await;
-        estado.items.values().cloned().collect()
-    };
-    save_db(&items)?;
-
     Ok(secreto)
+}
+
+/// Busca un secreto ya guardado por sus atributos.
+async fn buscar_secreto(
+    state: &Arc<Mutex<KeyringState>>,
+    atributos: &HashMap<String, String>,
+) -> Option<Vec<u8>> {
+    let estado = state.lock().await;
+    estado
+        .items
+        .values()
+        .find(|item| &item.attributes == atributos)
+        .map(|item| item.secret.clone())
 }

@@ -21,6 +21,26 @@
 //! descriptor y el backend escribe ahí. Eso mantiene la clave fuera de los
 //! mensajes de D-Bus, que pasan por el broker y aparecen en cualquier traza del
 //! bus.
+//!
+//! # Quién puede llamar
+//!
+//! El `app_id` lo dice quien llama, y el backend no tiene forma de verificarlo:
+//! así está diseñado el portal, porque el que sí puede verificarlo es
+//! xdg-desktop-portal —lo deriva del sandbox del proceso que le pidió—. La
+//! consecuencia es que **cualquiera que pueda llamar acá directamente puede pedir
+//! el secreto de cualquier aplicación**, pasando su `app_id`. Con un diálogo de
+//! permiso eso sería una molestia; con una clave, es entregar los datos de otro.
+//!
+//! Por eso dos cosas:
+//!
+//! 1. Se comprueba que quien llama **sea** el portal, mirando el ejecutable de su
+//!    pid. Es el mismo mecanismo que usa vasak-permissions, y funciona por la
+//!    misma razón: escribir en `/usr/lib` requiere root.
+//! 2. Va en una **conexión propia** al bus, aparte de la que sirve el Secret
+//!    Service. Con las dos en la misma conexión, un permiso de sandbox concedido
+//!    sobre `org.freedesktop.secrets` alcanzaría para hablar con este backend: el
+//!    proxy de D-Bus filtra por nombre, y todos los nombres de una conexión
+//!    comparten el mismo nombre único.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -42,6 +62,29 @@ const RESPUESTA_OK: u32 = 0;
 /// Cualquier fallo que no sea una cancelación de la persona.
 const RESPUESTA_FALLO: u32 = 2;
 
+/// El ejecutable que tiene permitido pedir secretos por acá.
+///
+/// Sólo xdg-desktop-portal, que es el único que puede saber de verdad qué
+/// aplicación está preguntando. La ruta está en `/usr/lib`, donde escribir
+/// requiere root, así que ningún programa del usuario puede hacerse pasar por él.
+const EJECUTABLE_DEL_PORTAL: &str = "/usr/lib/xdg-desktop-portal";
+
+/// Si el pid que llama es el portal.
+///
+/// Separado para poder probarlo: la decisión es «este ejecutable sí, cualquier
+/// otro no», y un error acá no da ningún síntoma —simplemente deja de funcionar,
+/// o deja de proteger—.
+pub fn es_el_portal(ejecutable: Option<&str>) -> bool {
+    ejecutable == Some(EJECUTABLE_DEL_PORTAL)
+}
+
+/// El ejecutable de un pid, o `None` si no se puede saber.
+fn ejecutable_de(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|r| r.to_string_lossy().into_owned())
+}
+
 pub struct SecretBackend {
     state: Arc<Mutex<KeyringState>>,
     conn: zbus::Connection,
@@ -50,6 +93,40 @@ pub struct SecretBackend {
 impl SecretBackend {
     pub fn new(state: Arc<Mutex<KeyringState>>, conn: zbus::Connection) -> Self {
         Self { state, conn }
+    }
+}
+
+impl SecretBackend {
+    /// Si el mensaje viene del proceso del portal.
+    ///
+    /// El pid se le pregunta al bus —es el único que lo sabe de verdad— y de ahí
+    /// sale el ejecutable. Si algo de eso falla, se responde que no: es preferible
+    /// que la función deje de andar y se vea, a que deje de proteger y no se vea.
+    async fn llama_el_portal(&self, cabecera: &zbus::message::Header<'_>) -> bool {
+        let Some(emisor) = cabecera.sender() else {
+            return false;
+        };
+
+        let respuesta = self
+            .conn
+            .call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "GetConnectionUnixProcessID",
+                &(emisor.as_str(),),
+            )
+            .await;
+
+        let pid: u32 = match respuesta.and_then(|r| r.body().deserialize()) {
+            Ok(pid) => pid,
+            Err(e) => {
+                eprintln!("vasak-keyring: no se pudo identificar a quien pide el secreto: {e}");
+                return false;
+            }
+        };
+
+        es_el_portal(ejecutable_de(pid).as_deref())
     }
 }
 
@@ -62,6 +139,7 @@ impl SecretBackend {
     /// que el escritorio guarda por ella. Un diálogo acá no tendría qué decir.
     async fn retrieve_secret(
         &self,
+        #[zbus(header)] cabecera: zbus::message::Header<'_>,
         handle: ObjectPath<'_>,
         app_id: String,
         fd: zbus::zvariant::OwnedFd,
@@ -74,6 +152,16 @@ impl SecretBackend {
         // enseguida y no hay nada que cancelar. En `options` no hay nada que la
         // especificación defina para esta llamada.
         let _ = (handle, options);
+
+        // Sólo el portal. Cualquier otro proceso podría pedir el secreto de
+        // cualquier aplicación pasando su `app_id`: el backend no puede verificar
+        // ese dato, sólo puede verificar quién lo trae.
+        if !self.llama_el_portal(&cabecera).await {
+            eprintln!(
+                "vasak-keyring: se rechaza un pedido de secreto que no viene del portal"
+            );
+            return (RESPUESTA_FALLO, HashMap::new());
+        }
 
         let secreto = match secreto_maestro_de_app(&self.state, &self.conn, &app_id).await {
             Ok(secreto) => secreto,
@@ -149,6 +237,42 @@ mod tests {
         // nada, así que el backend nunca se elegía.
         let portal = include_str!("../packaging/vasak-keyring.portal");
         assert!(portal.contains("UseIn=Vasak;"), "UseIn tiene que ser Vasak");
+    }
+
+    /// Sólo el portal, y nada más.
+    ///
+    /// Esta es la puerta: sin ella, cualquier proceso del usuario puede pedir el
+    /// secreto de cualquier aplicación pasando su `app_id`, porque ese dato lo
+    /// dice quien llama y el backend no puede verificarlo.
+    #[test]
+    fn solo_el_ejecutable_del_portal_puede_pedir() {
+        assert!(es_el_portal(Some("/usr/lib/xdg-desktop-portal")));
+
+        // Un impostor con nombre parecido, que es la forma en que este chequeo se
+        // rompe si se hace con `contains` o `starts_with`.
+        assert!(!es_el_portal(Some("/usr/lib/xdg-desktop-portal-falso")));
+        assert!(!es_el_portal(Some("/tmp/xdg-desktop-portal")));
+        assert!(!es_el_portal(Some("/usr/lib/xdg-desktop-portal-gtk")));
+        assert!(!es_el_portal(Some("/usr/bin/algo")));
+    }
+
+    #[test]
+    fn sin_poder_saber_quien_llama_se_dice_que_no() {
+        // Un pid que ya murió, o un /proc que no se puede leer. Es preferible que
+        // la función deje de andar y se vea, a que deje de proteger y no se vea.
+        assert!(!es_el_portal(None));
+    }
+
+    /// El ejecutable que se exige tiene que ser el que la máquina realmente
+    /// tiene. Si el portal se mudara de ruta, el chequeo dejaría de aceptarlo y
+    /// la función se apagaría en silencio.
+    #[test]
+    fn la_ruta_del_portal_existe_en_esta_maquina() {
+        let ruta = std::path::Path::new(EJECUTABLE_DEL_PORTAL);
+        assert!(
+            ruta.exists(),
+            "{EJECUTABLE_DEL_PORTAL} no existe: el backend no aceptaría a nadie"
+        );
     }
 
     /// Que lo escrito sea exactamente el secreto, y que el descriptor quede

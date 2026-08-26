@@ -82,36 +82,48 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    // El backend del portal para el secreto maestro por aplicación. Nombre
-    // aparte del de Secret Service: son dos contratos distintos, y el portal
-    // busca este exacto —el mismo que declara `packaging/vasak-keyring.portal`—.
+    // El backend del portal para el secreto maestro por aplicación.
     //
-    // Si no se puede tomar, el llavero sigue sirviendo todo lo demás: lo único
+    // En una **conexión propia**, no en la que sirve el Secret Service. Con las
+    // dos en la misma, un permiso de sandbox concedido sobre
+    // `org.freedesktop.secrets` alcanzaría para hablar con este backend y pedir el
+    // secreto de cualquier aplicación: el proxy de D-Bus filtra por nombre, y
+    // todos los nombres de una conexión comparten el mismo nombre único.
+    //
+    // Si algo de esto falla, el llavero sigue sirviendo todo lo demás: lo único
     // que se pierde es que las aplicaciones en sandbox tengan clave propia, y es
     // preferible eso a no arrancar.
-    let backend = portal_secret::SecretBackend::new(state_portal, conn.clone());
-    match conn
-        .object_server()
-        .at(portal_secret::RUTA_BACKEND, backend)
-        .await
-    {
-        Ok(_) => match conn
-            .request_name_with_flags(
-                portal_secret::NOMBRE_BACKEND,
-                RequestNameFlags::DoNotQueue.into(),
-            )
-            .await
-        {
-            Ok(RequestNameReply::PrimaryOwner) => {}
-            otro => eprintln!(
-                "vasak-keyring: no se pudo tomar {}: {otro:?}; \
-                 las aplicaciones en sandbox no van a tener secreto propio",
-                portal_secret::NOMBRE_BACKEND
-            ),
-        },
+    match zbus::connection::Builder::session() {
+        Ok(constructor) => {
+            let backend_conn = constructor
+                .name(portal_secret::NOMBRE_BACKEND)
+                .and_then(|c| {
+                    c.serve_at(
+                        portal_secret::RUTA_BACKEND,
+                        portal_secret::SecretBackend::new(state_portal, conn.clone()),
+                    )
+                });
+
+            match backend_conn {
+                Ok(constructor) => match constructor.build().await {
+                    // Se deja viva a propósito: al soltarla, la conexión se cierra
+                    // y el nombre se pierde.
+                    Ok(viva) => {
+                        std::mem::forget(viva);
+                    }
+                    Err(e) => eprintln!(
+                        "vasak-keyring: no se pudo abrir la conexión del backend del portal \
+                         ({e}); las aplicaciones en sandbox no van a tener secreto propio"
+                    ),
+                },
+                Err(e) => eprintln!(
+                    "vasak-keyring: no se pudo publicar el backend del portal ({e}); \
+                     las aplicaciones en sandbox no van a tener secreto propio"
+                ),
+            }
+        }
         Err(e) => eprintln!(
-            "vasak-keyring: no se pudo publicar el backend del portal ({e}); \
-             las aplicaciones en sandbox no van a tener secreto propio"
+            "vasak-keyring: no se pudo preparar la conexión del backend del portal ({e})"
         ),
     }
 

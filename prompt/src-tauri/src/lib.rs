@@ -35,7 +35,14 @@ const UNLOCK_METHOD: &str = "Unlock";
 /// because they call for different things: retyping, or giving up.
 #[tauri::command]
 async fn unlock(password: String) -> Result<bool, String> {
+    // Se manda la maestra derivada y no la contraseña escrita, igual que hace el
+    // módulo de PAM: los dos caminos tienen que derivar idéntico o la base que
+    // crea uno no la abre el otro. Ver el crate `vasak-keyring-derivacion`.
+    //
+    // La escrita se envuelve igual para que no quede en memoria más de lo
+    // necesario, aunque acá no salga del proceso.
     let password = Zeroizing::new(password);
+    let maestra = vasak_keyring_derivacion::derivar_maestra(&password)?;
 
     let connection = zbus::Connection::session()
         .await
@@ -47,7 +54,7 @@ async fn unlock(password: String) -> Result<bool, String> {
             KEYRING_PATH,
             Some(KEYRING_INTERFACE),
             UNLOCK_METHOD,
-            &(password.as_str(),),
+            &(maestra.as_str(),),
         )
         .await
         .map_err(|error| match error {

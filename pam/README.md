@@ -31,9 +31,52 @@ Hacen falta ambas y en ese orden:
   contraseña que el usuario acaba de escribir, guardándola en el contexto de PAM.
   Va después de `system-auth` porque para entonces la contraseña ya se pidió.
 - `session` corre al abrir la sesión, recupera esa contraseña del contexto y se
-  la pasa al demonio por D-Bus. Va **al final**, después de `pam_systemd`: ese es
-  el módulo que crea `/run/user/<uid>`, y ahí adentro vive el socket del bus por
-  donde se entrega la contraseña. Antes de él no hay dónde entregarla.
+  la pasa al demonio por un socket unix propio,
+  `/run/user/<uid>/vasak-keyring/unlock.sock`. Va **al final**, después de
+  `pam_systemd`: ese es el módulo que crea `/run/user/<uid>`, y ahí adentro vive
+  el socket. Antes de él no hay dónde entregarla.
+
+## Por qué un socket propio y no D-Bus
+
+Esto se hacía por el bus de sesión y **nunca funcionó ni una vez**. El módulo
+corre como root, y `dbus-broker` acepta conexiones del dueño del bus y rechaza al
+resto —root incluido— durante la autenticación, antes de que exista mensaje
+alguno. El módulo veía un error de conexión, lo tomaba por «el demonio todavía no
+arrancó», reintentaba tres segundos y se rendía; el mensaje que dejaba en el
+diario nombraba dos causas posibles sin distinguirlas, y una de ellas era
+imposible.
+
+El socket vive dentro de `/run/user/<uid>`, que es 0700 del usuario, y root entra
+igual porque no está sujeto a los permisos. El demonio verifica con `SO_PEERCRED`
+que quien entrega sea root o el propio usuario. De paso la contraseña ya no
+atraviesa el proceso del broker, y el módulo dejó de cargar zbus y tokio dentro
+del gestor de inicio de sesión.
+
+## Lo que viaja no es la contraseña de la cuenta
+
+Ese directorio es **del usuario**, y ahí está el problema: cualquier código
+corriendo con su cuenta puede reemplazar por un enlace simbólico el directorio
+donde vive el socket y quedarse con lo que root entregue. Con la contraseña en
+texto plano eso sería escalada a root —esa contraseña es la de `sudo`—, y por un
+proceso sin privilegios.
+
+Así que no se manda la contraseña: se manda `Argon2id(contraseña, sal)`, con la
+sal derivada de `/etc/machine-id`. Quien intercepte se lleva la maestra del
+llavero y no la contraseña de la cuenta. Eso no le da nada nuevo —cualquier
+proceso del usuario ya puede pedirle todos los secretos al Secret Service, que es
+para lo que existe— pero deja de poder escalar.
+
+La derivación vive en el crate `vasak-keyring-derivacion` y no copiada en cada
+lado, porque hay **dos** caminos que entregan la maestra: el módulo de PAM al
+iniciar sesión y el diálogo gráfico cuando la pide a mano. Si derivaran distinto,
+la base creada por uno no la abriría el otro, y sin ningún error: la contraseña
+simplemente «no sería la correcta». Hay un test con vector fijo para que la
+derivación no pueda cambiar sin que se note.
+
+Como defensa adicional, el módulo comprueba antes de conectar que ningún
+componente de la ruta sea un enlace (`O_NOFOLLOW`) y que el dueño sea el usuario
+del inicio de sesión. Queda una carrera de microsegundos que no se puede cerrar
+con esta topología, y por eso no es la defensa principal.
 
 Con `session` sola el módulo no encuentra nada guardado y no hace nada: el
 llavero queda bloqueado igual que si no estuviera configurado.

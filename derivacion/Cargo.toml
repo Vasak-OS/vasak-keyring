@@ -1,0 +1,10 @@
+[package]
+name = "vasak-keyring-derivacion"
+version = "0.1.0"
+edition = "2021"
+description = "Derivación de la contraseña maestra del llavero, compartida por todos los que la entregan"
+
+[dependencies]
+argon2 = "0.5"
+sha2 = "0.10"
+zeroize = "1"

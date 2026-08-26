@@ -2,6 +2,7 @@
 mod crypto;
 mod dbus_api;
 mod session_crypto;
+mod portal_secret;
 mod unlock_socket;
 
 use std::sync::Arc;
@@ -70,6 +71,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // reclamar el nombre porque recién ahí se sabe que este proceso es el único
     // demonio, y por lo tanto que puede borrar un socket viejo sin robarle las
     // entregas a otro. Ver `unlock_socket.rs` para por qué no alcanza D-Bus.
+    let state_portal = state.clone();
     if let Err(e) = unlock_socket::escuchar(state, conn.clone()).await {
         // No es fatal: el llavero sigue sirviendo a quien ya esté desbloqueado y
         // el diálogo gráfico sigue funcionando por el bus. Pero el desbloqueo
@@ -78,6 +80,39 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "vasak-keyring: no se pudo abrir el socket de desbloqueo ({e}); \
              el llavero va a pedir la contraseña a mano."
         );
+    }
+
+    // El backend del portal para el secreto maestro por aplicación. Nombre
+    // aparte del de Secret Service: son dos contratos distintos, y el portal
+    // busca este exacto —el mismo que declara `packaging/vasak-keyring.portal`—.
+    //
+    // Si no se puede tomar, el llavero sigue sirviendo todo lo demás: lo único
+    // que se pierde es que las aplicaciones en sandbox tengan clave propia, y es
+    // preferible eso a no arrancar.
+    let backend = portal_secret::SecretBackend::new(state_portal, conn.clone());
+    match conn
+        .object_server()
+        .at(portal_secret::RUTA_BACKEND, backend)
+        .await
+    {
+        Ok(_) => match conn
+            .request_name_with_flags(
+                portal_secret::NOMBRE_BACKEND,
+                RequestNameFlags::DoNotQueue.into(),
+            )
+            .await
+        {
+            Ok(RequestNameReply::PrimaryOwner) => {}
+            otro => eprintln!(
+                "vasak-keyring: no se pudo tomar {}: {otro:?}; \
+                 las aplicaciones en sandbox no van a tener secreto propio",
+                portal_secret::NOMBRE_BACKEND
+            ),
+        },
+        Err(e) => eprintln!(
+            "vasak-keyring: no se pudo publicar el backend del portal ({e}); \
+             las aplicaciones en sandbox no van a tener secreto propio"
+        ),
     }
 
     println!("vasak-keyring: D-Bus services ready");

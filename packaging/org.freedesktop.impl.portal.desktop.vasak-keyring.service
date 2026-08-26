@@ -1,0 +1,7 @@
+[D-BUS Service]
+# El llavero ya está corriendo por systemd cuando el portal pregunta, así que
+# esto es la red de seguridad: si por algún motivo no estuviera, D-Bus lo activa
+# en lugar de que el portal se quede sin backend.
+Name=org.freedesktop.impl.portal.desktop.vasak-keyring
+Exec=/usr/bin/vasak-keyring
+SystemdService=vasak-keyring.service

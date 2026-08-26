@@ -1521,3 +1521,107 @@ impl PamUnlockInterface {
         self.aplicar(password).await
     }
 }
+
+// ── Secreto maestro por aplicación (portal Secret) ─────────
+
+/// Atributo con el que se marcan estos secretos, por convención de freedesktop.
+pub const ESQUEMA_PORTAL: &str = "org.freedesktop.portal.Secret";
+
+/// Cuántos bytes tiene el secreto maestro que se le da a una aplicación.
+///
+/// Es una clave, no una contraseña: no la escribe nadie, así que conviene que
+/// sea larga. 64 bytes es lo que usan las otras implementaciones del portal.
+const LARGO_SECRETO_PORTAL: usize = 64;
+
+/// El secreto maestro de una aplicación, creándolo la primera vez.
+///
+/// La especificación del portal pide que sea **único por aplicación y estable
+/// mientras esté instalada**, así que no se deriva de nada: se genera al azar la
+/// primera vez y queda guardado en el llavero como cualquier otro secreto. Si se
+/// derivara de la contraseña maestra, cambiar la contraseña de la cuenta
+/// cambiaría el secreto de todas las aplicaciones a la vez, y lo que cada una
+/// hubiera cifrado con él dejaría de abrirse.
+///
+/// Queda visible en el Secret Service como una entrada más, a propósito: es un
+/// secreto que el escritorio guarda en nombre de la persona, y tiene que poder
+/// verlo y borrarlo como cualquier otro.
+pub async fn secreto_maestro_de_app(
+    state: &Arc<Mutex<KeyringState>>,
+    conn: &Connection,
+    app_id: &str,
+) -> Result<Vec<u8>, String> {
+    if app_id.is_empty() {
+        // Sin identidad no hay a qué atarlo. Devolver algo acá sería darle el
+        // mismo secreto a todo lo que pregunte.
+        return Err("la aplicación no tiene identificador".into());
+    }
+    if master_password().is_none() {
+        return Err(LOCKED_MESSAGE.into());
+    }
+
+    let atributos: HashMap<String, String> = HashMap::from([
+        ("xdg:schema".to_string(), ESQUEMA_PORTAL.to_string()),
+        ("app_id".to_string(), app_id.to_string()),
+    ]);
+
+    // ¿Ya existe?
+    {
+        let estado = state.lock().await;
+        if let Some(item) = estado
+            .items
+            .values()
+            .find(|item| item.attributes == atributos)
+        {
+            return Ok(item.secret.clone());
+        }
+    }
+
+    // No: se crea uno.
+    use rand::RngCore;
+    let mut secreto = vec![0u8; LARGO_SECRETO_PORTAL];
+    rand::thread_rng().fill_bytes(&mut secreto);
+
+    let coleccion = "/org/freedesktop/secrets/collection/login";
+    let ruta = {
+        let mut estado = state.lock().await;
+        let ruta = format!("{coleccion}/items/{}", estado.take_item_id());
+
+        estado.items.insert(
+            ruta.clone(),
+            ItemInfo {
+                label: format!("Secreto de {app_id}"),
+                attributes: atributos,
+                secret: secreto.clone(),
+                content_type: "application/octet-stream".into(),
+                created: now(),
+                modified: now(),
+            },
+        );
+        if let Some(col) = estado.collections.get_mut(coleccion) {
+            col.items.push(ruta.clone());
+            col.modified = now();
+        }
+        ruta
+    };
+
+    // Se publica en el bus como cualquier otra entrada.
+    let iface = ItemInterface {
+        state: state.clone(),
+        conn: conn.clone(),
+        path: ruta.clone(),
+    };
+    if let Err(e) = conn.object_server().at(ruta.clone(), iface).await {
+        eprintln!("vasak-keyring: no se pudo publicar {ruta}: {e}");
+    }
+
+    // Y se guarda **antes** de entregarlo. Si el disco falla, la aplicación no
+    // debe recibir un secreto que en el próximo arranque no va a existir: cifraría
+    // sus datos con una clave que se pierde.
+    let items: Vec<ItemInfo> = {
+        let estado = state.lock().await;
+        estado.items.values().cloned().collect()
+    };
+    save_db(&items)?;
+
+    Ok(secreto)
+}

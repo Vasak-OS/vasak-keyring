@@ -2,6 +2,7 @@
 mod crypto;
 mod dbus_api;
 mod session_crypto;
+mod portal_secret;
 mod unlock_socket;
 
 use std::sync::Arc;
@@ -70,6 +71,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // reclamar el nombre porque recién ahí se sabe que este proceso es el único
     // demonio, y por lo tanto que puede borrar un socket viejo sin robarle las
     // entregas a otro. Ver `unlock_socket.rs` para por qué no alcanza D-Bus.
+    let state_portal = state.clone();
     if let Err(e) = unlock_socket::escuchar(state, conn.clone()).await {
         // No es fatal: el llavero sigue sirviendo a quien ya esté desbloqueado y
         // el diálogo gráfico sigue funcionando por el bus. Pero el desbloqueo
@@ -78,6 +80,51 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "vasak-keyring: no se pudo abrir el socket de desbloqueo ({e}); \
              el llavero va a pedir la contraseña a mano."
         );
+    }
+
+    // El backend del portal para el secreto maestro por aplicación.
+    //
+    // En una **conexión propia**, no en la que sirve el Secret Service. Con las
+    // dos en la misma, un permiso de sandbox concedido sobre
+    // `org.freedesktop.secrets` alcanzaría para hablar con este backend y pedir el
+    // secreto de cualquier aplicación: el proxy de D-Bus filtra por nombre, y
+    // todos los nombres de una conexión comparten el mismo nombre único.
+    //
+    // Si algo de esto falla, el llavero sigue sirviendo todo lo demás: lo único
+    // que se pierde es que las aplicaciones en sandbox tengan clave propia, y es
+    // preferible eso a no arrancar.
+    match zbus::connection::Builder::session() {
+        Ok(constructor) => {
+            let backend_conn = constructor
+                .name(portal_secret::NOMBRE_BACKEND)
+                .and_then(|c| {
+                    c.serve_at(
+                        portal_secret::RUTA_BACKEND,
+                        portal_secret::SecretBackend::new(state_portal, conn.clone()),
+                    )
+                });
+
+            match backend_conn {
+                Ok(constructor) => match constructor.build().await {
+                    // Se deja viva a propósito: al soltarla, la conexión se cierra
+                    // y el nombre se pierde.
+                    Ok(viva) => {
+                        std::mem::forget(viva);
+                    }
+                    Err(e) => eprintln!(
+                        "vasak-keyring: no se pudo abrir la conexión del backend del portal \
+                         ({e}); las aplicaciones en sandbox no van a tener secreto propio"
+                    ),
+                },
+                Err(e) => eprintln!(
+                    "vasak-keyring: no se pudo publicar el backend del portal ({e}); \
+                     las aplicaciones en sandbox no van a tener secreto propio"
+                ),
+            }
+        }
+        Err(e) => eprintln!(
+            "vasak-keyring: no se pudo preparar la conexión del backend del portal ({e})"
+        ),
     }
 
     println!("vasak-keyring: D-Bus services ready");

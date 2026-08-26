@@ -1,0 +1,19 @@
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.vasak-keyring
+# Sólo el secreto maestro por aplicación. Lo sirve el llavero porque es quien
+# tiene los secretos: el único backend que había con esta interfaz era el de
+# KWallet, que los guardaba en una cartera de KDE que nada más del sistema lee.
+Interfaces=org.freedesktop.impl.portal.Secret;
+# `Vasak`, que es lo que la sesión exporta en XDG_CURRENT_DESKTOP. Esta clave es
+# la red de seguridad; la forma que corresponde es `vasak-portals.conf`.
+UseIn=Vasak;
+# El mapeo `org.freedesktop.impl.portal.Secret=vasak-keyring` **no** va acá: lo
+# entrega vasak-desktop-settings en `vasak-portals.conf`, que es el archivo del
+# escritorio y cubre todas las interfaces de una vez. Entregar una segunda copia
+# desde este paquete sería un conflicto de archivos en pacman —dos paquetes
+# escribiendo la misma ruta— y dejaría el ruteo del escritorio partido en dos
+# lugares que pueden discrepar.
+#
+# El `UseIn` de arriba es la red de seguridad para una instalación sin ese
+# archivo: sin él, el portal caería en «last-resort fallback» y podría elegir otro
+# backend.

@@ -1,5 +1,5 @@
 [workspace]
-members = ["pam_vasak_keyring", "prompt/src-tauri"]
+members = ["derivacion", "pam_vasak_keyring", "prompt/src-tauri"]
 resolver = "2"
 
 [package]

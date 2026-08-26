@@ -10,3 +10,4 @@ name = "pam_vasak_keyring"
 [dependencies]
 libc = "0.2"
 zeroize = "1"
+vasak-keyring-derivacion = { path = "../derivacion" }

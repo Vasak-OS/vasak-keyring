@@ -39,6 +39,13 @@ use crate::dbus_api::{KeyringState, PamUnlockInterface};
 ///
 /// Una contraseña no llega ni cerca; el límite está para que nadie pueda hacer
 /// crecer la memoria del demonio del llavero mandando bytes para siempre.
+///
+/// Se lee **uno más** que el tope para poder distinguir «entró justo» de «no
+/// entró»: `take()` corta y `read_to_end` devuelve `Ok`, así que sin ese byte de
+/// más una entrega más larga se tomaría por completa y el prefijo cortado
+/// pasaría por contraseña. Y si todavía no hay base, ese prefijo se convertiría
+/// en la contraseña maestra de una base nueva que ningún inicio de sesión vuelve
+/// a abrir — porque el diálogo gráfico, que va por D-Bus, no corta nada.
 const MAXIMO_PETICION: u64 = 1024;
 
 /// Cuánto se espera a que el cliente termine de escribir.
@@ -46,6 +53,9 @@ const MAXIMO_PETICION: u64 = 1024;
 /// Sin esto una conexión que abre y no dice nada deja una tarea esperando para
 /// siempre, y quien puede abrir el socket puede abrir muchas.
 const PLAZO_LECTURA: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Cuánto esperar antes de volver a intentar un `accept` que falló.
+const REPOSO_TRAS_FALLO: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// La ruta del socket para un uid, la misma que arma el módulo de PAM.
 pub fn ruta_del_socket(uid: u32) -> std::path::PathBuf {
@@ -117,6 +127,11 @@ pub async fn escuchar(
                 // resto de la sesión: sin este socket no hay desbloqueo.
                 Err(e) => {
                     eprintln!("vasak-keyring: accept falló en el socket de desbloqueo: {e}");
+                    // Y una pausa antes de reintentar. Hay errores que no se
+                    // arreglan solos —EMFILE o ENFILE, sin descriptores libres—
+                    // y sin esto el bucle gira a toda velocidad inundando el
+                    // diario hasta que alguno se libere.
+                    tokio::time::sleep(REPOSO_TRAS_FALLO).await;
                     continue;
                 }
             };
@@ -157,11 +172,20 @@ async fn atender(
     let mut buffer = Vec::new();
     let leido = tokio::time::timeout(
         PLAZO_LECTURA,
-        (&mut stream).take(MAXIMO_PETICION).read_to_end(&mut buffer),
+        (&mut stream)
+            .take(MAXIMO_PETICION + 1)
+            .read_to_end(&mut buffer),
     )
     .await;
 
     let resultado = match leido {
+        Ok(Ok(leidos)) if leidos as u64 > MAXIMO_PETICION => {
+            eprintln!(
+                "vasak-keyring: la entrega supera {MAXIMO_PETICION} bytes; se descarta \
+                 en lugar de usar el pedazo que entró"
+            );
+            false
+        }
         Ok(Ok(_)) => match interpretar_peticion(&buffer) {
             Ok(mut password) => {
                 let unlock = PamUnlockInterface::new(state, conn);

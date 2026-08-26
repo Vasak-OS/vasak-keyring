@@ -166,6 +166,97 @@ fn target_uid(pamh: *mut pam_handle_t) -> Option<u32> {
     }
 }
 
+/// Comprueba que la ruta del socket no haya sido desviada.
+///
+/// Defensa en profundidad, no la principal —esa es mandar la maestra derivada en
+/// lugar de la contraseña de la cuenta—. Acá se cierra el ataque fácil: que el
+/// directorio `vasak-keyring` sea un enlace simbólico a otro lado.
+///
+/// `/run/user` es de root y 0755, así que `/run/user/<uid>` no se puede
+/// reemplazar; es el punto de partida confiable. De ahí en adelante se abre cada
+/// componente con `O_NOFOLLOW`, que **falla** si es un enlace, y se verifica que
+/// el dueño sea el usuario del inicio de sesión. Un `unlock.sock` que no sea un
+/// socket, o que sea de otro, también se rechaza.
+///
+/// Queda una carrera irreducible: entre esta comprobación y el `connect`, quien
+/// pueda escribir en ese directorio —su dueño— podría cambiar el socket. La
+/// ventana es de microsegundos y ganarla ya no sirve para llevarse la contraseña
+/// de la cuenta, sólo la maestra del llavero, que un proceso del usuario ya podía
+/// obtener pidiéndole los secretos al Secret Service.
+fn ruta_sin_desviar(uid: u32) -> Result<(), std::io::Error> {
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+
+    fn abrir_directorio(base: Option<&OwnedFd>, nombre: &CStr) -> Result<OwnedFd, std::io::Error> {
+        let banderas = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let fd = match base {
+            None => unsafe { libc::open(nombre.as_ptr(), banderas) },
+            Some(dir) => unsafe { libc::openat(dir.as_raw_fd(), nombre.as_ptr(), banderas) },
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn dueno(fd: &OwnedFd) -> Result<u32, std::io::Error> {
+        let mut datos: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut datos) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(datos.st_uid)
+    }
+
+    // `/run/user/<uid>`: lo crea pam_systemd como root dentro de un directorio
+    // que sólo root puede escribir, así que este paso es de fiar.
+    let raiz = CString::new(format!("/run/user/{uid}"))
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let dir_usuario = abrir_directorio(None, &raiz)?;
+    if dueno(&dir_usuario)? != uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("/run/user/{uid} no es del uid {uid}"),
+        ));
+    }
+
+    // Y el directorio del llavero, que lo crea el demonio. Si acá hay un enlace,
+    // `O_NOFOLLOW` hace fallar el open en lugar de seguirlo.
+    let dir_llavero = abrir_directorio(Some(&dir_usuario), c"vasak-keyring")?;
+    if dueno(&dir_llavero)? != uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "el directorio del llavero no es del usuario del inicio de sesión",
+        ));
+    }
+
+    // El socket: ni enlace, ni de otro, ni otra clase de archivo.
+    let mut datos: libc::stat = unsafe { std::mem::zeroed() };
+    let hecho = unsafe {
+        libc::fstatat(
+            dir_llavero.as_raw_fd(),
+            c"unlock.sock".as_ptr(),
+            &mut datos,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if hecho != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if datos.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unlock.sock no es un socket",
+        ));
+    }
+    if datos.st_uid != uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "unlock.sock no es del usuario del inicio de sesión",
+        ));
+    }
+
+    Ok(())
+}
+
 /// Una sola entrega sobre una conexión ya abierta.
 fn conversar(mut flujo: UnixStream, password: &str) -> Result<bool, std::io::Error> {
     flujo.set_write_timeout(Some(PLAZO))?;
@@ -190,6 +281,17 @@ fn entregar(uid: u32, password: &str) -> Entrega {
     );
 
     for intento in 0..INTENTOS {
+        // Antes de cada intento, no una sola vez: entre reintentos pasan
+        // doscientos milisegundos y el socket puede aparecer desviado.
+        if let Err(e) = ruta_sin_desviar(uid) {
+            if todavia_arrancando(e.kind()) && intento + 1 < INTENTOS {
+                ultimo = e;
+                std::thread::sleep(ESPERA_ENTRE_INTENTOS);
+                continue;
+            }
+            return Entrega::SinDemonio(e);
+        }
+
         match UnixStream::connect(&ruta) {
             Ok(flujo) => {
                 return match conversar(flujo, password) {
@@ -291,15 +393,30 @@ pub extern "C" fn pam_sm_open_session(
         return PAM_IGNORE;
     };
 
+    // Lo que viaja es la maestra derivada, **nunca** la contraseña de la cuenta.
+    // El socket vive en /run/user/<uid>, que es del usuario: cualquier código
+    // corriendo con su cuenta puede reemplazar ese directorio por un enlace y
+    // quedarse con lo que root entregue. Con la contraseña en texto plano eso es
+    // escalada a root vía sudo; con la maestra derivada, quien intercepte se
+    // lleva el acceso al llavero —que ya tenía, por el Secret Service— y nada
+    // más. Ver el crate `vasak-keyring-derivacion`.
     if password.is_empty() {
         log(pamh, "pam_vasak_keyring: la contraseña guardada está vacía; no se entrega");
         return PAM_SUCCESS;
     }
 
+    let maestra = match vasak_keyring_derivacion::derivar_maestra(&password) {
+        Ok(m) => m,
+        Err(e) => {
+            log(pamh, &format!("pam_vasak_keyring: {e}"));
+            return PAM_SUCCESS;
+        }
+    };
+
     // Se informa **qué** falló y no una lista de lo que pudo haber sido. Cada
     // caso se arregla de una manera distinta, y sin distinguirlos no hay forma
     // de saber cuál está pasando.
-    match entregar(uid, &password) {
+    match entregar(uid, &maestra) {
         Entrega::Abierto => log(pamh, "pam_vasak_keyring: llavero desbloqueado"),
         Entrega::Rechazada => log(
             pamh,
@@ -477,5 +594,84 @@ mod tests {
         let sospechoso = "no se pudo conectar a /run/user/1000/%s%n%p (roto)";
         let cmsg = CString::new(sospechoso).expect("sin bytes nulos");
         assert_eq!(cmsg.to_str().unwrap(), sospechoso);
+    }
+}
+
+#[cfg(test)]
+mod tests_ruta {
+    use super::*;
+
+    /// Un uid sin `/run/user/<uid>` se rechaza en lugar de conectar a ciegas.
+    #[test]
+    fn sin_directorio_de_runtime_no_hay_entrega() {
+        // 61234 no tiene sesión; su /run/user no existe.
+        let error = ruta_sin_desviar(61234).expect_err("no debería haber ruta");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        // Y eso cuenta como «todavía no arrancó», así que se reintenta en lugar
+        // de darse por vencido al primer intento del inicio de sesión.
+        assert!(todavia_arrancando(error.kind()));
+    }
+
+    /// El ataque que esto cierra: el directorio del llavero como enlace.
+    ///
+    /// Se arma con la forma real —un directorio de runtime propio con un enlace
+    /// adentro— y se comprueba que el `O_NOFOLLOW` lo rechace. Sin eso, root
+    /// entregaría en el destino del enlace.
+    #[test]
+    fn un_enlace_en_lugar_del_directorio_se_rechaza() {
+        use std::os::unix::fs::symlink;
+
+        let uid = unsafe { libc::geteuid() };
+        let real = std::path::PathBuf::from(format!("/run/user/{uid}"));
+        if !real.exists() {
+            // Sin sesión gráfica no hay dónde armarlo; el otro test cubre el
+            // camino de «no existe».
+            return;
+        }
+
+        let señuelo = real.join(format!("vsk-prueba-enlace-{}", std::process::id()));
+        let destino = real.join(format!("vsk-prueba-destino-{}", std::process::id()));
+        let _ = std::fs::remove_file(&señuelo);
+        let _ = std::fs::remove_dir_all(&destino);
+        std::fs::create_dir_all(&destino).expect("destino");
+        symlink(&destino, &señuelo).expect("enlace");
+
+        // Se comprueba el mecanismo directamente: abrir con O_NOFOLLOW un
+        // componente que es un enlace tiene que fallar con ELOOP.
+        let ruta = CString::new(señuelo.to_str().unwrap()).unwrap();
+        let fd = unsafe {
+            libc::open(
+                ruta.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        let error = std::io::Error::last_os_error();
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+            panic!("O_NOFOLLOW siguió el enlace: el desvío sería posible");
+        }
+        // Con `O_NOFOLLOW` **y** `O_DIRECTORY` el kernel contesta ENOTDIR —el
+        // enlace en sí no es un directorio y no se lo sigue—; sin `O_DIRECTORY`
+        // contestaría ELOOP. Las dos sirven: lo que importa es que el open falle
+        // en lugar de seguir el enlace.
+        assert!(
+            matches!(error.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)),
+            "un enlace tiene que hacer fallar el open, y dio {error}"
+        );
+        // Y ELOOP no se reintenta: esperar no lo va a arreglar.
+        assert!(!todavia_arrancando(error.kind()));
+
+        let _ = std::fs::remove_file(&señuelo);
+        let _ = std::fs::remove_dir_all(&destino);
+    }
+
+    /// Lo que se manda no puede ser la contraseña de la cuenta.
+    #[test]
+    fn lo_que_viaja_es_la_maestra_derivada() {
+        let cuenta = "MiContraseñaDeCuenta1";
+        let maestra = vasak_keyring_derivacion::derivar_maestra(cuenta).expect("derivar");
+        assert_ne!(*maestra, cuenta);
+        assert!(!maestra.contains("Contraseña"));
+        assert_eq!(maestra.len(), 64, "hexadecimal de 32 bytes");
     }
 }

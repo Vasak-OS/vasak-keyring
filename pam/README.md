@@ -52,6 +52,32 @@ que quien entrega sea root o el propio usuario. De paso la contraseña ya no
 atraviesa el proceso del broker, y el módulo dejó de cargar zbus y tokio dentro
 del gestor de inicio de sesión.
 
+## Lo que viaja no es la contraseña de la cuenta
+
+Ese directorio es **del usuario**, y ahí está el problema: cualquier código
+corriendo con su cuenta puede reemplazar por un enlace simbólico el directorio
+donde vive el socket y quedarse con lo que root entregue. Con la contraseña en
+texto plano eso sería escalada a root —esa contraseña es la de `sudo`—, y por un
+proceso sin privilegios.
+
+Así que no se manda la contraseña: se manda `Argon2id(contraseña, sal)`, con la
+sal derivada de `/etc/machine-id`. Quien intercepte se lleva la maestra del
+llavero y no la contraseña de la cuenta. Eso no le da nada nuevo —cualquier
+proceso del usuario ya puede pedirle todos los secretos al Secret Service, que es
+para lo que existe— pero deja de poder escalar.
+
+La derivación vive en el crate `vasak-keyring-derivacion` y no copiada en cada
+lado, porque hay **dos** caminos que entregan la maestra: el módulo de PAM al
+iniciar sesión y el diálogo gráfico cuando la pide a mano. Si derivaran distinto,
+la base creada por uno no la abriría el otro, y sin ningún error: la contraseña
+simplemente «no sería la correcta». Hay un test con vector fijo para que la
+derivación no pueda cambiar sin que se note.
+
+Como defensa adicional, el módulo comprueba antes de conectar que ningún
+componente de la ruta sea un enlace (`O_NOFOLLOW`) y que el dueño sea el usuario
+del inicio de sesión. Queda una carrera de microsegundos que no se puede cerrar
+con esta topología, y por eso no es la defensa principal.
+
 Con `session` sola el módulo no encuentra nada guardado y no hace nada: el
 llavero queda bloqueado igual que si no estuviera configurado.
 

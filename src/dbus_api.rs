@@ -92,8 +92,13 @@ fn set_master_password(password: &str) {
 
 /// Return the master password held in memory.
 ///
+/// Lo que se guarda acá es la **maestra derivada**, no la contraseña de la
+/// cuenta: los dos caminos que la entregan —el módulo de PAM y el diálogo
+/// gráfico— derivan antes de mandarla, con el crate `vasak-keyring-derivacion`.
+/// El demonio no deriva: usa lo que recibe tal cual.
+///
 /// Falls back to the `VASAK_KEYRING_PASSWORD` environment variable for
-/// headless/testing scenarios only. The old plaintext
+/// headless/testing scenarios only (y ahí también va la derivada). The old plaintext
 /// `~/.config/vasak-keyring/master.key` file is deliberately NOT read: keeping
 /// the key next to the encrypted database defeats the encryption entirely.
 fn master_password() -> Option<Zeroizing<String>> {

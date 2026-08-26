@@ -32,7 +32,7 @@ fn claim_stdout() {
             let _ = ANSWER.set(OwnedFd::from_raw_fd(saved));
         }
 
-        let devnull = libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_WRONLY);
+        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
         if devnull >= 0 {
             libc::dup2(devnull, libc::STDOUT_FILENO);
             libc::close(devnull);

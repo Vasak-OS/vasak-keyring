@@ -2,6 +2,7 @@
 mod crypto;
 mod dbus_api;
 mod session_crypto;
+mod unlock_socket;
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -25,7 +26,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await
         .map(|_| ())?;
 
-    let unlock = PamUnlockInterface::new(state, conn.clone());
+    let unlock = PamUnlockInterface::new(state.clone(), conn.clone());
     conn.object_server()
         .at("/org/vasak/keyring", unlock)
         .await
@@ -63,6 +64,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
             std::process::exit(1);
         }
         Err(e) => return Err(e.into()),
+    }
+
+    // El socket por donde llega la contraseña al iniciar sesión. Va después de
+    // reclamar el nombre porque recién ahí se sabe que este proceso es el único
+    // demonio, y por lo tanto que puede borrar un socket viejo sin robarle las
+    // entregas a otro. Ver `unlock_socket.rs` para por qué no alcanza D-Bus.
+    if let Err(e) = unlock_socket::escuchar(state, conn.clone()).await {
+        // No es fatal: el llavero sigue sirviendo a quien ya esté desbloqueado y
+        // el diálogo gráfico sigue funcionando por el bus. Pero el desbloqueo
+        // automático no va a andar, y eso tiene que quedar dicho.
+        eprintln!(
+            "vasak-keyring: no se pudo abrir el socket de desbloqueo ({e}); \
+             el llavero va a pedir la contraseña a mano."
+        );
     }
 
     println!("vasak-keyring: D-Bus services ready");

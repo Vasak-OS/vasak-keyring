@@ -812,7 +812,14 @@ impl ServiceInterface {
                             }
                         }
                     } else {
-                        eprintln!("[vasak-keyring] no master password available");
+                        // Lo normal al arrancar: la contraseña llega después, al
+                        // iniciar sesión. Se dice en tono informativo y no como
+                        // un fallo, que es como se leía en el diario de cada
+                        // arranque mientras el problema real estaba en otra parte.
+                        println!(
+                            "[vasak-keyring] hay una base en disco; \
+                             esperando la contraseña del inicio de sesión"
+                        );
                     }
                 }
             }
@@ -1369,9 +1376,15 @@ impl PamUnlockInterface {
     }
 }
 
-#[interface(name = "org.vasak.Keyring")]
 impl PamUnlockInterface {
-    async fn unlock(&mut self, password: &str) -> Result<bool, zbus::fdo::Error> {
+    /// Adopta `password` como contraseña maestra de la sesión, si abre la base.
+    ///
+    /// Vive acá y no dentro del método de D-Bus porque hay dos formas de llegar
+    /// con la contraseña, y por buenas razones: el diálogo gráfico corre como el
+    /// usuario y usa el bus, pero el módulo de PAM corre como root dentro del
+    /// gestor de inicio de sesión y el bus de sesión no lo deja entrar. Ese
+    /// llega por el socket de `unlock_socket.rs`.
+    pub async fn aplicar(&self, password: &str) -> Result<bool, zbus::fdo::Error> {
         // Refused rather than answered `false`: the caller is being told to stop
         // trying, which is a different thing from the password being wrong, and
         // the dialog says so instead of blaming the password.
@@ -1493,5 +1506,13 @@ impl PamUnlockInterface {
         self.announce_unlocked(&coll_path, &item_paths).await;
 
         Ok(true)
+    }
+}
+
+#[interface(name = "org.vasak.Keyring")]
+impl PamUnlockInterface {
+    /// El desbloqueo por D-Bus, que usa el diálogo gráfico.
+    async fn unlock(&mut self, password: &str) -> Result<bool, zbus::fdo::Error> {
+        self.aplicar(password).await
     }
 }

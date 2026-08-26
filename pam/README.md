@@ -31,9 +31,26 @@ Hacen falta ambas y en ese orden:
   contraseña que el usuario acaba de escribir, guardándola en el contexto de PAM.
   Va después de `system-auth` porque para entonces la contraseña ya se pidió.
 - `session` corre al abrir la sesión, recupera esa contraseña del contexto y se
-  la pasa al demonio por D-Bus. Va **al final**, después de `pam_systemd`: ese es
-  el módulo que crea `/run/user/<uid>`, y ahí adentro vive el socket del bus por
-  donde se entrega la contraseña. Antes de él no hay dónde entregarla.
+  la pasa al demonio por un socket unix propio,
+  `/run/user/<uid>/vasak-keyring/unlock.sock`. Va **al final**, después de
+  `pam_systemd`: ese es el módulo que crea `/run/user/<uid>`, y ahí adentro vive
+  el socket. Antes de él no hay dónde entregarla.
+
+## Por qué un socket propio y no D-Bus
+
+Esto se hacía por el bus de sesión y **nunca funcionó ni una vez**. El módulo
+corre como root, y `dbus-broker` acepta conexiones del dueño del bus y rechaza al
+resto —root incluido— durante la autenticación, antes de que exista mensaje
+alguno. El módulo veía un error de conexión, lo tomaba por «el demonio todavía no
+arrancó», reintentaba tres segundos y se rendía; el mensaje que dejaba en el
+diario nombraba dos causas posibles sin distinguirlas, y una de ellas era
+imposible.
+
+El socket vive dentro de `/run/user/<uid>`, que es 0700 del usuario, y root entra
+igual porque no está sujeto a los permisos. El demonio verifica con `SO_PEERCRED`
+que quien entrega sea root o el propio usuario. De paso la contraseña ya no
+atraviesa el proceso del broker, y el módulo dejó de cargar zbus y tokio dentro
+del gestor de inicio de sesión.
 
 Con `session` sola el módulo no encuentra nada guardado y no hace nada: el
 llavero queda bloqueado igual que si no estuviera configurado.

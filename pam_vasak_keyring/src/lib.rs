@@ -2,10 +2,19 @@
 // Captures the login password and sends it to the daemon via D-Bus.
 
 #![allow(non_camel_case_types, non_snake_case)]
+// Los puntos de entrada de PAM tienen que ser `pub extern "C"` y recibir el
+// `pam_handle_t` como puntero crudo: la firma la fija el ABI de PAM, no nosotros.
+// Marcarlos `unsafe` —lo que pide la regla— cambiaría el símbolo exportado y PAM
+// no lo encontraría, así que la única salida es decir que acá no aplica. El
+// puntero se usa sólo para devolvérselo a las funciones de PAM, y todas las
+// desreferencias están dentro de bloques `unsafe`.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use libc::c_int;
 use std::ffi::{CStr, CString};
+use std::io::{Read, Write};
 use std::os::raw::c_char;
+use std::os::unix::net::UnixStream;
 use zeroize::Zeroizing;
 
 // ── PAM constants ──────────────────────────────────────────
@@ -54,8 +63,17 @@ extern "C" {
 // ── Logging helper ─────────────────────────────────────────
 
 fn log(pamh: *mut pam_handle_t, msg: &str) {
-    let cmsg = CString::new(msg).unwrap_or(CString::new("log error").unwrap());
-    unsafe { pam_syslog(pamh, LOG_AUTH, cmsg.as_ptr()); }
+    let cmsg = CString::new(msg).unwrap_or_else(|_| c"log error".to_owned());
+
+    // `pam_syslog` es variádica y toma el segundo argumento como **cadena de
+    // formato**. Pasando el mensaje ahí, cualquier `%` que contenga se
+    // interpreta como especificador y lee de la pila lo que no le corresponde:
+    // en un proceso que corre como root dentro del gestor de inicio de sesión,
+    // eso es una fuga de memoria ajena o un cierre en falso. Mientras todos los
+    // mensajes fueron literales sin `%` no se notó; ahora que también se informa
+    // el error del sistema —que puede traer una ruta o un texto ajeno— el
+    // formato tiene que ser fijo y el mensaje un argumento.
+    unsafe { pam_syslog(pamh, LOG_AUTH, c"%s".as_ptr(), cmsg.as_ptr()); }
 }
 
 // ── Cleanup callback (called by PAM when data is released) ─
@@ -71,49 +89,65 @@ unsafe extern "C" fn password_cleanup(
     }
 }
 
-// ── D-Bus: send password to the daemon ─────────────────────
+// ── Entrega de la contraseña al demonio ────────────────────
 
-/// The daemon's well-known name, lowercase as the freedesktop spec defines it.
-/// This used to ask for `org.freedesktop.Secrets`, which nothing owns — D-Bus
-/// names are case-sensitive, so every unlock failed and the keyring stayed
-/// locked for the whole session with no error the user could see.
-const KEYRING_SERVICE: &str = "org.freedesktop.secrets";
-const KEYRING_PATH: &str = "/org/vasak/keyring";
-const KEYRING_INTERFACE: &str = "org.vasak.Keyring";
-/// zbus exports methods in CamelCase; the lowercase `unlock` did not exist.
-const UNLOCK_METHOD: &str = "Unlock";
-
-/// How long to keep trying while the daemon starts.
+/// Cuánto se sigue intentando mientras el demonio arranca.
 ///
-/// PAM opens the session before the user's systemd units are up, so the very
-/// first attempt at login usually finds no daemon. This only costs time when
-/// the daemon really is absent; the normal case answers on the first attempt.
-const UNLOCK_ATTEMPTS: u32 = 15;
-const UNLOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(200);
+/// PAM abre la sesión al mismo tiempo que systemd lanza las unidades del
+/// usuario, así que el primer intento suele no encontrar el socket todavía. Sólo
+/// cuesta tiempo cuando el demonio de verdad no está.
+const INTENTOS: u32 = 15;
+const ESPERA_ENTRE_INTENTOS: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// Whether a D-Bus error means «todavía no arrancó» rather than «no».
+/// Plazo de lectura y escritura sobre el socket.
 ///
-/// Un demonio que aún no reclamó su nombre no da un error de conexión: el bus
-/// contesta por él con ServiceUnknown, y eso es un MethodError como cualquier
-/// otro. Tratarlos a todos como respuesta definitiva desactivaba justo el
-/// reintento escrito para este caso: al iniciar sesión, PAM corre un segundo
-/// después de que systemd lanza el demonio y se rendía en el primer intento.
-/// El llavero quedaba cerrado toda la sesión y, en una máquina nueva, ni
-/// siquiera llegaba a crearse.
-fn todavia_arrancando(error_name: &str) -> bool {
+/// Un demonio trabado no puede quedarse con el inicio de sesión: sin plazo, PAM
+/// espera para siempre y no se entra a la máquina. Un llavero cerrado es un
+/// problema; una sesión que no abre es otra cosa.
+const PLAZO: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Cómo terminó la entrega. Cada variante es un diagnóstico distinto, y eso es
+/// el punto: el mensaje que había nombraba dos causas posibles sin distinguir
+/// cuál, y una de las dos era imposible en la máquina donde se diagnosticó
+/// —decía «la contraseña no corresponde a la base existente» cuando todavía no
+/// había ninguna base—. Con eso el problema real quedó tapado durante meses.
+enum Entrega {
+    Abierto,
+    /// El demonio contestó, y dijo que no.
+    Rechazada,
+    /// No se llegó a hablar con nadie en toda la ventana de espera.
+    SinDemonio(std::io::Error),
+    /// Se conectó pero la conversación falló.
+    Cortada(std::io::Error),
+}
+
+/// La ruta del socket, armada igual que del lado del demonio.
+///
+/// A partir del uid y nada más: acá no hay sesión todavía, así que no hay
+/// `XDG_RUNTIME_DIR` del usuario que leer. Los dos lados tienen que formar la
+/// misma cadena o la entrega falla sin que nadie sepa por qué.
+fn ruta_del_socket(uid: u32) -> String {
+    format!("/run/user/{uid}/vasak-keyring/unlock.sock")
+}
+
+/// Si un error de conexión significa «todavía no arrancó» y conviene reintentar.
+///
+/// El socket no existe hasta que el demonio lo crea (`NotFound`), y entre el
+/// bind y el accept puede rechazar (`ConnectionRefused`). Todo lo demás
+/// —permisos, por ejemplo— no lo va a arreglar esperar.
+fn todavia_arrancando(clase: std::io::ErrorKind) -> bool {
     matches!(
-        error_name,
-        "org.freedesktop.DBus.Error.ServiceUnknown"
-            | "org.freedesktop.DBus.Error.NameHasNoOwner"
-            | "org.freedesktop.DBus.Error.NoReply"
-            | "org.freedesktop.DBus.Error.Disconnected"
+        clase,
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::Interrupted
     )
 }
 
-/// The uid the login is for, which is not the one this code runs as.
+/// El uid del inicio de sesión, que no es el que corre este código.
 ///
-/// PAM modules run as root, in the login manager's process, before anything of
-/// the user's session exists.
+/// Los módulos de PAM corren como root, en el proceso del gestor de inicio de
+/// sesión, antes de que exista nada de la sesión del usuario.
 fn target_uid(pamh: *mut pam_handle_t) -> Option<u32> {
     let mut user: *const c_char = std::ptr::null();
 
@@ -132,51 +166,47 @@ fn target_uid(pamh: *mut pam_handle_t) -> Option<u32> {
     }
 }
 
-/// The bus the daemon is on: the user's, addressed explicitly.
-///
-/// `Connection::session()` reads the environment of the current process, and at
-/// this point that process is the login manager running as root — with no
-/// XDG_RUNTIME_DIR of the user in it, and often none at all. So it either found
-/// root's bus or nothing, never the one the daemon is sitting on, and the unlock
-/// could not have worked no matter how the PAM stack was configured.
-fn session_bus(uid: u32) -> Result<zbus::blocking::Connection, zbus::Error> {
-    zbus::blocking::connection::Builder::address(format!("unix:path=/run/user/{uid}/bus").as_str())?
-        .build()
+/// Una sola entrega sobre una conexión ya abierta.
+fn conversar(mut flujo: UnixStream, password: &str) -> Result<bool, std::io::Error> {
+    flujo.set_write_timeout(Some(PLAZO))?;
+    flujo.set_read_timeout(Some(PLAZO))?;
+
+    flujo.write_all(password.as_bytes())?;
+    // El demonio lee hasta el fin del flujo, así que hay que cerrar este lado o
+    // los dos se quedan esperando al otro.
+    flujo.shutdown(std::net::Shutdown::Write)?;
+
+    let mut respuesta = [0u8; 1];
+    flujo.read_exact(&mut respuesta)?;
+    Ok(respuesta[0] == b'1')
 }
 
-fn try_unlock(uid: u32, password: &str) -> Result<bool, zbus::Error> {
-    let conn = session_bus(uid)?;
-    let reply = conn.call_method(
-        Some(KEYRING_SERVICE),
-        KEYRING_PATH,
-        Some(KEYRING_INTERFACE),
-        UNLOCK_METHOD,
-        &(password,),
-    )?;
+/// Entrega la contraseña, esperando al demonio si está arrancando.
+fn entregar(uid: u32, password: &str) -> Entrega {
+    let ruta = ruta_del_socket(uid);
+    let mut ultimo = std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no se intentó ninguna conexión",
+    );
 
-    Ok(reply.body().deserialize::<bool>().unwrap_or(false))
-}
-
-fn send_to_daemon(uid: u32, password: &str) -> bool {
-    for attempt in 0..UNLOCK_ATTEMPTS {
-        match try_unlock(uid, password) {
-            // A `false` reply is a real answer — the password was wrong for the
-            // existing database. Retrying cannot change that.
-            Ok(unlocked) => return unlocked,
-            // Un error que mandó el demonio de verdad —por ejemplo el de
-            // demasiados intentos fallidos— también es una respuesta. Los que
-            // dicen que no hay nadie escuchando, no: al iniciar sesión el
-            // demonio suele estar arrancando todavía.
-            Err(zbus::Error::MethodError(name, ..))
-                if !todavia_arrancando(name.as_str()) =>
-            {
-                return false
+    for intento in 0..INTENTOS {
+        match UnixStream::connect(&ruta) {
+            Ok(flujo) => {
+                return match conversar(flujo, password) {
+                    Ok(true) => Entrega::Abierto,
+                    Ok(false) => Entrega::Rechazada,
+                    Err(e) => Entrega::Cortada(e),
+                }
             }
-            Err(_) if attempt + 1 < UNLOCK_ATTEMPTS => std::thread::sleep(UNLOCK_RETRY),
-            Err(_) => return false,
+            Err(e) if todavia_arrancando(e.kind()) && intento + 1 < INTENTOS => {
+                ultimo = e;
+                std::thread::sleep(ESPERA_ENTRE_INTENTOS);
+            }
+            Err(e) => return Entrega::SinDemonio(e),
         }
     }
-    false
+
+    Entrega::SinDemonio(ultimo)
 }
 
 // ════════════════════════════════════════════════════════════
@@ -261,16 +291,35 @@ pub extern "C" fn pam_sm_open_session(
         return PAM_IGNORE;
     };
 
-    // Send to daemon
-    if password.len() > 0 && send_to_daemon(uid, &password) {
-        log(pamh, "pam_vasak_keyring: keyring unlocked successfully");
-    } else {
-        log(
+    if password.is_empty() {
+        log(pamh, "pam_vasak_keyring: la contraseña guardada está vacía; no se entrega");
+        return PAM_SUCCESS;
+    }
+
+    // Se informa **qué** falló y no una lista de lo que pudo haber sido. Cada
+    // caso se arregla de una manera distinta, y sin distinguirlos no hay forma
+    // de saber cuál está pasando.
+    match entregar(uid, &password) {
+        Entrega::Abierto => log(pamh, "pam_vasak_keyring: llavero desbloqueado"),
+        Entrega::Rechazada => log(
             pamh,
-            "pam_vasak_keyring: no se pudo abrir el llavero. O la contraseña no \
-             corresponde a la base existente, o el demonio no llegó a arrancar \
-             en los 3 segundos que se lo espera.",
-        );
+            "pam_vasak_keyring: el demonio rechazó la contraseña; \
+             no es la que cifra la base del llavero",
+        ),
+        Entrega::SinDemonio(e) => log(
+            pamh,
+            &format!(
+                "pam_vasak_keyring: no se pudo conectar a {} en 3 s ({e}); \
+                 el llavero queda cerrado y va a pedir la contraseña a mano",
+                ruta_del_socket(uid)
+            ),
+        ),
+        Entrega::Cortada(e) => log(
+            pamh,
+            &format!(
+                "pam_vasak_keyring: se conectó al demonio pero la entrega falló ({e})"
+            ),
+        ),
     }
 
     // password zeroized automatically on drop (Zeroizing)
@@ -312,21 +361,121 @@ pub extern "C" fn pam_sm_close_session(
 mod tests {
     use super::*;
 
-    /// El error que rompía el inicio de sesión: el demonio arranca junto con la
-    /// sesión y el bus contesta por él hasta que reclama su nombre. Si eso
-    /// cuenta como «no», el llavero nunca se abre —y en una máquina nueva ni
-    /// siquiera se crea, porque se crea al abrirlo por primera vez.
+    /// El contrato con el demonio. Los dos lados arman esta cadena por separado
+    /// —el módulo no puede leer el entorno del usuario— así que si dejan de
+    /// coincidir la entrega falla y nada lo dice.
     #[test]
-    fn un_demonio_que_todavia_no_arranco_no_es_una_negativa() {
-        assert!(todavia_arrancando("org.freedesktop.DBus.Error.ServiceUnknown"));
-        assert!(todavia_arrancando("org.freedesktop.DBus.Error.NameHasNoOwner"));
+    fn la_ruta_del_socket_es_la_que_el_demonio_publica() {
+        assert_eq!(
+            ruta_del_socket(1000),
+            "/run/user/1000/vasak-keyring/unlock.sock"
+        );
     }
 
-    /// Lo que contesta el demonio sí es una respuesta: insistir después de tres
-    /// contraseñas incorrectas es exactamente lo que la espera quiere evitar.
+    /// El error que dejaba el llavero cerrado toda la sesión: el demonio arranca
+    /// junto con la sesión y su socket todavía no existe. Si eso cuenta como
+    /// «no», el llavero nunca se abre —y en una máquina nueva ni siquiera se
+    /// crea, porque se crea al abrirlo por primera vez.
     #[test]
-    fn lo_que_contesta_el_demonio_es_definitivo() {
-        assert!(!todavia_arrancando("org.freedesktop.DBus.Error.Failed"));
-        assert!(!todavia_arrancando("org.freedesktop.DBus.Error.AccessDenied"));
+    fn un_demonio_que_todavia_no_arranco_no_es_una_negativa() {
+        assert!(todavia_arrancando(std::io::ErrorKind::NotFound));
+        assert!(todavia_arrancando(std::io::ErrorKind::ConnectionRefused));
+    }
+
+    /// Lo que no arregla esperar, no se espera. Un socket con los permisos mal
+    /// puestos va a seguir rechazando dentro de tres segundos, y mientras tanto
+    /// el inicio de sesión está detenido.
+    #[test]
+    fn lo_que_no_mejora_esperando_no_se_reintenta() {
+        assert!(!todavia_arrancando(std::io::ErrorKind::PermissionDenied));
+        assert!(!todavia_arrancando(std::io::ErrorKind::ConnectionReset));
+        assert!(!todavia_arrancando(std::io::ErrorKind::InvalidData));
+    }
+
+    /// La ventana de espera tiene que seguir siendo la que dice el mensaje del
+    /// diario, o el diagnóstico manda a buscar en el lugar equivocado.
+    #[test]
+    fn la_ventana_de_espera_es_de_tres_segundos() {
+        assert_eq!(
+            ESPERA_ENTRE_INTENTOS * INTENTOS,
+            std::time::Duration::from_secs(3)
+        );
+    }
+
+    /// El protocolo sobre el socket, contra un servidor de juguete.
+    ///
+    /// Es la parte que no se puede probar reiniciando la máquina, y la que tiene
+    /// el detalle que trabaría el inicio de sesión si faltara: el demonio lee
+    /// hasta el fin del flujo, así que sin el `shutdown` los dos lados se
+    /// quedan esperando al otro y PAM se cuelga hasta el plazo.
+    #[test]
+    fn la_entrega_manda_la_contrasena_cierra_su_lado_y_lee_la_respuesta() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("pam-vsk-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let ruta = dir.join("prueba.sock");
+        let _ = std::fs::remove_file(&ruta);
+        let escucha = UnixListener::bind(&ruta).expect("bind");
+
+        let servidor = std::thread::spawn(move || {
+            let (mut flujo, _) = escucha.accept().expect("accept");
+            let mut recibido = Vec::new();
+            // Leer hasta EOF: si el cliente no cerrara su lado, esto no termina.
+            flujo.read_to_end(&mut recibido).expect("leer");
+            flujo.write_all(b"1").expect("responder");
+            recibido
+        });
+
+        let flujo = UnixStream::connect(&ruta).expect("connect");
+        let abierto = conversar(flujo, "contraseña ñandú").expect("conversar");
+
+        let recibido = servidor.join().expect("hilo del servidor");
+        assert_eq!(
+            String::from_utf8(recibido).unwrap(),
+            "contraseña ñandú",
+            "la contraseña llega tal cual, sin salto de línea agregado"
+        );
+        assert!(abierto, "un «1» del demonio es un desbloqueo");
+
+        let _ = std::fs::remove_file(&ruta);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// Y que un «0» no se lea como un sí. Que el byte se interprete al revés
+    /// dejaría a PAM informando un desbloqueo que nunca pasó.
+    #[test]
+    fn un_cero_del_demonio_es_una_negativa() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("pam-vsk-no-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let ruta = dir.join("prueba.sock");
+        let _ = std::fs::remove_file(&ruta);
+        let escucha = UnixListener::bind(&ruta).expect("bind");
+
+        std::thread::spawn(move || {
+            let (mut flujo, _) = escucha.accept().expect("accept");
+            let mut basura = Vec::new();
+            let _ = flujo.read_to_end(&mut basura);
+            let _ = flujo.write_all(b"0");
+        });
+
+        let flujo = UnixStream::connect(&ruta).expect("connect");
+        assert!(!conversar(flujo, "cualquiera").expect("conversar"));
+
+        let _ = std::fs::remove_file(&ruta);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// Un mensaje con `%` no debe poder convertirse en un especificador de
+    /// formato. No se puede llamar a `pam_syslog` sin un handle real, así que lo
+    /// que se comprueba es que el texto sobreviva intacto hasta el `CString`
+    /// —que es lo que se le pasa como argumento y no como formato—.
+    #[test]
+    fn un_mensaje_con_porcentaje_viaja_como_dato() {
+        let sospechoso = "no se pudo conectar a /run/user/1000/%s%n%p (roto)";
+        let cmsg = CString::new(sospechoso).expect("sin bytes nulos");
+        assert_eq!(cmsg.to_str().unwrap(), sospechoso);
     }
 }

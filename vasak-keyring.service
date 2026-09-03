@@ -10,5 +10,57 @@ ExecStart=/usr/bin/vasak-keyring
 Restart=on-failure
 RestartSec=3
 
+# Este proceso guarda **todas** las contraseñas de la sesión: es el backend del
+# portal `Secret` y del servicio `org.freedesktop.secrets`. Hasta acá corría sin
+# ninguna restricción, que para el proceso que menos conviene que se escape es
+# justo al revés de lo que corresponde. Se le saca todo lo que no necesita para
+# su trabajo, que es leer y escribir un archivo y atender D-Bus.
+#
+# La más importante de la lista es `RestrictAddressFamilies`: sin red, un fallo
+# en este proceso no puede mandar los secretos a ninguna parte. Lo único que
+# habla es sockets locales —D-Bus y el suyo de desbloqueo en /run/user—.
+RestrictAddressFamilies=AF_UNIX
+
+NoNewPrivileges=yes
+# El llavero crea el archivo con los secretos. Sin esto nace legible por
+# cualquier usuario de la máquina, que en un almacén de contraseñas es la
+# diferencia entre estar cifrado y estar cifrado *y* fuera de la vista.
+UMask=0077
+# Y sus claves dejan de compartirse con el resto de los servicios del usuario:
+# `KeyringMode=inherit`, el valor por omisión, deja el llavero del kernel de la
+# sesión abierto a todos por igual.
+KeyringMode=private
+CapabilityBoundingSet=
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+# Los demás procesos del sistema dejan de verse desde acá.
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# `@privileged` y `@resources` no le hacen falta: no cambia dueños, ni monta
+# nada, ni toca prioridades.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallFilter=~@resources
+SystemCallErrorNumber=EPERM
+
+# `full` y no `strict` como en vasak-permissions, y es a propósito: `strict`
+# deja **todo** el árbol de sólo lectura, y este demonio tiene que poder crear
+# `~/.local/share/vasak-keyring/` la primera vez que corre. Con `strict` habría
+# que abrirle el directorio padre entero con `ReadWritePaths`, que es más
+# permiso del que se ahorra. `full` ya le cierra /usr, /boot y /etc, que es de
+# donde vendría un cambio persistente al sistema.
+ProtectSystem=full
+
 [Install]
 WantedBy=default.target

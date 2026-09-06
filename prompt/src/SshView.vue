@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { invoke } from '@tauri-apps/api/core';
 import { useConfigStore } from '@vasakgroup/plugin-config-manager';
-import type { Store } from 'pinia';
 import { nextTick, onMounted, ref } from 'vue';
 
 interface SshRequest {
@@ -33,10 +32,7 @@ onMounted(async () => {
 	field.value?.focus();
 
 	try {
-		const configStore = useConfigStore() as Store<
-			'config',
-			{ config: any; loadConfig: () => Promise<void> }
-		>;
+		const configStore = useConfigStore();
 		await configStore.loadConfig();
 	} catch {
 		// Un diálogo con los colores por omisión sigue siendo un diálogo de Vasak.

@@ -15,22 +15,22 @@
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",
     "@tauri-apps/api": "^2.11.1",
-    "@vasakgroup/plugin-config-manager": "^2.2.6",
+    "@vasakgroup/plugin-config-manager": "^2.5.0",
     "path": "^0.12.7",
     "pinia": "^3.0.4",
     "url": "^0.11.4",
-    "vue": "^3.5.41"
+    "vue": "^3.5.42"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.8",
+    "@biomejs/biome": "^2.5.12",
     "@tailwindcss/postcss": "^4.3.3",
     "@tauri-apps/cli": "^2.11.4",
     "@types/node": "^25.9.5",
     "@vitejs/plugin-vue": "^6.0.8",
-    "postcss": "^8.5.26",
+    "postcss": "^8.5.28",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",
     "vite": "^7.3.6",
-    "vue-tsc": "^3.3.9"
+    "vue-tsc": "^3.3.11"
   }
 }

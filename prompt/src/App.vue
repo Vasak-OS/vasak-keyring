@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { invoke } from '@tauri-apps/api/core';
 import { useConfigStore } from '@vasakgroup/plugin-config-manager';
-import type { Store } from 'pinia';
 import { nextTick, onMounted, ref } from 'vue';
 
 const password = ref('');
@@ -16,10 +15,7 @@ const field = ref<HTMLInputElement | null>(null);
  * system — one that looks foreign is one nobody should type into.
  */
 onMounted(async () => {
-	const configStore = useConfigStore() as Store<
-		'config',
-		{ config: any; loadConfig: () => Promise<void> }
-	>;
+	const configStore = useConfigStore();
 
 	try {
 		await configStore.loadConfig();

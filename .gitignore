@@ -1,7 +1,16 @@
 # Build output. The Cargo workspace lives at the repository root, so its target
 # directory does too — prompt/src-tauri/.gitignore would not cover it.
 /target
-Cargo.lock
+
+# El Cargo.lock **sí** se versiona, y por eso no está en esta lista.
+#
+# Estaba acá, junto a /target, como si fuera un producto de la compilación. No
+# lo es: en una biblioteca se omite a propósito —quien la usa resuelve sus
+# propias versiones— pero esto es un paquete que se instala, con un binario, un
+# módulo de PAM y un diálogo. Sin candado versionado, cada compilación resuelve
+# las dependencias de nuevo y dos builds del mismo commit pueden dar binarios
+# distintos. En el paquete que guarda todas las contraseñas de la sesión, eso es
+# no poder contestar de qué código exacto salió lo que está instalado.
 
 # The unlock dialog is a Tauri application: its JavaScript half brings the usual
 # build artefacts along.

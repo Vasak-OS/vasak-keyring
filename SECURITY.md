@@ -98,6 +98,11 @@ El seguimiento de todo esto está en
 
 ## Lo que falta de esta política
 
-Es una primera versión y lo dice: falta el threat model completo, el proceso de
-CVE y el fuzzing de los analizadores privilegiados. Está en
-[website#5](https://github.com/Vasak-OS/website/issues/5).
+Es una primera versión y lo dice: faltan el threat model completo y el proceso
+de CVE. Está en [website#5](https://github.com/Vasak-OS/website/issues/5).
+
+El fuzzing de los analizadores privilegiados sí está. Los tres que leen entrada
+que eligió otro tienen pruebas de propiedad corriendo en cada push: el registro
+del kernel que lee el servicio de permisos, el sondeo de discos del instalador
+—que monta particiones ajenas— y el protocolo del teléfono, que es el único que
+llega desde la red.

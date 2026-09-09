@@ -16,6 +16,8 @@
 use tauri::{WebviewUrl, WebviewWindowBuilder};
 use zeroize::Zeroizing;
 
+pub mod canal;
+pub mod pinentry;
 pub mod secret_service;
 pub mod ssh_askpass;
 
@@ -115,6 +117,11 @@ pub fn run() {
 const SSH_WINDOW_LABEL: &str = "ssh-askpass";
 const SSH_DIALOG_HEIGHT: f64 = 320.0;
 
+const GPG_WINDOW_LABEL: &str = "gpg-pinentry";
+// Un poco más alta que la de SSH: el texto lo escribe `gpg-agent` y suele traer
+// la huella de la clave y para qué se la está usando, en varias líneas.
+const GPG_DIALOG_HEIGHT: f64 = 360.0;
+
 /// Lo que la ventana necesita saber para preguntar.
 #[derive(Clone, serde::Serialize)]
 struct SshRequest {
@@ -202,6 +209,93 @@ pub fn run_ssh_askpass() {
             window.on_window_event(|event| {
                 if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
                     ssh_askpass::give_up();
+                }
+            });
+
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+
+/// Lo que la ventana de GPG necesita saber, tal como se lo pasó el proceso que
+/// habla con el agente.
+#[derive(Clone, serde::Serialize)]
+struct GpgRequest {
+    modo: String,
+    descripcion: String,
+    etiqueta: String,
+    titulo: String,
+    error: String,
+}
+
+#[tauri::command]
+fn gpg_request(state: tauri::State<'_, GpgRequest>) -> GpgRequest {
+    state.inner().clone()
+}
+
+/// Entrega la respuesta al proceso que habla con el agente. No vuelve.
+///
+/// Para un aviso o una confirmación la frase viene vacía y lo que cuenta es que
+/// el proceso termine bien: el padre lee el código de salida, no el texto.
+#[tauri::command]
+fn gpg_answer(passphrase: String) {
+    let passphrase = Zeroizing::new(passphrase);
+    canal::responder(passphrase.as_str())
+}
+
+/// Nadie contestó.
+#[tauri::command]
+fn gpg_cancel() {
+    canal::rendirse()
+}
+
+/// El diálogo que pide la contraseña que GPG necesita.
+///
+/// Lo lanza `vasak-pinentry` con `--dialogo`, y el pedido llega por el entorno:
+/// la lista de argumentos de un proceso la puede leer cualquiera con `ps`, y la
+/// descripción dice de qué clave se trata.
+pub fn run_pinentry_dialog() {
+    // Antes que nada, y antes de que Tauri cargue una sola biblioteca gráfica.
+    canal::apartar_salida();
+
+    let leer = |clave: &str| std::env::var(clave).unwrap_or_default();
+    let state = GpgRequest {
+        modo: {
+            let modo = leer("VASAK_PINENTRY_MODO");
+            if modo.is_empty() { "frase".to_string() } else { modo }
+        },
+        descripcion: leer("VASAK_PINENTRY_DESC"),
+        etiqueta: leer("VASAK_PINENTRY_ETIQUETA"),
+        titulo: leer("VASAK_PINENTRY_TITULO"),
+        error: leer("VASAK_PINENTRY_ERROR"),
+    };
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_config_manager::init())
+        .plugin(tauri_plugin_vicons::init())
+        .manage(state)
+        .invoke_handler(tauri::generate_handler![gpg_request, gpg_answer, gpg_cancel])
+        .setup(|app| {
+            let window = WebviewWindowBuilder::new(
+                app,
+                GPG_WINDOW_LABEL,
+                WebviewUrl::App("index.html#/gpg".into()),
+            )
+            .title("GPG")
+            .inner_size(DIALOG_WIDTH, GPG_DIALOG_HEIGHT)
+            .resizable(false)
+            .decorations(false)
+            .transparent(true)
+            .center()
+            // Del otro lado hay un gpg esperando: si la ventana queda detrás de
+            // algo, la operación se cuelga sin que se vea por qué.
+            .always_on_top(true)
+            .build()?;
+
+            window.on_window_event(|event| {
+                if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                    canal::rendirse();
                 }
             });
 

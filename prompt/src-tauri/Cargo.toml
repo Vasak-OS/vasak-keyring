@@ -19,6 +19,14 @@ path = "src/main.rs"
 name = "vasak-ssh-askpass"
 path = "src/ssh_main.rs"
 
+# El programa que `gpg-agent` lanza para pedir una contraseña. Habla el
+# protocolo Assuan por entrada y salida estándar y, cuando hay que preguntar
+# algo, se ejecuta a sí mismo con `--dialogo`: ese canal no admite una sola
+# línea que no sea protocolo, y una ventana no puede prometer eso.
+[[bin]]
+name = "vasak-pinentry"
+path = "src/pinentry_main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

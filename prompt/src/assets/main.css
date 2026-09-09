@@ -151,7 +151,6 @@
   --color-status-warning: var(--use-status-warning);
 }
 
-
 ::view-transition-old(root) {
   animation-delay: 500ms;
 }
@@ -169,6 +168,7 @@ body * {
 }
 
 @layer base {
+  /* biome-ignore lint/style/noDescendingSpecificity: `body *` está fuera de toda capa y esto está en `base`, así que el orden de la cascada ya lo decide la capa y no la especificidad — lo de afuera gana siempre. La regla no mira las capas. */
   *,
   ::after,
   ::before,

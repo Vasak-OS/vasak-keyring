@@ -1,6 +1,7 @@
 import { createPinia } from 'pinia';
 import { createApp } from 'vue';
 import App from '@/App.vue';
+import GpgView from '@/GpgView.vue';
 import SshView from '@/SshView.vue';
 import { disableNativeContextMenu } from '@/tools/native-menu';
 import '@/assets/main.css';
@@ -9,11 +10,13 @@ import '@/assets/main.css';
 // del navegador acá los cubre a ambos.
 disableNativeContextMenu();
 
-// Dos diálogos, un solo paquete: desbloquear el llavero y desbloquear una
-// clave SSH son la misma ventana con otro texto. La dirección dice cuál es.
-const isSsh = window.location.hash.startsWith('#/ssh');
+// Tres diálogos, un solo paquete: desbloquear el llavero, desbloquear una
+// clave SSH y la contraseña que pide GPG son la misma ventana con otro texto.
+// La dirección dice cuál es.
+const hash = window.location.hash;
+const vista = hash.startsWith('#/ssh') ? SshView : hash.startsWith('#/gpg') ? GpgView : App;
 
-const app = createApp(isSsh ? SshView : App);
+const app = createApp(vista);
 const pinia = createPinia();
 
 app.use(pinia);

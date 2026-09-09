@@ -26,16 +26,33 @@ static RESPUESTA: OnceLock<OwnedFd> = OnceLock::new();
 /// Se llama una sola vez y lo antes posible: cualquier cosa que escriba antes
 /// ya salió por el canal bueno.
 pub fn apartar_salida() {
+    // Los tres pasos son obligatorios y cada fallo deja al proceso en el estado
+    // que este módulo existe para evitar, así que ninguno se ignora.
+    //
+    // Sin el `dup`, `RESPUESTA` queda vacío: `responder` no escribiría nada y
+    // terminaría con éxito igual, y el padre leería esa nada como una frase
+    // válida. Sin el `open` o sin el `dup2`, la salida estándar sigue apuntando
+    // a la tubería del padre y el primer aviso de GTK se convierte en la frase.
+    //
+    // En los tres casos se sale con código distinto de cero, que es como el
+    // padre entiende «no hay respuesta» — la misma señal que cancelar.
     unsafe {
         let guardado = libc::dup(libc::STDOUT_FILENO);
-        if guardado >= 0 {
-            let _ = RESPUESTA.set(OwnedFd::from_raw_fd(guardado));
+        if guardado < 0 {
+            std::process::exit(1);
         }
+        let _ = RESPUESTA.set(OwnedFd::from_raw_fd(guardado));
 
         let nulo = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
-        if nulo >= 0 {
-            libc::dup2(nulo, libc::STDOUT_FILENO);
-            libc::close(nulo);
+        if nulo < 0 {
+            std::process::exit(1);
+        }
+        let redirigido = libc::dup2(nulo, libc::STDOUT_FILENO);
+        // Se cierra después de redirigir, y sólo entonces: cerrarlo antes
+        // dejaría a `dup2` sin descriptor de origen.
+        libc::close(nulo);
+        if redirigido < 0 {
+            std::process::exit(1);
         }
     }
 }

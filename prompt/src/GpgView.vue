@@ -11,7 +11,7 @@ import { computed, nextTick, onMounted, ref } from 'vue';
  * tiene la persona de saber qué está por desbloquear.
  */
 interface GpgRequest {
-	/** `frase`, `confirmar` o `aviso`. */
+	/** `frase`, `confirmar`, `aviso` o `error`. */
 	modo: string;
 	descripcion: string;
 	etiqueta: string;
@@ -24,9 +24,11 @@ const request = ref<GpgRequest | null>(null);
 const passphrase = ref('');
 const working = ref(false);
 const field = ref<HTMLInputElement | null>(null);
+const aceptar = ref<HTMLButtonElement | null>(null);
 
 const pideFrase = computed(() => request.value?.modo === 'frase');
 const esAviso = computed(() => request.value?.modo === 'aviso');
+const esError = computed(() => request.value?.modo === 'error');
 
 const titulo = computed(
 	() => request.value?.titulo || (pideFrase.value ? 'Contraseña de GPG' : 'GPG')
@@ -42,11 +44,24 @@ onMounted(async () => {
 	try {
 		request.value = await invoke<GpgRequest>('gpg_request');
 	} catch {
-		request.value = { modo: 'frase', descripcion: '', etiqueta: '', titulo: '', error: '' };
+		// Falla cerrado. Antes se caía a pedir una frase con la descripción
+		// vacía: una ventana que pide la contraseña de una clave privada sin
+		// poder decir de cuál se trata. Eso no se pregunta — se explica y se
+		// ofrece cancelar, que es lo único honesto cuando no sabemos qué
+		// estaríamos autorizando.
+		request.value = {
+			modo: 'error',
+			descripcion: '',
+			etiqueta: '',
+			titulo: 'GPG',
+			error: 'No se pudo leer qué está pidiendo GPG. Cancelá y volvé a intentarlo.',
+		};
 	}
 
 	await nextTick();
-	field.value?.focus();
+	// En un aviso o una confirmación no hay campo donde escribir: el foco va al
+	// botón que responde, así se puede contestar sin tocar el ratón.
+	(field.value ?? aceptar.value)?.focus();
 
 	try {
 		const configStore = useConfigStore();
@@ -122,6 +137,8 @@ const submit = async () => {
 				Cancelar
 			</button>
 			<button
+				v-if="!esError"
+				ref="aceptar"
 				type="button"
 				:disabled="working || (pideFrase && !passphrase)"
 				class="rounded-corner bg-primary px-4 py-2 text-sm font-semibold text-tx-on-primary hover:bg-secondary disabled:opacity-50"

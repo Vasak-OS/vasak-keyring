@@ -62,8 +62,13 @@ fn conversar() {
     for linea in entrada.lines() {
         let Ok(linea) = linea else { break };
 
-        let respuesta = match interpretar(&linea, &mut pedido) {
-            Accion::Responder(lineas) => lineas,
+        // Todas las respuestas van en `Zeroizing`, no sólo la de `GETPIN`.
+        //
+        // Es un solo tipo para las cuatro ramas y cuesta nada, pero sobre todo
+        // evita que la única que de verdad lleva la frase sea la excepción: la
+        // próxima rama que se agregue nace envuelta sin que nadie se acuerde.
+        let respuesta: Vec<Zeroizing<String>> = match interpretar(&linea, &mut pedido) {
+            Accion::Responder(lineas) => lineas.into_iter().map(Zeroizing::new).collect(),
             Accion::PedirFrase => {
                 let frase = preguntar("frase", &pedido);
                 respuesta_a_getpin(frase.as_ref().map(|f| f.as_str()))
@@ -71,13 +76,16 @@ fn conversar() {
             Accion::Confirmar { una_sola_opcion } => {
                 let modo = if una_sola_opcion { "aviso" } else { "confirmar" };
                 respuesta_a_confirm(preguntar(modo, &pedido).is_some())
+                    .into_iter()
+                    .map(Zeroizing::new)
+                    .collect()
             }
             Accion::Mostrar => {
                 preguntar("aviso", &pedido);
-                vec!["OK".to_string()]
+                vec![Zeroizing::new("OK".to_string())]
             }
             Accion::Terminar => {
-                let _ = decir(&mut salida, &["OK closing connection".to_string()]);
+                let _ = decir(&mut salida, &["OK closing connection"]);
                 return;
             }
         };
@@ -93,9 +101,9 @@ fn conversar() {
 /// Vaciar en cada línea no es opcional: del otro lado hay alguien esperando
 /// esta respuesta para mandar la siguiente orden, así que una respuesta que se
 /// queda en el búfer es un cuelgue.
-fn decir(salida: &mut impl Write, lineas: &[String]) -> bool {
+fn decir<L: AsRef<str>>(salida: &mut impl Write, lineas: &[L]) -> bool {
     for linea in lineas {
-        if writeln!(salida, "{linea}").is_err() {
+        if writeln!(salida, "{}", linea.as_ref()).is_err() {
             return false;
         }
     }
@@ -138,7 +146,16 @@ fn preguntar(modo: &str, pedido: &Pedido) -> Option<Zeroizing<String>> {
     if !estado.success() {
         return None;
     }
-    leido?;
+
+    // Cero bytes leídos es «cerró sin contestar», no «contestó vacío».
+    //
+    // Un hijo que muere sin escribir nada pero con código de éxito —por lo que
+    // sea— dejaría acá un `Some("")`, y eso corriente abajo es una frase vacía
+    // que se le entrega a GPG, o un `CONFIRM` que se toma por aceptado. Sin
+    // respuesta no hay respuesta.
+    if leido? == 0 {
+        return None;
+    }
 
     // El salto final es del protocolo entre padre e hijo, no de la frase.
     let frase = Zeroizing::new(linea.trim_end_matches(['\r', '\n']).to_string());

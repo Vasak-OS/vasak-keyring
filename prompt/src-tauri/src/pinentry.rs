@@ -50,6 +50,21 @@ use zeroize::Zeroizing;
 /// de eso depende que reintente o no.
 pub const CANCELADO: &str = "ERR 83886179 Operation cancelled <Pinentry>";
 
+/// El de «esa orden no la conozco».
+///
+/// Medido: es lo que contesta `pinentry-tty` a una orden inventada, y la fuente
+/// no es Pinentry sino libassuan —`0x20000000 | 275`—, porque la genera su
+/// despachador antes de llegar al programa. Se copia tal cual en vez de armar
+/// una con nuestra fuente: es la línea que todos los pinentry devuelven y con
+/// la que `gpg-agent` está probado.
+pub const ORDEN_DESCONOCIDA: &str = "ERR 536871187 Unknown IPC command <User defined source 1>";
+
+/// El de «esa orden la conozco, pero ese argumento no».
+///
+/// `0x05000118`, con el 280 —`GPG_ERR_ASS_PARAMETER`—. También medido: es lo
+/// que contesta a un `GETINFO` de algo que no sabe.
+pub const PARAMETRO_DESCONOCIDO: &str = "ERR 83886360 IPC parameter error <Pinentry>";
+
 /// El de «no confirmó», para los diálogos de sí o no.
 ///
 /// `0x05000072`, con el 114 —`GPG_ERR_NOT_CONFIRMED`—. Medido contra
@@ -147,7 +162,7 @@ pub fn interpretar(linea: &str, pedido: &mut Pedido) -> Accion {
             // un dato inventado: el agente usa `ttyinfo` para decidir si puede
             // dibujar en una terminal, y mentirle ahí lo manda a un lugar donde
             // no hay nadie.
-            _ => vec!["ERR 83886355 Unknown option <Pinentry>".into()],
+            _ => vec![PARAMETRO_DESCONOCIDO.into()],
         }),
         "RESET" => {
             pedido.limpiar();
@@ -162,7 +177,7 @@ pub fn interpretar(linea: &str, pedido: &mut Pedido) -> Accion {
         | "SETGENPIN" | "SETGENPIN_TT" | "CLEARPASSPHRASE" => ok(),
         "BYE" => Accion::Terminar,
         "" => ok(),
-        _ => Accion::Responder(vec!["ERR 83886162 Unknown command <Pinentry>".into()]),
+        _ => Accion::Responder(vec![ORDEN_DESCONOCIDA.into()]),
     }
 }
 
@@ -187,13 +202,21 @@ pub fn saludo() -> String {
 /// La frase va codificada: una que lleve un `%` o un salto de línea rompería el
 /// protocolo tal cual, y GPG recibiría una distinta de la que se tecleó — que
 /// se ve como «contraseña incorrecta» sin ninguna pista de por qué.
-pub fn respuesta_a_getpin(frase: Option<&str>) -> Vec<String> {
+///
+/// Y vuelve en `Zeroizing`, no en un `String` pelado: la línea que se arma acá
+/// **contiene la frase**, y un `String` común queda en la memoria liberada
+/// cuando se suelta. Que quien la reciba tenga que sostener el envase es a
+/// propósito.
+pub fn respuesta_a_getpin(frase: Option<&str>) -> Vec<Zeroizing<String>> {
     match frase {
         Some(frase) => {
-            let codificada = Zeroizing::new(codificar(frase));
-            vec![format!("D {}", codificada.as_str()), "OK".into()]
+            let codificada = codificar(frase);
+            vec![
+                Zeroizing::new(format!("D {codificada}")),
+                Zeroizing::new("OK".to_string()),
+            ]
         }
-        None => vec![CANCELADO.into()],
+        None => vec![Zeroizing::new(CANCELADO.to_string())],
     }
 }
 
@@ -251,6 +274,12 @@ pub fn codificar(texto: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Las respuestas de `GETPIN` vienen envueltas para que se borren al
+    /// soltarse; para compararlas alcanza con mirar el texto.
+    fn texto(lineas: &[Zeroizing<String>]) -> Vec<String> {
+        lineas.iter().map(|l| l.to_string()).collect()
+    }
+
     fn interpretar_solo(linea: &str) -> Accion {
         let mut pedido = Pedido::default();
         interpretar(linea, &mut pedido)
@@ -306,6 +335,35 @@ mod tests {
         assert_eq!(0x0500_0072, 83886194);
     }
 
+    /// Los dos errores de «eso no lo entiendo», también medidos.
+    ///
+    /// Los tenía cruzados: la orden desconocida contestaba `83886162`, que es
+    /// `GPG_ERR_INV_SESSION_KEY` —nada que ver— y el `GETINFO` raro contestaba
+    /// el código de «orden desconocida». Lo que devuelve `pinentry-tty` es:
+    ///
+    /// ```text
+    /// $ printf 'BAILAR\nGETINFO cualquiera\nBYE\n' | pinentry-tty
+    /// ERR 536871187 Unknown IPC command <User defined source 1>
+    /// ERR 83886360 IPC parameter error <Pinentry>
+    /// ```
+    #[test]
+    fn lo_que_no_se_entiende_se_contesta_como_lo_hace_el_de_verdad() {
+        // 0x20000000 | 275: la fuente es libassuan, no Pinentry, porque el
+        // error lo genera su despachador antes de llegar al programa.
+        assert_eq!(0x2000_0000 | 275, 536871187);
+        assert_eq!(
+            interpretar_solo("BAILAR"),
+            Accion::Responder(vec![ORDEN_DESCONOCIDA.into()])
+        );
+
+        // 0x05000000 | 280 (GPG_ERR_ASS_PARAMETER), esta sí con fuente Pinentry.
+        assert_eq!(0x0500_0000 | 280, 83886360);
+        assert_eq!(
+            interpretar_solo("GETINFO cualquiera"),
+            Accion::Responder(vec![PARAMETRO_DESCONOCIDO.into()])
+        );
+    }
+
     #[test]
     fn getpin_pide_la_frase_y_confirm_pregunta_si_o_no() {
         assert_eq!(interpretar_solo("GETPIN"), Accion::PedirFrase);
@@ -328,11 +386,11 @@ mod tests {
     #[test]
     fn la_frase_viaja_codificada() {
         assert_eq!(
-            respuesta_a_getpin(Some("100% seguro")),
+            texto(&respuesta_a_getpin(Some("100% seguro"))),
             vec!["D 100%25 seguro".to_string(), "OK".to_string()]
         );
         assert_eq!(
-            respuesta_a_getpin(Some("dos\nlineas")),
+            texto(&respuesta_a_getpin(Some("dos\nlineas"))),
             vec!["D dos%0Alineas".to_string(), "OK".to_string()]
         );
         // Y lo que va y vuelve es lo mismo.
@@ -343,10 +401,10 @@ mod tests {
 
     #[test]
     fn cancelar_no_es_una_frase_vacia() {
-        assert_eq!(respuesta_a_getpin(None), vec![CANCELADO.to_string()]);
+        assert_eq!(texto(&respuesta_a_getpin(None)), vec![CANCELADO.to_string()]);
         // Una frase vacía sí es una respuesta, y es distinta de cancelar.
         assert_eq!(
-            respuesta_a_getpin(Some("")),
+            texto(&respuesta_a_getpin(Some(""))),
             vec!["D ".to_string(), "OK".to_string()]
         );
     }
@@ -444,7 +502,7 @@ mod tests {
     #[test]
     fn ninguna_respuesta_lleva_un_salto_adentro() {
         let mut candidatas = vec![saludo(), CANCELADO.to_string(), NO_CONFIRMADO.to_string()];
-        candidatas.extend(respuesta_a_getpin(Some("con\nsalto\r\ny retorno")));
+        candidatas.extend(texto(&respuesta_a_getpin(Some("con\nsalto\r\ny retorno"))));
         candidatas.extend(respuesta_a_confirm(false));
         if let Accion::Responder(lineas) = interpretar_solo("GETINFO version") {
             candidatas.extend(lineas);

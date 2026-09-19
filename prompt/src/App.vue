@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { invoke } from '@tauri-apps/api/core';
 import { useConfigStore } from '@vasakgroup/plugin-config-manager';
+import { WindowFrame } from '@vasakgroup/vue-libvasak';
 import { nextTick, onMounted, ref } from 'vue';
 
 const password = ref('');
@@ -62,9 +63,14 @@ const submit = async () => {
 </script>
 
 <template>
-	<div
-		class="h-screen w-screen select-none rounded-corner-window border border-ui-border bg-ui-bg/95 p-6 flex flex-col gap-4"
-	>
+	<!-- El marco es el compartido, y sin barra: esto es un cuadro de diálogo,
+	     no una ventana. Se responde —se escribe la contraseña o se cancela—, y
+	     un botón de cerrar sería una salida que deja al programa que pidió el
+	     secreto esperando. Del marco se queda lo que sí hace falta: que el
+	     borde, la esquina y el fondo sean los mismos que los de la ventana que
+	     tiene debajo, que es cualquiera. -->
+	<WindowFrame hide-bar class="bg-ui-bg/95">
+		<div class="flex min-w-0 flex-1 select-none flex-col gap-4 p-6">
 		<div class="flex flex-col gap-2">
 			<h1 class="text-lg font-semibold text-tx-main">El llavero está bloqueado</h1>
 			<p class="text-sm text-tx-muted">
@@ -107,5 +113,6 @@ const submit = async () => {
 				{{ working ? 'Desbloqueando…' : 'Desbloquear' }}
 			</button>
 		</div>
-	</div>
+		</div>
+	</WindowFrame>
 </template>

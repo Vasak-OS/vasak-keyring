@@ -3796,9 +3796,9 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-config-manager"
-version = "2.2.7"
+version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5727ef664feca0304b67be8ab693a7dc3e9ebc57bbd98e539e19465eda4a6dc5"
+checksum = "d7ded4a825c8e819683d6f40ff22add5589881c0c4e1f2dc80c6c5798b0f987b"
 dependencies = [
  "home",
  "notify",
@@ -4440,7 +4440,7 @@ dependencies = [
 
 [[package]]
 name = "vasak-keyring"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -4471,7 +4471,7 @@ dependencies = [
 
 [[package]]
 name = "vasak-keyring-prompt"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures-util",
  "libc",

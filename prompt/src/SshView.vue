@@ -61,8 +61,13 @@ const submit = async () => {
 	     un botón de cerrar sería una salida que deja al programa que pidió el
 	     secreto esperando. Del marco se queda lo que sí hace falta: que el
 	     borde, la esquina y el fondo sean los mismos que los de la ventana que
-	     tiene debajo, que es cualquiera. -->
-	<WindowFrame hide-bar class="bg-ui-bg/95">
+	     tiene debajo, que es cualquiera.
+
+	     El fondo es el del marco y no uno propio: dos utilidades de fondo sobre
+	     el mismo elemento las desempata el orden del CSS generado, no el del
+	     atributo, así que un `bg-ui-bg/95` encima del `/80` del marco gana o
+	     pierde según el día. -->
+	<WindowFrame hide-bar>
 		<div class="flex min-w-0 flex-1 select-none flex-col gap-4 p-6">
 		<div class="flex flex-col gap-2">
 			<h1 class="text-lg font-semibold text-tx-main">Desbloquear la clave SSH</h1>

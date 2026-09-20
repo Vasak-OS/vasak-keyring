@@ -1,0 +1,4 @@
+[test]
+# El DOM, el compilador de `.vue` y los dobles de Tauri tienen que estar puestos
+# antes de que una prueba importe un componente. Ver `tests/preparar.ts`.
+preload = ["./tests/preparar.ts"]

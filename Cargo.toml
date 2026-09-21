@@ -4,10 +4,13 @@ resolver = "2"
 
 [package]
 name = "vasak-keyring"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 
 [dependencies]
+# The XDG base directories, so the rule that a relative or empty variable is
+# ignored lives in one place and not in a copy per program. See `keyring_path`.
+dirs = "6"
 aes-gcm = "0.10"
 argon2 = "0.5"
 serde = { version = "1", features = ["derive"] }

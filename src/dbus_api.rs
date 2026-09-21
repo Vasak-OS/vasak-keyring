@@ -68,11 +68,48 @@ fn extract_bytes(value: &Value<'_>) -> Result<Vec<u8>, zbus::fdo::Error> {
     Vec::<u8>::try_from(value.clone()).map_err(|_| dbus_err("expected byte array"))
 }
 
+/// Where the keyring database lives.
+///
+/// # Why this goes through `dirs` and is not read from the environment
+///
+/// It used to read `XDG_DATA_HOME` directly, with `unwrap_or_else` for the
+/// fallback, and that has a hole that only shows up on a misconfigured session.
+/// `var` returns `Ok("")` when the variable is **set but empty**, so the
+/// fallback never fires: `PathBuf::from("")` joined with the rest yields
+/// `vasak-keyring/keyring.db`, **relative to the working directory**. Same with
+/// any relative value, which the XDG spec says to ignore.
+///
+/// For a keyring that is worse than an error. The caller creates the parent
+/// directory and writes, so the database lands somewhere unpredictable — and
+/// `spawn_unlock_prompt` asks `path.exists()` to decide whether there is a
+/// keyring at all. Against the wrong path that answers `false`, so the daemon
+/// behaves like a fresh install and the user's stored credentials look like
+/// they vanished.
+///
+/// `dirs::data_dir()` already implements the rule, and it is one rule and not
+/// two: an empty string is not an absolute path either, so both cases fall out
+/// of the same check. Using it rather than a local copy is also what stops
+/// every program here from getting this subtly wrong on its own.
+///
+/// `dirs` validates the XDG variable but only checks `HOME` for emptiness, so
+/// the filter below closes the other half: a relative `HOME` would otherwise
+/// come back as a relative base.
 fn keyring_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let data = std::env::var("XDG_DATA_HOME")
-        .unwrap_or_else(|_| format!("{home}/.local/share"));
-    Some(std::path::PathBuf::from(data).join("vasak-keyring").join("keyring.db"))
+    keyring_path_under(dirs::data_dir())
+}
+
+/// The same decision without reading the environment.
+///
+/// Split out so it can be tested: the environment is global to the process and
+/// tests run in parallel, so one that sets a variable decides the outcome of
+/// another.
+///
+/// Returning `None` rather than guessing is deliberate. Refusing to answer
+/// makes the caller fail loudly; writing secrets to a directory nobody chose
+/// does not.
+fn keyring_path_under(base: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    let base = base.filter(|base| base.is_absolute())?;
+    Some(base.join("vasak-keyring").join("keyring.db"))
 }
 
 /// In-memory master password (used to derive the DB key via Argon2). It is set
@@ -1664,4 +1701,43 @@ async fn buscar_secreto(
         .values()
         .find(|item| &item.attributes == atributos)
         .map(|item| item.secret.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn the_database_hangs_off_the_data_directory() {
+        assert_eq!(
+            keyring_path_under(Some(PathBuf::from("/home/pato/.local/share"))),
+            Some(PathBuf::from(
+                "/home/pato/.local/share/vasak-keyring/keyring.db"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_relative_base_is_refused_rather_than_guessed() {
+        // This is the bug this replaced. A relative or empty base made the
+        // database land next to wherever the daemon happened to be started, and
+        // `spawn_unlock_prompt` then reported no keyring at all — so a user with
+        // stored credentials looked like a fresh install.
+        //
+        // Empty, bare name, `./` and `../`: the bare name is the one that slips
+        // through when only the empty case is remembered.
+        for relative in ["", "share", "./share", "../share"] {
+            assert_eq!(
+                keyring_path_under(Some(PathBuf::from(relative))),
+                None,
+                "a base of {relative:?} must not produce a path"
+            );
+        }
+    }
+
+    #[test]
+    fn no_base_means_no_path() {
+        assert_eq!(keyring_path_under(None), None);
+    }
 }

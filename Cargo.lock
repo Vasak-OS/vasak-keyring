@@ -4440,13 +4440,14 @@ dependencies = [
 
 [[package]]
 name = "vasak-keyring"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "aes",
  "aes-gcm",
  "argon2",
  "cbc",
  "cipher",
+ "dirs",
  "hex",
  "hkdf",
  "libc",

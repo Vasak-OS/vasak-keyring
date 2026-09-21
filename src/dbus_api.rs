@@ -1,14 +1,14 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::convert::TryFrom;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
-use zeroize::Zeroizing;
-use zbus::{interface, Connection};
 use zbus::object_server::SignalEmitter;
-use zbus::zvariant::{self, OwnedObjectPath, OwnedValue, Value, Type};
-use serde::{Deserialize, Serialize};
-use std::convert::TryFrom;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use zbus::zvariant::{self, OwnedObjectPath, OwnedValue, Type, Value};
+use zbus::{interface, Connection};
+use zeroize::Zeroizing;
 
 use crate::crypto;
 use crate::session_crypto;
@@ -68,11 +68,48 @@ fn extract_bytes(value: &Value<'_>) -> Result<Vec<u8>, zbus::fdo::Error> {
     Vec::<u8>::try_from(value.clone()).map_err(|_| dbus_err("expected byte array"))
 }
 
+/// Where the keyring database lives.
+///
+/// # Why this goes through `dirs` and is not read from the environment
+///
+/// It used to read `XDG_DATA_HOME` directly, with `unwrap_or_else` for the
+/// fallback, and that has a hole that only shows up on a misconfigured session.
+/// `var` returns `Ok("")` when the variable is **set but empty**, so the
+/// fallback never fires: `PathBuf::from("")` joined with the rest yields
+/// `vasak-keyring/keyring.db`, **relative to the working directory**. Same with
+/// any relative value, which the XDG spec says to ignore.
+///
+/// For a keyring that is worse than an error. The caller creates the parent
+/// directory and writes, so the database lands somewhere unpredictable — and
+/// `spawn_unlock_prompt` asks `path.exists()` to decide whether there is a
+/// keyring at all. Against the wrong path that answers `false`, so the daemon
+/// behaves like a fresh install and the user's stored credentials look like
+/// they vanished.
+///
+/// `dirs::data_dir()` already implements the rule, and it is one rule and not
+/// two: an empty string is not an absolute path either, so both cases fall out
+/// of the same check. Using it rather than a local copy is also what stops
+/// every program here from getting this subtly wrong on its own.
+///
+/// `dirs` validates the XDG variable but only checks `HOME` for emptiness, so
+/// the filter below closes the other half: a relative `HOME` would otherwise
+/// come back as a relative base.
 fn keyring_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let data = std::env::var("XDG_DATA_HOME")
-        .unwrap_or_else(|_| format!("{home}/.local/share"));
-    Some(std::path::PathBuf::from(data).join("vasak-keyring").join("keyring.db"))
+    keyring_path_under(dirs::data_dir())
+}
+
+/// The same decision without reading the environment.
+///
+/// Split out so it can be tested: the environment is global to the process and
+/// tests run in parallel, so one that sets a variable decides the outcome of
+/// another.
+///
+/// Returning `None` rather than guessing is deliberate. Refusing to answer
+/// makes the caller fail loudly; writing secrets to a directory nobody chose
+/// does not.
+fn keyring_path_under(base: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    let base = base.filter(|base| base.is_absolute())?;
+    Some(base.join("vasak-keyring").join("keyring.db"))
 }
 
 /// In-memory master password (used to derive the DB key via Argon2). It is set
@@ -107,7 +144,9 @@ fn master_password() -> Option<Zeroizing<String>> {
             return Some(pw.clone());
         }
     }
-    std::env::var("VASAK_KEYRING_PASSWORD").ok().map(Zeroizing::new)
+    std::env::var("VASAK_KEYRING_PASSWORD")
+        .ok()
+        .map(Zeroizing::new)
 }
 
 /// Message shown when the keyring cannot be written because it was never
@@ -327,16 +366,22 @@ struct ItemInterface {
 impl ItemInterface {
     #[zbus(property)]
     async fn label(&self) -> Result<String, zbus::fdo::Error> {
-        self.state.lock().await
-            .items.get(&self.path)
+        self.state
+            .lock()
+            .await
+            .items
+            .get(&self.path)
             .map(|i| i.label.clone())
             .ok_or_else(|| dbus_err("item not found"))
     }
 
     #[zbus(property)]
     async fn attributes(&self) -> Result<HashMap<String, String>, zbus::fdo::Error> {
-        self.state.lock().await
-            .items.get(&self.path)
+        self.state
+            .lock()
+            .await
+            .items
+            .get(&self.path)
             .map(|i| i.attributes.clone())
             .ok_or_else(|| dbus_err("item not found"))
     }
@@ -354,16 +399,22 @@ impl ItemInterface {
 
     #[zbus(property)]
     async fn created(&self) -> Result<u64, zbus::fdo::Error> {
-        self.state.lock().await
-            .items.get(&self.path)
+        self.state
+            .lock()
+            .await
+            .items
+            .get(&self.path)
             .map(|i| i.created)
             .ok_or_else(|| dbus_err("item not found"))
     }
 
     #[zbus(property)]
     async fn modified(&self) -> Result<u64, zbus::fdo::Error> {
-        self.state.lock().await
-            .items.get(&self.path)
+        self.state
+            .lock()
+            .await
+            .items
+            .get(&self.path)
             .map(|i| i.modified)
             .ok_or_else(|| dbus_err("item not found"))
     }
@@ -380,12 +431,20 @@ impl ItemInterface {
     ) -> Result<(SecretStruct,), zbus::fdo::Error> {
         let state = self.state.lock().await;
         // Never release a secret from a locked collection.
-        if state.collections.values().any(|c| effectively_locked(c.locked) && c.items.contains(&self.path)) {
+        if state
+            .collections
+            .values()
+            .any(|c| effectively_locked(c.locked) && c.items.contains(&self.path))
+        {
             return Err(dbus_err("collection is locked"));
         }
-        let item = state.items.get(&self.path)
+        let item = state
+            .items
+            .get(&self.path)
             .ok_or_else(|| dbus_err("item not found"))?;
-        let ses = state.sessions.get(session.as_str())
+        let ses = state
+            .sessions
+            .get(session.as_str())
             .ok_or_else(|| dbus_err("session not found"))?;
 
         let (parameters, value) = ses.encode(&item.secret)?;
@@ -418,7 +477,9 @@ impl ItemInterface {
                 }
                 None => return Err(dbus_err("item not found")),
             }
-            state.collections.iter()
+            state
+                .collections
+                .iter()
                 .find(|(_, c)| c.items.contains(&self.path))
                 .map(|(cp, _)| cp.clone())
         };
@@ -489,32 +550,44 @@ impl CollectionInterface {
 
     #[zbus(property)]
     async fn label(&self) -> Result<String, zbus::fdo::Error> {
-        self.state.lock().await
-            .collections.get(&self.path)
+        self.state
+            .lock()
+            .await
+            .collections
+            .get(&self.path)
             .map(|c| c.label.clone())
             .ok_or_else(|| dbus_err("collection not found"))
     }
 
     #[zbus(property)]
     async fn locked(&self) -> Result<bool, zbus::fdo::Error> {
-        self.state.lock().await
-            .collections.get(&self.path)
+        self.state
+            .lock()
+            .await
+            .collections
+            .get(&self.path)
             .map(|c| effectively_locked(c.locked))
             .ok_or_else(|| dbus_err("collection not found"))
     }
 
     #[zbus(property)]
     async fn created(&self) -> Result<u64, zbus::fdo::Error> {
-        self.state.lock().await
-            .collections.get(&self.path)
+        self.state
+            .lock()
+            .await
+            .collections
+            .get(&self.path)
             .map(|c| c.created)
             .ok_or_else(|| dbus_err("collection not found"))
     }
 
     #[zbus(property)]
     async fn modified(&self) -> Result<u64, zbus::fdo::Error> {
-        self.state.lock().await
-            .collections.get(&self.path)
+        self.state
+            .lock()
+            .await
+            .collections
+            .get(&self.path)
             .map(|c| c.modified)
             .ok_or_else(|| dbus_err("collection not found"))
     }
@@ -547,7 +620,10 @@ impl CollectionInterface {
         if let Some(col) = state.collections.get(&self.path) {
             for ip in &col.items {
                 if let Some(item) = state.items.get(ip) {
-                    if attributes.iter().all(|(k, v)| item.attributes.get(k) == Some(v)) {
+                    if attributes
+                        .iter()
+                        .all(|(k, v)| item.attributes.get(k) == Some(v))
+                    {
                         results.push(owned_path_try(ip).unwrap_or_else(|_| owned_path("/")));
                     }
                 }
@@ -586,14 +662,17 @@ impl CollectionInterface {
 
         if replace {
             let existing: Vec<String> = {
-                let col = state.collections.get(&self.path)
+                let col = state
+                    .collections
+                    .get(&self.path)
                     .ok_or_else(|| dbus_err("collection not found"))?;
                 col.items
                     .iter()
                     .filter(|ip| {
-                        state.items.get(*ip).is_some_and(|item| {
-                            item.attributes == attributes
-                        })
+                        state
+                            .items
+                            .get(*ip)
+                            .is_some_and(|item| item.attributes == attributes)
                     })
                     .cloned()
                     .collect()
@@ -632,7 +711,10 @@ impl CollectionInterface {
             conn: self.conn.clone(),
             path: item_path.clone(),
         };
-        self.conn.object_server().at(item_path.clone(), iface).await
+        self.conn
+            .object_server()
+            .at(item_path.clone(), iface)
+            .await
             .map(|_| ())
             .map_err(|e| dbus_err(format!("{e}")))?;
 
@@ -721,8 +803,12 @@ impl ServiceInterface {
     }
 
     pub async fn register_default_collection(&self) -> Result<(), zbus::fdo::Error> {
-        self.spawn_collection("/org/freedesktop/secrets/collection/login",
-            "login", "Default collection").await
+        self.spawn_collection(
+            "/org/freedesktop/secrets/collection/login",
+            "login",
+            "Default collection",
+        )
+        .await
     }
 
     /// Object path an alias is addressed by, per the Secret Service spec.
@@ -742,9 +828,11 @@ impl ServiceInterface {
     /// The interface keeps pointing at the collection's real path, so items
     /// created through the alias land in the collection itself and signals are
     /// emitted on the canonical path.
-    async fn publish_alias(&self, alias: &str, collection_path: &str)
-        -> Result<(), zbus::fdo::Error>
-    {
+    async fn publish_alias(
+        &self,
+        alias: &str,
+        collection_path: &str,
+    ) -> Result<(), zbus::fdo::Error> {
         let iface = CollectionInterface {
             state: self.state.clone(),
             conn: self.conn.clone(),
@@ -790,9 +878,12 @@ impl ServiceInterface {
         }
     }
 
-    async fn spawn_collection(&self, path: &str, alias: &str, label: &str)
-        -> Result<(), zbus::fdo::Error>
-    {
+    async fn spawn_collection(
+        &self,
+        path: &str,
+        alias: &str,
+        label: &str,
+    ) -> Result<(), zbus::fdo::Error> {
         let mut loaded: Vec<ItemInfo> = Vec::new();
         if let Some(db_path) = keyring_path() {
             if db_path.exists() {
@@ -862,7 +953,9 @@ impl ServiceInterface {
         // The login collection is the default keyring; libsecret resolves the
         // "default" alias when storing/looking up passwords.
         if alias == "login" {
-            state.aliases.insert("default".to_string(), path.to_string());
+            state
+                .aliases
+                .insert("default".to_string(), path.to_string());
         }
 
         // Register item interfaces
@@ -872,7 +965,10 @@ impl ServiceInterface {
                 conn: self.conn.clone(),
                 path: ip.clone(),
             };
-            self.conn.object_server().at(ip.clone(), iface).await
+            self.conn
+                .object_server()
+                .at(ip.clone(), iface)
+                .await
                 .map(|_| ())
                 .map_err(|e| dbus_err(format!("{e}")))?;
         }
@@ -884,7 +980,10 @@ impl ServiceInterface {
             path: path.to_string(),
             alias: alias.to_string(),
         };
-        self.conn.object_server().at(path.to_string(), iface).await
+        self.conn
+            .object_server()
+            .at(path.to_string(), iface)
+            .await
             .map(|_| ())
             .map_err(|e| dbus_err(format!("{e}")))?;
 
@@ -899,13 +998,22 @@ impl ServiceInterface {
 #[interface(name = "org.freedesktop.Secret.Service")]
 impl ServiceInterface {
     #[zbus(signal)]
-    async fn collection_created(emitter: &SignalEmitter<'_>, collection: OwnedObjectPath) -> zbus::Result<()>;
+    async fn collection_created(
+        emitter: &SignalEmitter<'_>,
+        collection: OwnedObjectPath,
+    ) -> zbus::Result<()>;
 
     #[zbus(signal)]
-    async fn collection_deleted(emitter: &SignalEmitter<'_>, collection: OwnedObjectPath) -> zbus::Result<()>;
+    async fn collection_deleted(
+        emitter: &SignalEmitter<'_>,
+        collection: OwnedObjectPath,
+    ) -> zbus::Result<()>;
 
     #[zbus(signal)]
-    async fn collection_changed(emitter: &SignalEmitter<'_>, collection: OwnedObjectPath) -> zbus::Result<()>;
+    async fn collection_changed(
+        emitter: &SignalEmitter<'_>,
+        collection: OwnedObjectPath,
+    ) -> zbus::Result<()>;
 
     #[zbus(property)]
     async fn collections(&self) -> Vec<OwnedObjectPath> {
@@ -965,7 +1073,10 @@ impl ServiceInterface {
             state: self.state.clone(),
             path: path.clone(),
         };
-        self.conn.object_server().at(path.clone(), iface).await
+        self.conn
+            .object_server()
+            .at(path.clone(), iface)
+            .await
             .map(|_| ())
             .map_err(|e| dbus_err(format!("{e}")))?;
 
@@ -1011,9 +1122,16 @@ impl ServiceInterface {
         for col in state.collections.values() {
             for ip in &col.items {
                 if let Some(item) = state.items.get(ip) {
-                    if attributes.iter().all(|(k, v)| item.attributes.get(k) == Some(v)) {
+                    if attributes
+                        .iter()
+                        .all(|(k, v)| item.attributes.get(k) == Some(v))
+                    {
                         let o = owned_path_try(ip).unwrap_or_else(|_| owned_path("/"));
-                        if effectively_locked(col.locked) { locked.push(o) } else { unlocked.push(o) }
+                        if effectively_locked(col.locked) {
+                            locked.push(o)
+                        } else {
+                            unlocked.push(o)
+                        }
                     }
                 }
             }
@@ -1046,7 +1164,9 @@ impl ServiceInterface {
                 state.aliases.remove(alias);
                 None
             } else if state.collections.contains_key(collection.as_str()) {
-                state.aliases.insert(alias.to_string(), collection.as_str().to_string());
+                state
+                    .aliases
+                    .insert(alias.to_string(), collection.as_str().to_string());
                 Some(collection.as_str().to_string())
             } else {
                 return Err(dbus_err("collection not found"));
@@ -1122,7 +1242,11 @@ impl ServiceInterface {
         for ip in &items {
             let ip_str = ip.as_str();
             // Skip items whose collection is locked.
-            if state.collections.values().any(|c| effectively_locked(c.locked) && c.items.iter().any(|p| p == ip_str)) {
+            if state
+                .collections
+                .values()
+                .any(|c| effectively_locked(c.locked) && c.items.iter().any(|p| p == ip_str))
+            {
                 continue;
             }
             if let Some(item) = state.items.get(ip.as_str()) {
@@ -1199,7 +1323,14 @@ impl PromptInterface {
     /// `uwsm finalize` when the session came up.
     async fn ask() -> bool {
         let via_systemd = tokio::process::Command::new("systemd-run")
-            .args(["--user", "--wait", "--collect", "--quiet", "--pipe", PROMPTER])
+            .args([
+                "--user",
+                "--wait",
+                "--collect",
+                "--quiet",
+                "--pipe",
+                PROMPTER,
+            ])
             .status()
             .await;
 
@@ -1370,12 +1501,20 @@ impl PamUnlockInterface {
         let server = self.conn.object_server();
 
         if let Ok(iface) = server.interface::<_, CollectionInterface>(coll_path).await {
-            let _ = iface.get().await.locked_changed(iface.signal_emitter()).await;
+            let _ = iface
+                .get()
+                .await
+                .locked_changed(iface.signal_emitter())
+                .await;
         }
 
         for ip in item_paths {
             if let Ok(iface) = server.interface::<_, ItemInterface>(ip.as_str()).await {
-                let _ = iface.get().await.locked_changed(iface.signal_emitter()).await;
+                let _ = iface
+                    .get()
+                    .await
+                    .locked_changed(iface.signal_emitter())
+                    .await;
             }
         }
     }
@@ -1432,13 +1571,16 @@ impl PamUnlockInterface {
             let mut state = self.state.lock().await;
 
             if !state.collections.contains_key(&coll_path) {
-                state.collections.insert(coll_path.clone(), CollectionInfo {
-                    label: "Default collection".into(),
-                    locked: false,
-                    items: vec![],
-                    created: now(),
-                    modified: now(),
-                });
+                state.collections.insert(
+                    coll_path.clone(),
+                    CollectionInfo {
+                        label: "Default collection".into(),
+                        locked: false,
+                        items: vec![],
+                        created: now(),
+                        modified: now(),
+                    },
+                );
             }
 
             // Unlocking reloads the collection from disk, so whatever it held
@@ -1489,7 +1631,10 @@ impl PamUnlockInterface {
                 conn: self.conn.clone(),
                 path: ip.clone(),
             };
-            self.conn.object_server().at(ip.clone(), iface).await
+            self.conn
+                .object_server()
+                .at(ip.clone(), iface)
+                .await
                 .map(|_| ())
                 .map_err(|e| dbus_err(format!("{e}")))?;
         }
@@ -1500,7 +1645,10 @@ impl PamUnlockInterface {
             path: coll_path.clone(),
             alias: "login".into(),
         };
-        self.conn.object_server().at(coll_path.clone(), iface).await
+        self.conn
+            .object_server()
+            .at(coll_path.clone(), iface)
+            .await
             .map(|_| ())
             .map_err(|e| dbus_err(format!("{e}")))?;
 
@@ -1664,4 +1812,43 @@ async fn buscar_secreto(
         .values()
         .find(|item| &item.attributes == atributos)
         .map(|item| item.secret.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn the_database_hangs_off_the_data_directory() {
+        assert_eq!(
+            keyring_path_under(Some(PathBuf::from("/home/pato/.local/share"))),
+            Some(PathBuf::from(
+                "/home/pato/.local/share/vasak-keyring/keyring.db"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_relative_base_is_refused_rather_than_guessed() {
+        // This is the bug this replaced. A relative or empty base made the
+        // database land next to wherever the daemon happened to be started, and
+        // `spawn_unlock_prompt` then reported no keyring at all — so a user with
+        // stored credentials looked like a fresh install.
+        //
+        // Empty, bare name, `./` and `../`: the bare name is the one that slips
+        // through when only the empty case is remembered.
+        for relative in ["", "share", "./share", "../share"] {
+            assert_eq!(
+                keyring_path_under(Some(PathBuf::from(relative))),
+                None,
+                "a base of {relative:?} must not produce a path"
+            );
+        }
+    }
+
+    #[test]
+    fn no_base_means_no_path() {
+        assert_eq!(keyring_path_under(None), None);
+    }
 }

@@ -24,6 +24,13 @@ const PAM_IGNORE: c_int = 25;
 const PAM_AUTHTOK: c_int = 6;
 const LOG_AUTH: c_int = 4;
 
+/// Lo que contesta `pam_get_data` cuando no hay nada bajo la clave.
+///
+/// No hace falta en el camino de éxito, así que vive detrás de `cfg(test)` para
+/// no dejar una constante sin usar en la compilación normal.
+#[cfg(test)]
+const PAM_NO_MODULE_DATA: c_int = 18;
+
 // ── Opaque PAM handle (only accessed through FFI) ──────────
 
 pub enum pam_handle_t {}
@@ -73,7 +80,9 @@ fn log(pamh: *mut pam_handle_t, msg: &str) {
     // mensajes fueron literales sin `%` no se notó; ahora que también se informa
     // el error del sistema —que puede traer una ruta o un texto ajeno— el
     // formato tiene que ser fijo y el mensaje un argumento.
-    unsafe { pam_syslog(pamh, LOG_AUTH, c"%s".as_ptr(), cmsg.as_ptr()); }
+    unsafe {
+        pam_syslog(pamh, LOG_AUTH, c"%s".as_ptr(), cmsg.as_ptr());
+    }
 }
 
 // ── Cleanup callback (called by PAM when data is released) ─
@@ -87,6 +96,64 @@ unsafe extern "C" fn password_cleanup(
     if !data.is_null() {
         drop(Box::from_raw(data as *mut Zeroizing<String>));
     }
+}
+
+/// Por qué no se pudo leer la contraseña del handle.
+///
+/// Cada una se informa por separado, porque se arreglan distinto. `Ausente` es
+/// el camino normal —nunca se autenticó con este módulo, o ya se entregó y la
+/// clave sigue reservada— y `Desalineado` significa que lo que había bajo la
+/// clave no lo puso este módulo. Un solo mensaje taparía las dos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FallaLectura {
+    Ausente,
+    Desalineado,
+}
+
+/// Recupera la contraseña que dejó `pam_sm_authenticate` en el handle de PAM.
+///
+/// **De dónde sale la validez del puntero**: lo produce `Box::into_raw` en este
+/// mismo archivo y lo devuelve `Box::from_raw` en `password_cleanup`, así que
+/// mientras PAM no libere el handle la reserva está viva, es del tamaño de
+/// `Zeroizing<String>` y tiene su alineación. Y se **clona**, no se mueve: eso es
+/// lo que deja a PAM como dueño y su limpieza como sigue siendo correcta
+/// después —el manual dice además que ese puntero se trata como constante—.
+/// Por eso leer dos veces seguidas da lo mismo —hay una prueba de eso— y por eso
+/// el alert de CodeQL sobre este acceso es una regla sintáctica: no puede ver la
+/// procedencia desde el mismo archivo.
+///
+/// Lo único que se puede comprobar sin conocer al productor es que el puntero no
+/// sea nulo y esté alineado, y se comprueba. No por paranoia: los módulos de una
+/// pila de PAM comparten el mismo handle, así que cualquiera de ellos podría
+/// escribir bajo esta clave y dejar un puntero de otro tipo, y desreferenciarlo
+/// sería comportamiento indefinido en un proceso que corre como root y del que
+/// depende el inicio de sesión. Con el chequeo eso es un `PAM_IGNORE` y una línea
+/// en el diario en vez de un arranque que se rompe.
+///
+/// Por eso no entra en pánico en ningún camino: devuelve. Un pánico acá se lleva
+/// puesto el inicio de sesión.
+fn leer_password(
+    ret_de_pam: c_int,
+    datos: *mut std::ffi::c_void,
+) -> Result<Zeroizing<String>, FallaLectura> {
+    // `pam_get_data` no escribe el puntero cuando no encuentra la clave, y ese
+    // es el caso normal. El que se le pasó venía en null, así que el puntero que
+    // llegue sin que PAM lo haya escrito se descarta igual —un `pam_get_data` que
+    // devolviera error con el búfer tocado sería una cosa que no depende de este
+    // módulo.
+    if ret_de_pam != PAM_SUCCESS || datos.is_null() {
+        return Err(FallaLectura::Ausente);
+    }
+
+    if datos as usize % std::mem::align_of::<Zeroizing<String>>() != 0 {
+        return Err(FallaLectura::Desalineado);
+    }
+
+    // El único punto del archivo donde se crea una referencia a la reserva que
+    // tiene PAM. `*const` y no `*mut` porque lo que se hace es leer, y el
+    // `.clone()` en vez de un `ptr::read` porque el dueño sigue siendo PAM.
+    let leida: Zeroizing<String> = unsafe { (*(datos as *const Zeroizing<String>)).clone() };
+    Ok(leida)
 }
 
 // ── Entrega de la contraseña al demonio ────────────────────
@@ -342,16 +409,31 @@ pub extern "C" fn pam_sm_authenticate(
     // Literal `c""`: no hay nada que construir ni desenvolver, y en un módulo
     // PAM un panic se lleva puesto el inicio de sesión.
     let key = c"vasak_keyring_password";
+    let crudo = Box::into_raw(stored);
     let ret = unsafe {
         pam_set_data(
             pamh,
             key.as_ptr(),
-            Box::into_raw(stored) as *mut std::ffi::c_void,
+            crudo as *mut std::ffi::c_void,
             Some(password_cleanup),
         )
     };
 
     if ret != PAM_SUCCESS {
+        // `pam_set_data` sólo toma posesión del puntero si lo guarda, y lo
+        // guarda en todos los caminos que devuelven `PAM_SUCCESS` —incluido el
+        // que reemplaza una clave que ya estaba. Los que devuelven otra cosa son
+        // de recursos: la tabla de datos del handle llena o sin memoria para
+        // crecer. Raros, pero en el proceso del gestor de inicio de sesión, y
+        // desde ahí no se sale bien.
+        //
+        // Así que el `Box` sigue siendo nuestro y hay que devolverlo: si nadie lo
+        // devuelve, la contraseña en texto plano queda en el montón **sin
+        // zeroizar** hasta que muera el proceso, que en un gestor de inicio de
+        // sesión es el final de la sesión. Se libera por el mismo camino que usa
+        // PAM, para que haya un solo lugar en el archivo que suelta esta reserva
+        // y sea el que se puede auditar.
+        unsafe { password_cleanup(pamh, crudo as *mut std::ffi::c_void, ret) };
         log(pamh, "pam_vasak_keyring: pam_set_data failed");
         return PAM_IGNORE;
     }
@@ -378,18 +460,30 @@ pub extern "C" fn pam_sm_open_session(
 
     let ret = unsafe { pam_get_data(pamh, key.as_ptr(), &mut data) };
 
-    if ret != PAM_SUCCESS || data.is_null() {
-        log(pamh, "pam_vasak_keyring: no stored password (already consumed or never set)");
-        return PAM_IGNORE;
-    }
-
-    let password: Zeroizing<String> = unsafe {
-        let bx = &*(data as *mut Zeroizing<String>);
-        bx.clone()
+    let password = match leer_password(ret, data) {
+        Ok(guardada) => guardada,
+        Err(FallaLectura::Desalineado) => {
+            log(
+                pamh,
+                "pam_vasak_keyring: lo que había bajo la clave no es una contraseña \
+                 guardada por este módulo; no se entrega",
+            );
+            return PAM_IGNORE;
+        }
+        Err(FallaLectura::Ausente) => {
+            log(
+                pamh,
+                "pam_vasak_keyring: no stored password (already consumed or never set)",
+            );
+            return PAM_IGNORE;
+        }
     };
 
     let Some(uid) = target_uid(pamh) else {
-        log(pamh, "pam_vasak_keyring: could not resolve the user of this login");
+        log(
+            pamh,
+            "pam_vasak_keyring: could not resolve the user of this login",
+        );
         return PAM_IGNORE;
     };
 
@@ -401,7 +495,10 @@ pub extern "C" fn pam_sm_open_session(
     // lleva el acceso al llavero —que ya tenía, por el Secret Service— y nada
     // más. Ver el crate `vasak-keyring-derivacion`.
     if password.is_empty() {
-        log(pamh, "pam_vasak_keyring: la contraseña guardada está vacía; no se entrega");
+        log(
+            pamh,
+            "pam_vasak_keyring: la contraseña guardada está vacía; no se entrega",
+        );
         return PAM_SUCCESS;
     }
 
@@ -433,9 +530,7 @@ pub extern "C" fn pam_sm_open_session(
         ),
         Entrega::Cortada(e) => log(
             pamh,
-            &format!(
-                "pam_vasak_keyring: se conectó al demonio pero la entrega falló ({e})"
-            ),
+            &format!("pam_vasak_keyring: se conectó al demonio pero la entrega falló ({e})"),
         ),
     }
 
@@ -655,7 +750,10 @@ mod tests_ruta {
         // contestaría ELOOP. Las dos sirven: lo que importa es que el open falle
         // en lugar de seguir el enlace.
         assert!(
-            matches!(error.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)),
+            matches!(
+                error.raw_os_error(),
+                Some(libc::ELOOP) | Some(libc::ENOTDIR)
+            ),
             "un enlace tiene que hacer fallar el open, y dio {error}"
         );
         // Y ELOOP no se reintenta: esperar no lo va a arreglar.
@@ -673,5 +771,120 @@ mod tests_ruta {
         assert_ne!(*maestra, cuenta);
         assert!(!maestra.contains("Contraseña"));
         assert_eq!(maestra.len(), 64, "hexadecimal de 32 bytes");
+    }
+}
+
+/// La reserva de la contraseña tal como la ve PAM: un `*mut c_void` y nada más.
+///
+/// Es la misma operación que hace `pam_sm_authenticate` antes de entregársela a
+/// PAM, así que la prueba usa la forma real del productor y no una imitación: si
+/// aquél cambiara el tipo, esta no compilaría.
+#[cfg(test)]
+fn guardar(secreto: &str) -> *mut std::ffi::c_void {
+    Box::into_raw(Box::new(Zeroizing::new(secreto.to_owned()))) as *mut std::ffi::c_void
+}
+
+#[cfg(test)]
+mod tests_datos {
+    use super::*;
+
+    /// Lo que el alert de `access-invalid-pointer` no puede ver y sí importa:
+    /// leer la reserva **no la gasta**. Que siga viva después de la lectura es lo
+    /// que hace que la limpieza de PAM siga siendo correcta; si alguien cambiara
+    /// el `.clone()` por un `ptr::read` o por un `Box::from_raw`, la segunda
+    /// lectura de esta prueba se leería memoria liberada —y el proceso abortaría
+    /// al liberar de nuevo— en vez de dar la contraseña otra vez.
+    #[test]
+    fn leer_no_gasta_lo_que_pam_guarda() {
+        let crudo = guardar("contraseña ñandú");
+        let en_caja = crudo as *mut Zeroizing<String>;
+
+        let primera = leer_password(PAM_SUCCESS, crudo).expect("está guardada");
+        let segunda = leer_password(PAM_SUCCESS, crudo).expect("sigue guardada");
+
+        assert_eq!(*primera, "contraseña ñandú");
+        assert_eq!(*segunda, "contraseña ñandú");
+        // Y cada lectura es una copia propia, no una segunda vista de la misma
+        // reserva: dos clones de un `String` no pueden compartir el búfer de texto.
+        assert_ne!(
+            primera.as_str().as_ptr(),
+            segunda.as_str().as_ptr(),
+            "cada lectura tiene que ser una copia"
+        );
+        assert_ne!(
+            primera.as_str().as_ptr(),
+            unsafe { (*en_caja).as_str().as_ptr() },
+            "lo leído no puede ser un alias de lo que tiene PAM"
+        );
+
+        // Recién ahora se libera, una sola vez, por el camino de siempre. Esta es
+        // la parte que, si la lectura hubiera movido el valor, abortaría el proceso.
+        unsafe { password_cleanup(std::ptr::null_mut(), crudo, PAM_SUCCESS) };
+    }
+
+    /// Sin datos guardados no hay contraseña, y eso no es un error: es lo que pasa
+    /// cuando el módulo no está en la pila de autenticación, o cuando la fase de
+    /// sesión se corre sin autenticación delante. Lo que no puede ser es un
+    /// pánico —en un módulo de PAM se lleva el inicio de sesión— ni una
+    /// desreferencia de un puntero nulo.
+    #[test]
+    fn sin_datos_guardados_no_hay_contrasena() {
+        assert_eq!(
+            leer_password(PAM_SUCCESS, std::ptr::null_mut()),
+            Err(FallaLectura::Ausente)
+        );
+        // Y que `pam_get_data` no encontrara la clave es indistinguible de un
+        // puntero que sigue en null: el que se le pasó venía en null.
+        assert_eq!(
+            leer_password(PAM_NO_MODULE_DATA, std::ptr::null_mut()),
+            Err(FallaLectura::Ausente)
+        );
+    }
+
+    /// Lo que sí puede pasar: otro módulo de la pila comparte el handle y escribe
+    /// bajo la misma clave con otro tipo. El puntero desalineado tiene que
+    /// rechazarse **sin desreferenciarse** —desreferenciarlo es comportamiento
+    /// indefinido en un proceso que corre como root— y sin entrar en pánico.
+    ///
+    /// Si el chequeo de alineación se saca, esta prueba pasa a desreferenciar un
+    /// `u64` como si fuera un `String`: o aborta, o falla la aserción. No puede
+    /// seguir pasando en verde.
+    #[test]
+    fn un_puntero_desalineado_se_rechaza_sin_desreferenciarlo() {
+        // `Box<u64>` sí está alineado, así que de ahí sale algo que por
+        // construcción no puede ser el principio de un `Zeroizing<String>`.
+        let ocho = Box::new(0u64);
+        let desalineado = (&*ocho as *const u64 as usize + 1) as *mut std::ffi::c_void;
+
+        assert_eq!(
+            leer_password(PAM_SUCCESS, desalineado),
+            Err(FallaLectura::Desalineado)
+        );
+    }
+
+    /// Lo que hace el camino de `pam_set_data` rechazado: devolver la reserva por
+    /// el mismo limpiador que usa PAM, sin dejar la contraseña en el montón.
+    ///
+    /// Lo que esta prueba **no** puede comprobar es que la reserva quede
+    /// realmente liberada: una fuga no se ve desde adentro del proceso. Lo que sí
+    /// comprueba es que el puntero que se devuelve es la reserva de verdad —el
+    /// mismo tipo, la misma dirección que la que se guardó— y que el camino de
+    /// liberación es el que corresponde. Que no quede huérfana lo garantiza que el
+    /// `Box::into_raw` de `pam_sm_authenticate` tenga su `from_raw` en el mismo
+    /// camino, y que no haya un segundo `Box::from_raw` en otro lado del archivo.
+    #[test]
+    fn la_reserva_rechazada_se_libera_por_el_mismo_camino_que_usa_pam() {
+        let crudo = guardar("contraseña ñandú");
+
+        // Lo que se entrega a PAM es legible como contraseña y como lo que es: si
+        // el limpiador recibiera otro tipo, esto no sería una `Zeroizing<String>`.
+        assert_eq!(
+            *leer_password(PAM_SUCCESS, crudo).expect("está guardada"),
+            "contraseña ñandú"
+        );
+
+        // Con el mismo `error_status` que contestaría `pam_set_data`: el limpiador
+        // no lo mira, y la idea es que se llame igual que si lo llamara PAM.
+        unsafe { password_cleanup(std::ptr::null_mut(), crudo, PAM_SUCCESS) };
     }
 }

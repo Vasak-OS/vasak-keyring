@@ -156,10 +156,72 @@ const LOCKED_MESSAGE: &str = "el llavero está bloqueado: no hay contraseña mae
      Se establece al iniciar sesión mediante pam_vasak_keyring; \
      si el demonio se reinició, hay que volver a iniciar sesión.";
 
-fn ensure_unlocked() -> Result<(), zbus::fdo::Error> {
+/// Message shown when a write is refused because the database on disk exists and
+/// this session never opened it.
+const UNDECRYPTED_MESSAGE: &str = "la base del llavero del disco existe y esta sesión no la pudo \
+     descifrar, así que no se escribió nada: lo que hay en memoria no es su contenido y guardarlo la \
+     dejaría vacía. Hay que volver a iniciar sesión, o responder en el diálogo de desbloqueo con la \
+     contraseña que la abre.";
+
+/// Por qué no se puede escribir la base todavía, si es que no se puede.
+///
+/// `None` es lo normal y lo que se quiere casi siempre. `Some(motivo)` significa
+/// que hay una base en el disco que esta sesión **no abrió**, y por eso lo que
+/// hay en memoria no es su contenido.
+///
+/// El estado es global al proceso y no una bandera por colección, a propósito: la
+/// base es un solo archivo con las entradas de **todas** las colecciones, así que
+/// un bloqueo puesto en una colección no protegería el archivo. Una colección
+/// creada después con `CreateCollection` se registraría abierta y vacía —`spawn_collection`
+/// no puede saber que la base del disco es otra cosa—, y su primer `CreateItem`
+/// guardaría la lista entera por encima de la que la persona tenía.
+///
+/// Se pone donde se descubre que la base no abre (`items_from_disk`, al sembrar
+/// una colección) y se levanta en el único lugar donde una contraseña la abre de
+/// verdad (`adopt_password`): tener una contraseña en memoria no dice que esa
+/// contraseña haya abierto nada, que es justo lo que había antes de esto.
+fn write_block() -> &'static StdMutex<Option<String>> {
+    static BLOQUEO: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
+    BLOQUEO.get_or_init(|| StdMutex::new(None))
+}
+
+/// Prohíbe escribir la base hasta que una contraseña la abra.
+fn block_writes() {
+    if let Ok(mut bloqueo) = write_block().lock() {
+        *bloqueo = Some(UNDECRYPTED_MESSAGE.to_string());
+    }
+}
+
+/// Levanta el bloqueo, desde el lugar donde una contraseña abrió la base.
+fn unblock_writes() {
+    if let Ok(mut bloqueo) = write_block().lock() {
+        *bloqueo = None;
+    }
+}
+
+/// El motivo por el que no se puede escribir ahora, o `None` si se puede.
+fn writes_blocked() -> Option<String> {
+    write_block()
+        .lock()
+        .ok()
+        .and_then(|bloqueo| bloqueo.clone())
+}
+
+/// Checked before a write mutates anything, so a rejected store leaves no
+/// half-created item behind that a later lookup would find.
+///
+/// `String` y no `zbus::fdo::Error` porque no todos los que preguntan están
+/// hablando por el bus: el backend del portal necesita el texto para el diario.
+fn ensure_unlocked() -> Result<(), String> {
+    // El bloqueo va antes que la contraseña, y no después: tener una en memoria
+    // no dice que haya abierto la base, y una que no la abre es precisamente el
+    // caso que hay que parar.
+    if let Some(motivo) = writes_blocked() {
+        return Err(motivo);
+    }
     match master_password() {
         Some(_) => Ok(()),
-        None => Err(dbus_err(LOCKED_MESSAGE)),
+        None => Err(LOCKED_MESSAGE.to_string()),
     }
 }
 
@@ -185,6 +247,22 @@ fn effectively_locked(collection_locked: bool) -> bool {
 /// password was saved and only found out at the next login that it was gone.
 fn save_db(items: &[ItemInfo]) -> Result<(), String> {
     let path = keyring_path().ok_or("no se pudo determinar la ruta del llavero (¿falta HOME?)")?;
+    write_to(&path, items)
+}
+
+/// Lo mismo, con la ruta dada.
+///
+/// La ruta entra por parámetro para que las pruebas puedan apuntarla a un
+/// directorio propio: `keyring_path` sale del entorno, que es del proceso
+/// entero, y una prueba que escribiera ahí tocaría el llavero de quien la corre.
+fn write_to(path: &std::path::Path, items: &[ItemInfo]) -> Result<(), String> {
+    // El bloqueo va **dentro** de la escritura y no repetido en cada llamador:
+    // esta función es la única que toca el archivo, así que acá queda la última
+    // palabra sobre qué se puede escribir —hoy y para lo que se agregue después—,
+    // en vez de depender de que cada camino nuevo se acuerde de preguntar.
+    if let Some(motivo) = writes_blocked() {
+        return Err(motivo);
+    }
     let pwd = master_password().ok_or(LOCKED_MESSAGE)?;
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -204,7 +282,7 @@ fn save_db(items: &[ItemInfo]) -> Result<(), String> {
     let data = crypto::encrypt_database(&db, pwd.as_str())
         .map_err(|e| format!("no se pudo cifrar el llavero: {e}"))?;
 
-    write_atomically(&path, &data)
+    write_atomically(path, &data)
         .map_err(|e| format!("no se pudo escribir {}: {e}", path.display()))
 }
 
@@ -477,7 +555,7 @@ impl ItemInterface {
     }
 
     async fn set_secret(&mut self, secret: SecretStruct) -> Result<(), zbus::fdo::Error> {
-        ensure_unlocked()?;
+        ensure_unlocked().map_err(dbus_err)?;
 
         let col_path = {
             let mut state = self.state.lock().await;
@@ -657,7 +735,7 @@ impl CollectionInterface {
         secret: SecretStruct,
         replace: bool,
     ) -> Result<(OwnedObjectPath, OwnedObjectPath), zbus::fdo::Error> {
-        ensure_unlocked()?;
+        ensure_unlocked().map_err(dbus_err)?;
 
         let label = properties
             .get("org.freedesktop.Secret.Item.Label")
@@ -805,6 +883,27 @@ impl CollectionInterface {
     }
 }
 
+/// Lo que hay que sembrar en una colección recién registrada.
+struct DiskLoad {
+    items: Vec<ItemInfo>,
+    /// Hay una base en el disco y esta sesión no la pudo descifrar.
+    ///
+    /// No es un fallo —así arranca una sesión nueva, con la contraseña todavía
+    /// sin llegar— pero sí es lo que impide guardar: lo que hay en memoria no es
+    /// el contenido de esa base, y escribirlo la dejaría vacía.
+    undecrypted: bool,
+}
+
+impl DiskLoad {
+    /// La carga de una máquina sin llavero, o la de una base que no hay.
+    fn empty() -> Self {
+        Self {
+            items: Vec::new(),
+            undecrypted: false,
+        }
+    }
+}
+
 /// Las entradas con las que se siembra una colección recién creada.
 ///
 /// Son tres las situaciones en que puede estar la base, y se distinguen a
@@ -822,12 +921,24 @@ impl CollectionInterface {
 /// Que el **descifrado** falle sí es normal y no corta nada, y es distinto de
 /// una lectura fallida: la base del disco está escrita con una contraseña y la
 /// de esta sesión todavía no llegó, así que la colección queda vacía y `aplicar`
-/// la carga cuando la contraseña llega por el módulo de PAM o por el diálogo. Lo
-/// que no se tolera es perder el archivo, y eso lo decide la lectura.
-async fn items_from_disk(db_path: &std::path::Path) -> Result<Vec<ItemInfo>, zbus::fdo::Error> {
+/// la carga cuando la contraseña llega por el módulo de PAM o por el diálogo.
+///
+/// Pero vacío no es lo mismo que «se sabe que está vacío», y esa diferencia es la
+/// que se perdía: con una lista vacía en memoria y una base llena en el disco,
+/// el primer guardado de la sesión escribía esa lista vacía por encima. Por eso
+/// el tercer caso sale marcado en `undecrypted` y no como una lista vacía
+/// cualquiera, y quien siembra lo convierte en un bloqueo de escritura.
+///
+/// `password` va por parámetro y no se lee acá adentro porque las dos
+/// situaciones —no llegó ninguna, o llegó una que no abre— tienen que poder
+/// provocarse por separado en las pruebas.
+async fn items_from_disk(
+    db_path: &std::path::Path,
+    password: Option<&str>,
+) -> Result<DiskLoad, zbus::fdo::Error> {
     let raw = match leer_base(db_path).await {
         Ok(Some(raw)) => raw,
-        Ok(None) => return Ok(Vec::new()),
+        Ok(None) => return Ok(DiskLoad::empty()),
         Err(e) => {
             return Err(dbus_err(format!(
                 "no se pudo leer la base del llavero: {e}"
@@ -837,7 +948,7 @@ async fn items_from_disk(db_path: &std::path::Path) -> Result<Vec<ItemInfo>, zbu
 
     let mut loaded: Vec<ItemInfo> = Vec::new();
 
-    let Some(pwd) = master_password() else {
+    let Some(pwd) = password else {
         // Lo normal al arrancar: la contraseña llega después, al
         // iniciar sesión. Se dice en tono informativo y no como
         // un fallo, que es como se leía en el diario de cada
@@ -846,10 +957,13 @@ async fn items_from_disk(db_path: &std::path::Path) -> Result<Vec<ItemInfo>, zbu
             "[vasak-keyring] hay una base en disco; \
              esperando la contraseña del inicio de sesión"
         );
-        return Ok(loaded);
+        return Ok(DiskLoad {
+            items: loaded,
+            undecrypted: false,
+        });
     };
 
-    match crypto::decrypt_database(&raw, pwd.as_str()) {
+    match crypto::decrypt_database(&raw, pwd) {
         Ok(db) => {
             let items = &db.items;
             for si in items {
@@ -862,13 +976,86 @@ async fn items_from_disk(db_path: &std::path::Path) -> Result<Vec<ItemInfo>, zbu
                     modified: now(),
                 });
             }
+            Ok(DiskLoad {
+                items: loaded,
+                undecrypted: false,
+            })
         }
         Err(e) => {
+            // El mensaje va al diario como hasta ahora, pero la lista vacía ya no
+            // sale de acá como si fuera la base: sale marcada, y `seed_items` la
+            // convierte en un bloqueo de escritura.
             eprintln!("[vasak-keyring] cannot decrypt keyring.db: {e}");
+            Ok(DiskLoad {
+                items: Vec::new(),
+                undecrypted: true,
+            })
         }
     }
+}
 
-    Ok(loaded)
+/// Saca las entradas a sembrar y, si la base del disco no se pudo descifrar,
+/// deja la escritura bloqueada.
+///
+/// Vive acá y no dentro de `items_from_disk` para que la decisión se pueda
+/// probar sin un bus: `spawn_collection` necesita una conexión para registrar
+/// los objetos, y lo que hay que comprobar es que una base sin descifrar frena la
+/// escritura.
+fn seed_items(carga: DiskLoad) -> Vec<ItemInfo> {
+    if carga.undecrypted {
+        block_writes();
+    }
+    carga.items
+}
+
+/// Abre la base de `path` con `password` y la adopta como contraseña maestra de
+/// la sesión.
+///
+/// Las tres respuestas significan tres cosas distintas, y por eso no se funden en
+/// un `bool`:
+///
+/// - `Ok(Some(db))`: la contraseña abre la base —o no hay base y ésa va a ser la
+///   maestra de la que se cree—. Queda en memoria, se borra el registro de
+///   intentos fallidos y **se levanta el bloqueo de escritura**, que existe
+///   justamente porque esta base todavía no se había abierto.
+/// - `Ok(None)`: la contraseña no abre la base que hay. No se adopta y cuenta como
+///   intento fallido. Es lo que el diálogo y el módulo de PAM leen como «no es
+///   la contraseña», y el bloqueo se queda puesto: esta sesión sigue sin tener el
+///   contenido del disco.
+/// - `Err`: la base ni siquiera se pudo leer. No se adopta nada.
+///
+/// Va con la ruta por parámetro y separada de `aplicar` porque lo que decide acá
+/// no necesita el bus —`aplicar` sólo usa la conexión para registrar los objetos
+/// en el— y porque es el único lugar del demonio donde una contraseña abre una
+/// base: si el bloqueo se levantara en otro, volvería a ser cierto que basta con
+/// tener cualquier contraseña en memoria para escribir por encima de la base de
+/// la persona.
+async fn adopt_password(
+    path: &std::path::Path,
+    password: &str,
+) -> Result<Option<crypto::KeyringDatabase>, String> {
+    let db = match leer_base(path).await {
+        Ok(Some(raw)) => match crypto::decrypt_database(&raw, password) {
+            Ok(db) => db,
+            Err(_) => {
+                note_failed_unlock();
+                return Ok(None);
+            }
+        },
+        // Todavía no hay archivo: máquina nueva, y la contraseña que acaba de
+        // llegar es la maestra de la base que se va a crear.
+        Ok(None) => crypto::KeyringDatabase { items: vec![] },
+        Err(e) => return Err(e.to_string()),
+    };
+
+    set_master_password(password);
+    note_successful_unlock();
+    // La base se acaba de abrir, así que lo que hay en memoria sí es su contenido
+    // y volver a guardar deja de pisarla. Incluido el caso de que no haya base:
+    // no hay nada que pisar y el primer secreto tiene que poder crearla.
+    unblock_writes();
+
+    Ok(Some(db))
 }
 
 // ── Service (root) interface ───────────────────────────────
@@ -972,10 +1159,16 @@ impl ServiceInterface {
         // Las entradas las decide `items_from_disk`, y su error sube por el `?`:
         // registrar la colección abierta y vacía porque la base no se pudo leer
         // es lo que terminaba escribiendo encima de la base de la persona.
-        let loaded: Vec<ItemInfo> = match keyring_path() {
-            Some(db_path) => items_from_disk(&db_path).await?,
-            None => Vec::new(),
+        let pwd = master_password();
+        let carga = match keyring_path() {
+            Some(db_path) => items_from_disk(&db_path, pwd.as_deref().map(String::as_str)).await?,
+            None => DiskLoad::empty(),
         };
+        // Y si la base existe pero no la abrió ninguna contraseña, la colección se
+        // registra igual —eso es lo normal, la contraseña llega al iniciar sesión—
+        // pero sembrarla deja la escritura bloqueada: sin ese paso, una lista
+        // vacía en memoria se confundía con una base vacía en el disco.
+        let loaded: Vec<ItemInfo> = seed_items(carga);
 
         let mut state = self.state.lock().await;
         let col_info = CollectionInfo {
@@ -1599,26 +1792,11 @@ impl PamUnlockInterface {
             None => return Ok(false),
         };
 
-        // Decrypt the existing DB, or start empty on a fresh system. In both
-        // cases the login password becomes the in-memory master, so the first
-        // stored secret can create/persist the database. A wrong password for
-        // an existing DB is rejected and NOT adopted.
-        let db = match leer_base(&path).await {
-            Ok(Some(raw)) => match crypto::decrypt_database(&raw, password) {
-                Ok(db) => db,
-                Err(_) => {
-                    note_failed_unlock();
-                    return Ok(false);
-                }
-            },
-            // Todavía no hay archivo: máquina nueva, y la contraseña que acaba
-            // de llegar es la maestra de la base que se va a crear.
-            Ok(None) => crypto::KeyringDatabase { items: vec![] },
-            Err(e) => return Err(dbus_err(format!("{e}"))),
+        // Toda la decisión sobre la contraseña vive en `adopt_password`: acá sólo
+        // se recarga la colección con lo que salió de ahí.
+        let Some(db) = adopt_password(&path, password).await.map_err(dbus_err)? else {
+            return Ok(false);
         };
-
-        set_master_password(password);
-        note_successful_unlock();
 
         let coll_path = "/org/freedesktop/secrets/collection/login".to_string();
         let item_paths: Vec<String>;
@@ -1777,9 +1955,11 @@ pub async fn secreto_maestro_de_app(
         // mismo secreto a todo lo que pregunte.
         return Err("la aplicación no tiene identificador".into());
     }
-    if master_password().is_none() {
-        return Err(LOCKED_MESSAGE.into());
-    }
+    // `ensure_unlocked` y no un «¿hay contraseña maestra?» propio: esta función
+    // crea una entrada y la guarda, así que es una escritura más —y va por el
+    // backend del portal, no por un alta de una aplicación—, y con la base sin
+    // descifrar escribiría una base vacía por encima de la que la persona tenía.
+    ensure_unlocked()?;
 
     let atributos: HashMap<String, String> = HashMap::from([
         ("xdg:schema".to_string(), ESQUEMA_PORTAL.to_string()),
@@ -1976,11 +2156,11 @@ mod tests {
         // nueva.
         let dir = DirDePrueba::nuevo("coleccion-sin-base");
 
-        let items = items_from_disk(&dir.ruta().join("keyring.db"))
+        let carga = items_from_disk(&dir.ruta().join("keyring.db"), None)
             .await
             .expect("una base que todavía no existe no puede impedir la colección");
 
-        assert!(items.is_empty(), "no hay nada que sembrar todavía");
+        assert!(carga.items.is_empty(), "no hay nada que sembrar todavía");
     }
 
     #[tokio::test]
@@ -1997,9 +2177,10 @@ mod tests {
             .unwrap();
         let debajo_de_un_archivo = archivo.join("keyring.db");
 
-        // Con `expect_err` haría falta `Debug` en `ItemInfo`, y eso terminaría
-        // imprimiendo el secreto de cada entrada. Un `match` dice lo mismo.
-        let error = match items_from_disk(&debajo_de_un_archivo).await {
+        // Con `expect_err` haría falta `Debug` en `DiskLoad`, y `DiskLoad` lleva
+        // las entradas: un pánico imprimiría el secreto de cada una. Un `match`
+        // dice lo mismo.
+        let error = match items_from_disk(&debajo_de_un_archivo, None).await {
             Err(e) => e,
             Ok(_) => panic!("una base que no se puede leer no puede sembrar una colección"),
         };
@@ -2023,20 +2204,232 @@ mod tests {
         // dejaría el llavero sin colección durante toda la sesión.
         let dir = DirDePrueba::nuevo("carga-sin-descifrar");
         let ruta = dir.ruta().join("keyring.db");
-        // Bytes que no son una base: da igual si hay o no contraseña maestra en
-        // memoria, el resultado tiene que ser el mismo.
+        // Bytes que no son una base: da igual qué contraseña se pruebe, la base no
+        // abre. Que la sesión tenga una o no ya no se prueba acá —eso lo decide
+        // quien llama— sino que se pasa explícitamente y así los dos casos se
+        // pueden provocar por separado.
         tokio::fs::write(&ruta, b"no soy una base cifrada")
             .await
             .unwrap();
 
-        let items = items_from_disk(&ruta)
+        let carga = items_from_disk(&ruta, Some("cualquiera"))
             .await
             .expect("no poder descifrar todavía no es un fallo");
 
         assert!(
-            items.is_empty(),
-            "sin contraseña no hay entradas, pero la colección se registra igual"
+            carga.items.is_empty(),
+            "sin abrir la base no hay entradas, pero la colección se registra igual"
         );
+    }
+
+    /// El estado del que dependen las pruebas de escritura es del proceso entero:
+    /// la contraseña maestra vive en un `OnceLock` y el bloqueo también, y las
+    /// pruebas de un mismo binario corren como hilos de un mismo proceso.
+    ///
+    /// Es lo mismo que hace falta con el contador de `unlock_attempts`, y por el
+    /// mismo motivo. El candado es el de tokio y no uno de `std` porque las
+    /// pruebas son async: uno de `std` tomado a lo largo de un `.await` bloquea
+    /// el hilo del runtime, que es justo lo que se está cuidando acá.
+    fn estado_de_la_sesion() -> &'static Mutex<()> {
+        static ESTADO: OnceLock<Mutex<()>> = OnceLock::new();
+        ESTADO.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Escribe una base de verdad, con una entrada, cifrada con `password`.
+    ///
+    /// Con `crypto::encrypt_database` y no con `write_to`, que es lo que se está
+    /// probando: hace falta una base que no haya pasado por el camino que puede
+    /// estar bloqueado.
+    async fn base_con_una_entrada(ruta: &std::path::Path, password: &str) {
+        let db = crypto::KeyringDatabase {
+            items: vec![crypto::SecretItem {
+                label: "la que estaba".into(),
+                attributes: HashMap::from([("app".to_string(), "de-prueba".to_string())]),
+                secret: b"el secreto de la persona".to_vec(),
+            }],
+        };
+        let datos = crypto::encrypt_database(&db, password).expect("no se pudo cifrar la base");
+        tokio::fs::write(ruta, datos)
+            .await
+            .expect("no se pudo escribir la base");
+    }
+
+    /// Una entrada nueva, como la que dejaría una aplicación al guardar.
+    fn entrada(secret: &[u8]) -> ItemInfo {
+        ItemInfo {
+            label: "la nueva".into(),
+            attributes: HashMap::new(),
+            secret: secret.to_vec(),
+            content_type: "text/plain".into(),
+            created: 0,
+            modified: 0,
+        }
+    }
+
+    /// Lo mismo que carga una colección: una entrada de la base, como queda en
+    /// memoria.
+    fn entrada_de_la_base(si: &crypto::SecretItem) -> ItemInfo {
+        ItemInfo {
+            label: si.label.clone(),
+            attributes: si.attributes.clone(),
+            secret: si.secret.clone(),
+            content_type: "text/plain".into(),
+            created: 0,
+            modified: 0,
+        }
+    }
+
+    /// El arranque que perdía datos: hay una base con la contraseña de la persona,
+    /// la sesión arranca con otra, y lo primero que hace la sesión es guardar.
+    ///
+    /// Antes de esto, ese arranque producía una colección vacía **y abierta**, y
+    /// el primer guardado escribía esa vacía encima de la base. La pérdida no se
+    /// veía hasta el reinicio siguiente, con el archivo ya pisado y sin forma de
+    /// saber qué se perdió.
+    #[tokio::test]
+    async fn una_contrasena_que_no_abre_la_base_no_puede_escribir_sobre_ella() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let dir = DirDePrueba::nuevo("escritura-bloqueada");
+        let ruta = dir.ruta().join("keyring.db");
+        base_con_una_entrada(&ruta, "la-buena").await;
+        let original = tokio::fs::read(&ruta)
+            .await
+            .expect("no se pudo leer la base");
+
+        // El arranque: hay base y la contraseña de la sesión no la abre.
+        let carga = items_from_disk(&ruta, Some("la-mala"))
+            .await
+            .expect("no poder descifrar todavía no es un fallo");
+        assert!(
+            carga.items.is_empty(),
+            "sin abrir la base no hay entradas en memoria"
+        );
+        assert!(
+            carga.undecrypted,
+            "esto es una base que existe y que esta sesión no abrió"
+        );
+
+        // Sembrar la colección con eso deja la escritura bloqueada.
+        let items = seed_items(carga);
+        let motivo = writes_blocked().expect("con la base sin abrir no se puede guardar");
+        assert!(
+            motivo.contains("descifrar"),
+            "el error tiene que decir por qué no se guardó: {motivo}"
+        );
+
+        // Y una modificación no llega a la base que la persona tenía.
+        let error =
+            write_to(&ruta, &items).expect_err("no se puede escribir sobre una base sin abrir");
+        assert!(
+            error.contains("no se escribió nada"),
+            "el error tiene que decir que no se escribió: {error}"
+        );
+        // El alta se rechaza antes de tocar nada en memoria: una entrada a medio
+        // crear sería encontrada después por el mismo cliente.
+        ensure_unlocked().expect_err("un alta tiene que rechazarse antes de tocar nada");
+        assert_eq!(
+            tokio::fs::read(&ruta)
+                .await
+                .expect("no se pudo leer la base"),
+            original,
+            "la base del disco tiene que seguir siendo la de la persona, byte a byte"
+        );
+
+        // La contraseña correcta abre la base, y con eso se levanta el bloqueo.
+        let db = adopt_password(&ruta, "la-buena")
+            .await
+            .expect("una base legible no puede fallar al leerla")
+            .expect("la contraseña de la persona abre su base");
+        assert_eq!(
+            db.items.len(),
+            1,
+            "la base de la persona tiene su entrada y hay que verla"
+        );
+        assert!(
+            writes_blocked().is_none(),
+            "con la base abierta se vuelve a poder guardar"
+        );
+
+        // Y ahora sí: guardar es lo de siempre, y lo que queda en el archivo es lo
+        // que hay en memoria y no una vacía.
+        let mut guardadas: Vec<ItemInfo> = db.items.iter().map(entrada_de_la_base).collect();
+        guardadas.push(entrada(b"el secreto nuevo"));
+        write_to(&ruta, &guardadas).expect("con la base abierta se guarda");
+        let guardado = crypto::decrypt_database(
+            &tokio::fs::read(&ruta)
+                .await
+                .expect("no se pudo leer la base"),
+            "la-buena",
+        )
+        .expect("lo guardado se tiene que poder abrir con la contraseña de la persona");
+        assert_eq!(
+            guardado.items.len(),
+            2,
+            "la de la persona sigue ahí y la nueva también"
+        );
+        assert_eq!(guardado.items[1].secret, b"el secreto nuevo");
+    }
+
+    /// El arranque que **no** es un fallo: todavía no hay contraseña maestra, y
+    /// la que corresponde llega al iniciar sesión.
+    ///
+    /// Es el caso que no se puede tapar con el anterior. Si se bloqueara la
+    /// escritura acá, el llavero de nadie se podría volver a abrir: la contraseña
+    /// llega después, y mientras no llegue no hay ni base descifrada ni motivo
+    /// para negarle nada a nadie.
+    #[tokio::test]
+    async fn un_arranque_sin_contrasena_deja_la_coleccion_vacia_y_no_cierra_el_llavero() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let dir = DirDePrueba::nuevo("arranque-en-frio");
+        let ruta = dir.ruta().join("keyring.db");
+        base_con_una_entrada(&ruta, "la-buena").await;
+
+        // Sin contraseña: la colección se registra igual, vacía.
+        let carga = items_from_disk(&ruta, None)
+            .await
+            .expect("esperar la contraseña no es un fallo");
+        assert!(carga.items.is_empty(), "todavía no hay nada sembrado");
+        assert!(
+            !carga.undecrypted,
+            "no se intentó abrir la base: no hay nada que lamentar ni que bloquear"
+        );
+
+        let _items = seed_items(carga);
+        assert!(
+            writes_blocked().is_none(),
+            "un arranque sin contraseña no puede bloquear el llavero de la persona"
+        );
+
+        // Y cuando la contraseña llega, abre la base y el llavero se vuelve a
+        // poder usar. Es el camino que `aplicar` toma al iniciar sesión.
+        let db = adopt_password(&ruta, "la-buena")
+            .await
+            .expect("una base legible no puede fallar al leerla")
+            .expect("la contraseña del inicio de sesión abre la base");
+        assert_eq!(
+            db.items.len(),
+            1,
+            "la entrada de la persona se cargó al desbloquear"
+        );
+
+        // Guardar vuelve a estar permitido, y lo que ya estaba no se pierde.
+        let mut guardadas: Vec<ItemInfo> = db.items.iter().map(entrada_de_la_base).collect();
+        guardadas.push(entrada(b"el secreto nuevo"));
+        write_to(&ruta, &guardadas).expect("después de desbloquear se vuelve a guardar");
+        let guardado = crypto::decrypt_database(
+            &tokio::fs::read(&ruta)
+                .await
+                .expect("no se pudo leer la base"),
+            "la-buena",
+        )
+        .expect("lo guardado se tiene que poder abrir con la contraseña de la persona");
+        assert_eq!(
+            guardado.items.len(),
+            2,
+            "la de la persona no se perdió al guardar"
+        );
+        assert_eq!(guardado.items[0].secret, b"el secreto de la persona");
+        assert_eq!(guardado.items[1].secret, b"el secreto nuevo");
     }
 
     #[test]

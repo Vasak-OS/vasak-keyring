@@ -94,27 +94,16 @@ pub fn interpretar_peticion(bytes: &[u8]) -> Result<String, &'static str> {
         .map_err(|_| "la contraseña no es UTF-8 válido")
 }
 
-/// Fija los permisos de `ruta` sin tapar un worker del runtime.
+/// Fija los permisos de `ruta`.
 ///
-/// `tokio::fs` no trae equivalente a `set_permissions`, así que no hay forma de
-/// pedirlo asíncrono: la llamada va al pool de hilos de bloqueo, que es
-/// justamente para eso. Los modos no son negociables —0700 en el directorio,
-/// 0600 en el socket—, y por eso el atajo de dejar los permisos como venían no
-/// existe: `umask` decide, y `umask` no es una garantía.
+/// `tokio::fs::set_permissions` es el mismo `chmod` de siempre, ejecutado en el
+/// pool de bloqueo del runtime sin ocupar un worker con una tarea esperando.
+///
+/// Los modos no son negociables —0700 en el directorio, 0600 en el socket—, y
+/// por eso el modo se pasa explícito y no se deja el que venga: `umask` decide
+/// sobre lo que se crea, y `umask` no es una garantía.
 async fn fijar_permisos(ruta: &std::path::Path, modo: u32) -> std::io::Result<()> {
-    let ruta = ruta.to_path_buf();
-    match tokio::task::spawn_blocking(move || {
-        std::fs::set_permissions(&ruta, PermissionsExt::from_mode(modo))
-    })
-    .await
-    {
-        Ok(resultado) => resultado,
-        // El pool de bloqueo sólo se cae si lo de adentro entra en pánico, y
-        // un `chmod` no entra. Se traduce a `io::Error` igual, para no reventar
-        // el demonio del llavero y para no perder el tipo de error de quien
-        // llama.
-        Err(pánico) => Err(std::io::Error::other(pánico)),
-    }
+    tokio::fs::set_permissions(ruta, PermissionsExt::from_mode(modo)).await
 }
 
 /// Deja el directorio del socket listo y corre el socket de un arranque anterior.
@@ -315,10 +304,9 @@ mod tests {
     #[tokio::test]
     async fn el_directorio_del_socket_queda_cerrado_a_otros() {
         // El 0700 es lo que impide que otra cuenta de la máquina liste el
-        // directorio donde vive el socket. Pasa por `spawn_blocking` porque
-        // `tokio::fs` no tiene `set_permissions`, y lo que se comprueba acá es
-        // que el modo sobreviva ese salto: nadie va a notar que sobre en
-        // papel y desaparezca en el disco.
+        // directorio donde vive el socket. Lo que se comprueba acá es que el modo
+        // llegue al disco: nadie va a notar que sobre en papel y desaparezca
+        // cuando alguien lo mira.
         let dir = DirDePrueba::nuevo("permisos");
 
         fijar_permisos(dir.ruta(), 0o700)
@@ -334,8 +322,8 @@ mod tests {
 
     #[tokio::test]
     async fn un_socket_inexistente_no_revienta_el_demonio() {
-        // El error tiene que volver como `io::Error` y no como un pánico del
-        // pool de bloqueo: quien llama decide qué hacer con él.
+        // El error tiene que volver como `io::Error` y no como un pánico: quien
+        // llama decide qué hacer con él.
         let dir = DirDePrueba::nuevo("permisos-faltantes");
         let ruta = dir.ruta().join("no-existe.sock");
 

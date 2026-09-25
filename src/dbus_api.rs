@@ -1015,21 +1015,26 @@ fn seed_items(carga: DiskLoad) -> Vec<ItemInfo> {
 /// un `bool`:
 ///
 /// - `Ok(Some(db))`: la contraseña abre la base —o no hay base y ésa va a ser la
-///   maestra de la que se cree—. Queda en memoria, se borra el registro de
-///   intentos fallidos y **se levanta el bloqueo de escritura**, que existe
-///   justamente porque esta base todavía no se había abierto.
+///   maestra de la que se cree—. Queda en memoria y se borra el registro de
+///   intentos fallidos.
 /// - `Ok(None)`: la contraseña no abre la base que hay. No se adopta y cuenta como
 ///   intento fallido. Es lo que el diálogo y el módulo de PAM leen como «no es
-///   la contraseña», y el bloqueo se queda puesto: esta sesión sigue sin tener el
-///   contenido del disco.
+///   la contraseña».
 /// - `Err`: la base ni siquiera se pudo leer. No se adopta nada.
+///
+/// **Acá no se levanta el bloqueo de escritura**, y es deliberado: en el momento
+/// en que esta función vuelve, lo que hay en memoria todavía es la lista de antes
+/// —vacía, si es el caso que hace falta cuidar—, así que dejarlo escribiendo acá
+/// abre la ventana que `reload_collection` cierra. El que sabe cuándo la lista
+/// pasó a ser el contenido del disco es el que la carga, y levanta el bloqueo
+/// ahí.
 ///
 /// Va con la ruta por parámetro y separada de `aplicar` porque lo que decide acá
 /// no necesita el bus —`aplicar` sólo usa la conexión para registrar los objetos
 /// en el— y porque es el único lugar del demonio donde una contraseña abre una
-/// base: si el bloqueo se levantara en otro, volvería a ser cierto que basta con
-/// tener cualquier contraseña en memoria para escribir por encima de la base de
-/// la persona.
+/// base: si la decisión de levantar el bloqueo viviera repartida en dos funciones,
+/// volvería a ser cierto que basta con tener cualquier contraseña en memoria para
+/// escribir por encima de la base de la persona.
 async fn adopt_password(
     path: &std::path::Path,
     password: &str,
@@ -1050,12 +1055,91 @@ async fn adopt_password(
 
     set_master_password(password);
     note_successful_unlock();
-    // La base se acaba de abrir, así que lo que hay en memoria sí es su contenido
-    // y volver a guardar deja de pisarla. Incluido el caso de que no haya base:
-    // no hay nada que pisar y el primer secreto tiene que poder crearla.
-    unblock_writes();
 
     Ok(Some(db))
+}
+
+/// Reemplaza el contenido de la colección del login por el de la base recién
+/// abierta, y levanta el bloqueo de escritura.
+///
+/// Devuelve las rutas de los items que quedaron y las que se fueron, que el
+/// llamador usa para registrar y retirar los objetos en el bus.
+///
+/// El bloqueo se levanta **adentro** del candado del estado, después de que la
+/// colección quedó cargada, y ése es el punto de todo el asunto: desde ese
+/// momento «ya se puede guardar» y «lo que hay en memoria es el contenido del
+/// disco» son la misma cosa para cualquiera que venga después. El candado del
+/// estado sirve porque es el mismo que toma cada camino que guarda —todos
+/// fotografían la lista completa de entradas y recién después escriben—, así que
+/// un `CreateItem` que ya pasó `ensure_unlocked` y está esperando este candado no
+/// puede fotografiar la lista vieja: para cuando lo tome, la lista ya es la
+/// nueva.
+///
+/// Levantarlo antes —al volver de `adopt_password`, que es donde estaba— abría una
+/// ventana entre las dos cosas, y en ella la lista en memoria seguía siendo la
+/// de antes: vacía en el caso que importa, que es una base que esta sesión no
+/// pudo descifrar. Un `CreateItem` que entrara en esa ventana pasaba
+/// `ensure_unlocked`, tomaba la foto de una lista vacía y la guardaba encima de
+/// la base de la persona. La pérdida no se veía hasta el reinicio siguiente, con
+/// el archivo ya pisado y sin forma de saber qué se perdió.
+async fn reload_collection(
+    state: &Arc<Mutex<KeyringState>>,
+    coll_path: &str,
+    db: &crypto::KeyringDatabase,
+) -> (Vec<String>, Vec<String>) {
+    let mut item_paths: Vec<String> = Vec::new();
+    let mut state = state.lock().await;
+
+    if !state.collections.contains_key(coll_path) {
+        state.collections.insert(
+            coll_path.to_string(),
+            CollectionInfo {
+                label: "Default collection".into(),
+                locked: false,
+                items: vec![],
+                created: now(),
+                modified: now(),
+            },
+        );
+    }
+
+    // Unlocking reloads the collection from disk, so whatever it held
+    // before is replaced. Item ids are never reused now, so the old
+    // paths have to be dropped explicitly or they linger on the bus as
+    // duplicates that no longer belong to any collection.
+    let stale_paths: Vec<String> = state
+        .collections
+        .get(coll_path)
+        .map(|col| col.items.clone())
+        .unwrap_or_default();
+    for ip in &stale_paths {
+        state.items.remove(ip);
+    }
+
+    for si in db.items.iter() {
+        let ip = format!("{coll_path}/items/{}", state.take_item_id());
+        let info = ItemInfo {
+            label: si.label.clone(),
+            attributes: si.attributes.clone(),
+            secret: si.secret.clone(),
+            content_type: "text/plain".into(),
+            created: now(),
+            modified: now(),
+        };
+        state.items.insert(ip.clone(), info);
+        item_paths.push(ip);
+    }
+
+    if let Some(col) = state.collections.get_mut(coll_path) {
+        col.items = item_paths.clone();
+    }
+
+    // Todo lo de arriba es invisible para quien vaya a leer la lista de entradas:
+    // el candado no se suelta hasta acá, y para entonces la lista ya es la del
+    // disco.
+    unblock_writes();
+
+    (item_paths, stale_paths)
 }
 
 // ── Service (root) interface ───────────────────────────────
@@ -1799,58 +1883,12 @@ impl PamUnlockInterface {
         };
 
         let coll_path = "/org/freedesktop/secrets/collection/login".to_string();
-        let item_paths: Vec<String>;
-        let stale_paths: Vec<String>;
 
-        {
-            let mut state = self.state.lock().await;
-
-            if !state.collections.contains_key(&coll_path) {
-                state.collections.insert(
-                    coll_path.clone(),
-                    CollectionInfo {
-                        label: "Default collection".into(),
-                        locked: false,
-                        items: vec![],
-                        created: now(),
-                        modified: now(),
-                    },
-                );
-            }
-
-            // Unlocking reloads the collection from disk, so whatever it held
-            // before is replaced. Item ids are never reused now, so the old
-            // paths have to be dropped explicitly or they linger on the bus as
-            // duplicates that no longer belong to any collection.
-            stale_paths = state
-                .collections
-                .get(&coll_path)
-                .map(|col| col.items.clone())
-                .unwrap_or_default();
-            for ip in &stale_paths {
-                state.items.remove(ip);
-            }
-
-            let mut paths = Vec::new();
-            for si in db.items.iter() {
-                let ip = format!("{coll_path}/items/{}", state.take_item_id());
-                let info = ItemInfo {
-                    label: si.label.clone(),
-                    attributes: si.attributes.clone(),
-                    secret: si.secret.clone(),
-                    content_type: "text/plain".into(),
-                    created: now(),
-                    modified: now(),
-                };
-                state.items.insert(ip.clone(), info);
-                paths.push(ip);
-            }
-
-            if let Some(col) = state.collections.get_mut(&coll_path) {
-                col.items = paths.clone();
-            }
-            item_paths = paths;
-        }
+        // La carga y el levantamiento del bloqueo van en una sola función, y en ese
+        // orden: mientras la lista de entradas en memoria no sea la del disco no se
+        // puede escribir. Sacarlos en funciones separadas fue lo que abrió la
+        // ventana; ver `reload_collection`.
+        let (item_paths, stale_paths) = reload_collection(&self.state, &coll_path, &db).await;
 
         for ip in &stale_paths {
             let _ = self
@@ -2222,6 +2260,180 @@ mod tests {
         );
     }
 
+    /// La colección del login, que es la que `aplicar` recarga.
+    const COLECCION_DEL_LOGIN: &str = "/org/freedesktop/secrets/collection/login";
+
+    /// La carrera que el bloqueo existe para cerrar, reproducida sin reloj ni
+    /// suerte: el que guarda y el que desbloquea se arman el candado del estado en
+    /// el orden que la hace perder.
+    ///
+    /// El que guarda es un `CreateItem` que ya pasó `ensure_unlocked` —o sea, ya
+    /// no lo va a volver a preguntar— y llegó al candado antes que la carga. Se
+    /// queda con él, y entonces fotografía la lista de entradas tal como está:
+    /// la de antes de la carga, que en este caso es una vacía. Con la base de la
+    /// persona en el disco, guardar esa vacía es la pérdida entera.
+    ///
+    /// Lo que evita la pérdida no es que el `CreateItem` pregunte otra vez —ya
+    /// preguntó y le dijeron que sí— sino que en el momento en que puede mirar la
+    /// lista, el bloqueo siga puesto. Por eso el bloqueo se levanta adentro del
+    /// candado del estado y no antes: mientras este lo tiene, todavía no se levantó.
+    ///
+    /// Se comprueba por partes, y en este orden:
+    ///
+    /// 1. con el candado tomado por el que guarda, el bloqueo sigue puesto;
+    /// 2. el `CreateItem` no puede persistir su foto de la lista vieja;
+    /// 3. el archivo del disco sigue siendo byte a byte el de la persona;
+    /// 4. una vez que la carga termina, el bloqueo se levanta y la lista es la del
+    ///    disco, y ahí sí se puede guardar.
+    #[tokio::test]
+    async fn un_guardado_concurrente_al_desbloqueo_no_puede_pisar_la_base() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let dir = DirDePrueba::nuevo("carrera-desbloqueo");
+        let ruta = dir.ruta().join("keyring.db");
+        base_con_una_entrada(&ruta, "la-buena").await;
+        let original = tokio::fs::read(&ruta)
+            .await
+            .expect("no se pudo leer la base");
+
+        // El arranque que bloquea: hay base, la contraseña de la sesión no la abre.
+        let carga = items_from_disk(&ruta, Some("la-mala"))
+            .await
+            .expect("no poder descifrar todavía no es un fallo");
+        assert!(carga.undecrypted);
+        seed_items(carga);
+        assert!(writes_blocked().is_some(), "arranco bloqueado");
+
+        // Llega la correcta: abre la base, pero la lista en memoria sigue vacía.
+        let db = adopt_password(&ruta, "la-buena")
+            .await
+            .expect("una base legible no puede fallar al leerla")
+            .expect("la contraseña correcta abre la base");
+
+        // El estado real de la colección en esa situación: registrada y vacía.
+        let estado = Arc::new(Mutex::new(KeyringState::new()));
+        {
+            let mut state = estado.lock().await;
+            state.collections.insert(
+                COLECCION_DEL_LOGIN.to_string(),
+                CollectionInfo {
+                    label: "Default collection".into(),
+                    locked: false,
+                    items: vec![],
+                    created: 0,
+                    modified: 0,
+                },
+            );
+        }
+
+        // El que guarda toma el candado del estado antes que la carga.
+        let candado = estado.lock().await;
+
+        // La carga arranca de verdad, en otra tarea, y se queda esperando este
+        // mismo candado. Importa que sea de verdad y no una llamada después: la
+        // ventana que hay que cerrar es la que existe **mientras** la carga corre
+        // y todavía no cargó nada, y para mirarla hace falta que esté corriendo.
+        let estado_para_cargar = estado.clone();
+        let carga = tokio::spawn(async move {
+            reload_collection(&estado_para_cargar, COLECCION_DEL_LOGIN, &db).await
+        });
+        // Un par de vueltas del runtime para que la tarea llegue hasta el candado
+        // y se quede esperando ahí, que es lo que hace en producción cuando un
+        // `CreateItem` se adelanta a la carga. Sin esto la prueba correría con la
+        // carga todavía sin empezar, que es un estado que en producción no existe:
+        // el `CreateItem` y el desbloqueo llegan juntos.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !carga.is_finished(),
+            "la carga tiene que estar corriendo y esperando el candado, no haber \\
+             terminado ya: si terminó, esto no está probando la carrera"
+        );
+
+        // 1. Mientras el candado lo tiene el que guarda, la carga no pudo terminar,
+        // y entonces el bloqueo tiene que seguir puesto.
+        assert!(
+            writes_blocked().is_some(),
+            "el bloqueo se levantó antes de que la colección quedara cargada: \\
+             entre las dos cosas hay una ventana en la que se puede guardar una \\
+             lista que no es la del disco"
+        );
+
+        // 2. El `CreateItem` fotografía lo que ve —la lista vieja— y trata de
+        // guardarlo. La contraseña está en memoria y ya pasó la comprobación, así
+        // que lo único que lo frena es el bloqueo.
+        let foto: Vec<ItemInfo> = candado.items.values().cloned().collect();
+        assert!(
+            foto.is_empty(),
+            "antes de la carga la lista en memoria es la vieja: eso es lo que \\
+             el que guarda photographía"
+        );
+        write_to(&ruta, &foto)
+            .expect_err("una lista de antes de la carga no se puede guardar encima del disco");
+
+        // 3. El archivo es el de la persona, intacto.
+        assert_eq!(
+            tokio::fs::read(&ruta)
+                .await
+                .expect("no se pudo leer la base"),
+            original,
+            "la base del disco tiene que seguir siendo la de la persona, byte a byte"
+        );
+
+        // 4. Suelto el candado: la carga entra y termina lo suyo.
+        drop(candado);
+        carga
+            .await
+            .expect("la carga no puede caerse: es la que deja el llavero servible");
+
+        assert!(
+            writes_blocked().is_none(),
+            "cargada la colección, guardar tiene que estar permitido"
+        );
+        // Lo que una aplicación ve de la colección una vez desbloqueada: la
+        // entrada de la persona, y no una colección que dice estar abierta y no
+        // tiene nada. Se mira la colección y no el mapa de entradas porque esto es
+        // lo que responde `Collection.Items` y lo que decide si un `GetSecret`
+        // encuentra algo.
+        {
+            let state = estado.lock().await;
+            let col = state
+                .collections
+                .get(COLECCION_DEL_LOGIN)
+                .expect("la colección del login tiene que existir después de desbloquear");
+            assert_eq!(
+                col.items.len(),
+                1,
+                "la colección tiene que quedar con la entrada de la persona, no vacía"
+            );
+            assert!(
+                state.items.contains_key(&col.items[0]),
+                "la entrada que la colección anuncia tiene que estar cargada"
+            );
+        }
+
+        // Y ahora sí se puede guardar, y no se pierde lo que ya estaba.
+        let mut guardadas: Vec<ItemInfo> = {
+            let state = estado.lock().await;
+            state.items.values().cloned().collect()
+        };
+        guardadas.push(entrada(b"el secreto nuevo"));
+        write_to(&ruta, &guardadas).expect("con la colección cargada se guarda");
+        let guardado = crypto::decrypt_database(
+            &tokio::fs::read(&ruta)
+                .await
+                .expect("no se pudo leer la base"),
+            "la-buena",
+        )
+        .expect("lo guardado se tiene que poder abrir con la contraseña de la persona");
+        assert_eq!(
+            guardado.items.len(),
+            2,
+            "la de la persona no se perdió al guardar"
+        );
+        assert_eq!(guardado.items[0].secret, b"el secreto de la persona");
+    }
+
     /// El estado del que dependen las pruebas de escritura es del proceso entero:
     /// la contraseña maestra vive en un `OnceLock` y el bloqueo también, y las
     /// pruebas de un mismo binario corren como hilos de un mismo proceso.
@@ -2335,7 +2547,11 @@ mod tests {
             "la base del disco tiene que seguir siendo la de la persona, byte a byte"
         );
 
-        // La contraseña correcta abre la base, y con eso se levanta el bloqueo.
+        // La contraseña correcta abre la base. Ojo con qué NO hace: abrir la base
+        // no levanta el bloqueo por sí solo, porque en este punto lo que hay en
+        // memoria sigue siendo la lista vacía de recién arriba. Si lo levantara,
+        // un `CreateItem` que entrara entre acá y la carga guardaría esa vacía
+        // encima del archivo. Eso es lo que comprueba la prueba de la carrera.
         let db = adopt_password(&ruta, "la-buena")
             .await
             .expect("una base legible no puede fallar al leerla")
@@ -2346,13 +2562,30 @@ mod tests {
             "la base de la persona tiene su entrada y hay que verla"
         );
         assert!(
-            writes_blocked().is_none(),
-            "con la base abierta se vuelve a poder guardar"
+            writes_blocked().is_some(),
+            "abrir la base no alcanza para poder guardar: la lista en memoria \\
+             todavía no es su contenido"
         );
 
-        // Y ahora sí: guardar es lo de siempre, y lo que queda en el archivo es lo
-        // que hay en memoria y no una vacía.
-        let mut guardadas: Vec<ItemInfo> = db.items.iter().map(entrada_de_la_base).collect();
+        // Ahora sí, y en el orden que corresponde: primero se carga la colección
+        // —que es lo que levanta el bloqueo— y después se puede guardar.
+        let estado = Arc::new(Mutex::new(KeyringState::new()));
+        reload_collection(&estado, COLECCION_DEL_LOGIN, &db).await;
+
+        assert!(
+            writes_blocked().is_none(),
+            "con la colección cargada se vuelve a poder guardar"
+        );
+        // Y lo que se guarda es lo que quedó cargado, no la vacía de antes.
+        let mut guardadas: Vec<ItemInfo> = {
+            let state = estado.lock().await;
+            state.items.values().cloned().collect()
+        };
+        assert_eq!(
+            guardadas.len(),
+            1,
+            "la carga tiene que haber repuesto la entrada de la persona"
+        );
         guardadas.push(entrada(b"el secreto nuevo"));
         write_to(&ruta, &guardadas).expect("con la base abierta se guarda");
         let guardado = crypto::decrypt_database(
@@ -2401,7 +2634,8 @@ mod tests {
         );
 
         // Y cuando la contraseña llega, abre la base y el llavero se vuelve a
-        // poder usar. Es el camino que `aplicar` toma al iniciar sesión.
+        // poder usar. Es el camino que `aplicar` toma al iniciar sesión: la
+        // contraseña abre la base y la carga la deja servible.
         let db = adopt_password(&ruta, "la-buena")
             .await
             .expect("una base legible no puede fallar al leerla")
@@ -2412,8 +2646,19 @@ mod tests {
             "la entrada de la persona se cargó al desbloquear"
         );
 
+        let estado = Arc::new(Mutex::new(KeyringState::new()));
+        reload_collection(&estado, COLECCION_DEL_LOGIN, &db).await;
+        assert!(
+            writes_blocked().is_none(),
+            "desbloquear tiene que dejar el llavero escribible, o no habría \\
+             desbloqueo que sirviera de nada"
+        );
+
         // Guardar vuelve a estar permitido, y lo que ya estaba no se pierde.
-        let mut guardadas: Vec<ItemInfo> = db.items.iter().map(entrada_de_la_base).collect();
+        let mut guardadas: Vec<ItemInfo> = {
+            let state = estado.lock().await;
+            state.items.values().cloned().collect()
+        };
         guardadas.push(entrada(b"el secreto nuevo"));
         write_to(&ruta, &guardadas).expect("después de desbloquear se vuelve a guardar");
         let guardado = crypto::decrypt_database(

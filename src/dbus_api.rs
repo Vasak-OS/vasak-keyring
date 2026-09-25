@@ -805,6 +805,72 @@ impl CollectionInterface {
     }
 }
 
+/// Las entradas con las que se siembra una colección recién creada.
+///
+/// Son tres las situaciones en que puede estar la base, y se distinguen a
+/// propósito porque dos de ellas se parecían y costaban datos:
+///
+/// - **Todavía no hay base**: una máquina nueva. Se sigue con una lista vacía y
+///   no es un fallo, así que un llavero nuevo se puede abrir.
+/// - **Hay base y se puede leer**: se descifra con la contraseña maestra que hay
+///   en memoria.
+/// - **Hay base y no se puede leer**: el error sube. Antes el `Err` se lo
+///   comía el `if let Ok(...)` de quien llamaba, la colección se registraba
+///   abierta y sin entradas, y el primer guardado escribía encima de la base
+///   que la persona tenía y que nadie había abierto todavía.
+///
+/// Que el **descifrado** falle sí es normal y no corta nada, y es distinto de
+/// una lectura fallida: la base del disco está escrita con una contraseña y la
+/// de esta sesión todavía no llegó, así que la colección queda vacía y `aplicar`
+/// la carga cuando la contraseña llega por el módulo de PAM o por el diálogo. Lo
+/// que no se tolera es perder el archivo, y eso lo decide la lectura.
+async fn items_from_disk(db_path: &std::path::Path) -> Result<Vec<ItemInfo>, zbus::fdo::Error> {
+    let raw = match leer_base(db_path).await {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(dbus_err(format!(
+                "no se pudo leer la base del llavero: {e}"
+            )));
+        }
+    };
+
+    let mut loaded: Vec<ItemInfo> = Vec::new();
+
+    let Some(pwd) = master_password() else {
+        // Lo normal al arrancar: la contraseña llega después, al
+        // iniciar sesión. Se dice en tono informativo y no como
+        // un fallo, que es como se leía en el diario de cada
+        // arranque mientras el problema real estaba en otra parte.
+        println!(
+            "[vasak-keyring] hay una base en disco; \
+             esperando la contraseña del inicio de sesión"
+        );
+        return Ok(loaded);
+    };
+
+    match crypto::decrypt_database(&raw, pwd.as_str()) {
+        Ok(db) => {
+            let items = &db.items;
+            for si in items {
+                loaded.push(ItemInfo {
+                    label: si.label.clone(),
+                    attributes: si.attributes.clone(),
+                    secret: si.secret.clone(),
+                    content_type: "text/plain".into(),
+                    created: now(),
+                    modified: now(),
+                });
+            }
+        }
+        Err(e) => {
+            eprintln!("[vasak-keyring] cannot decrypt keyring.db: {e}");
+        }
+    }
+
+    Ok(loaded)
+}
+
 // ── Service (root) interface ───────────────────────────────
 
 pub struct ServiceInterface {
@@ -903,40 +969,13 @@ impl ServiceInterface {
         alias: &str,
         label: &str,
     ) -> Result<(), zbus::fdo::Error> {
-        let mut loaded: Vec<ItemInfo> = Vec::new();
-        if let Some(db_path) = keyring_path() {
-            if let Ok(Some(raw)) = leer_base(&db_path).await {
-                if let Some(pwd) = master_password() {
-                    match crypto::decrypt_database(&raw, pwd.as_str()) {
-                        Ok(db) => {
-                            let items = &db.items;
-                            for si in items {
-                                loaded.push(ItemInfo {
-                                    label: si.label.clone(),
-                                    attributes: si.attributes.clone(),
-                                    secret: si.secret.clone(),
-                                    content_type: "text/plain".into(),
-                                    created: now(),
-                                    modified: now(),
-                                });
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[vasak-keyring] cannot decrypt keyring.db: {e}");
-                        }
-                    }
-                } else {
-                    // Lo normal al arrancar: la contraseña llega después, al
-                    // iniciar sesión. Se dice en tono informativo y no como
-                    // un fallo, que es como se leía en el diario de cada
-                    // arranque mientras el problema real estaba en otra parte.
-                    println!(
-                        "[vasak-keyring] hay una base en disco; \
-                         esperando la contraseña del inicio de sesión"
-                    );
-                }
-            }
-        }
+        // Las entradas las decide `items_from_disk`, y su error sube por el `?`:
+        // registrar la colección abierta y vacía porque la base no se pudo leer
+        // es lo que terminaba escribiendo encima de la base de la persona.
+        let loaded: Vec<ItemInfo> = match keyring_path() {
+            Some(db_path) => items_from_disk(&db_path).await?,
+            None => Vec::new(),
+        };
 
         let mut state = self.state.lock().await;
         let col_info = CollectionInfo {
@@ -1926,6 +1965,77 @@ mod tests {
             error.kind(),
             std::io::ErrorKind::NotFound,
             "esto no es una base inexistente: es un error de lectura"
+        );
+    }
+
+    #[tokio::test]
+    async fn una_coleccion_nueva_arranca_vacia_sin_que_falte_la_base() {
+        // El primer caso de los tres, del lado del que decide: una máquina sin
+        // base tiene que poder registrar su colección. Si esto volviera a ser un
+        // error, no se podría ni crear el primer llavero de una instalación
+        // nueva.
+        let dir = DirDePrueba::nuevo("coleccion-sin-base");
+
+        let items = items_from_disk(&dir.ruta().join("keyring.db"))
+            .await
+            .expect("una base que todavía no existe no puede impedir la colección");
+
+        assert!(items.is_empty(), "no hay nada que sembrar todavía");
+    }
+
+    #[tokio::test]
+    async fn una_base_ilegible_no_deja_una_coleccion_abierta_y_vacia() {
+        // El tercero, y el que se comía el `Err`. Si esto devolviera una lista
+        // vacía en vez de un error, `spawn_collection` registraría la colección
+        // como abierta y el primer guardado escribiría encima de la base que la
+        // persona tenía: la pérdida no se vería hasta el reinicio siguiente, con
+        // la base ya pisada.
+        let dir = DirDePrueba::nuevo("carga-ilegible");
+        let archivo = dir.ruta().join("keyring.db");
+        tokio::fs::write(&archivo, b"no se puede leer esto")
+            .await
+            .unwrap();
+        let debajo_de_un_archivo = archivo.join("keyring.db");
+
+        // Con `expect_err` haría falta `Debug` en `ItemInfo`, y eso terminaría
+        // imprimiendo el secreto de cada entrada. Un `match` dice lo mismo.
+        let error = match items_from_disk(&debajo_de_un_archivo).await {
+            Err(e) => e,
+            Ok(_) => panic!("una base que no se puede leer no puede sembrar una colección"),
+        };
+
+        // Y el error tiene que decir que fue la lectura, para que en el diario
+        // no se confunda con una contraseña que no abre.
+        assert!(
+            error
+                .to_string()
+                .contains("no se pudo leer la base del llavero"),
+            "el error tiene que nombrar la lectura: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn una_base_que_no_se_puede_descifrar_no_impide_arrancar() {
+        // El caso del medio, y deliberadamente **no** un error: la base del disco
+        // está escrita con una contraseña y la de esta sesión todavía no llegó.
+        // La colección se registra vacía y `aplicar` la carga en cuanto la
+        // contraseña llegue por PAM o por el diálogo. Tratar esto como un fallo
+        // dejaría el llavero sin colección durante toda la sesión.
+        let dir = DirDePrueba::nuevo("carga-sin-descifrar");
+        let ruta = dir.ruta().join("keyring.db");
+        // Bytes que no son una base: da igual si hay o no contraseña maestra en
+        // memoria, el resultado tiene que ser el mismo.
+        tokio::fs::write(&ruta, b"no soy una base cifrada")
+            .await
+            .unwrap();
+
+        let items = items_from_disk(&ruta)
+            .await
+            .expect("no poder descifrar todavía no es un fallo");
+
+        assert!(
+            items.is_empty(),
+            "sin contraseña no hay entradas, pero la colección se registra igual"
         );
     }
 

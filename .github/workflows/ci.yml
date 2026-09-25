@@ -19,6 +19,25 @@ jobs:
     permissions:
       contents: read
     uses: Vasak-OS/.github/.github/workflows/app.yml@main
+    with:
+      # Las pruebas de Rust se piden crate por crate y no con un `cargo test`
+      # pelado. En la raíz del workspace, ese `cargo test` sin selectores se
+      # lleva por delante **todos** los miembros, y uno de ellos es
+      # `prompt/src-tauri`, que es un diálogo de Tauri: webkit2gtk y medio
+      # escritorio por un runner Ubuntu, que es exactamente la tanda de apt de
+      # varios minutos que el flujo compartido evita a propósito. Por eso el
+      # paso pide los crates explícitos en la forma que espera `cargo test`.
+      #
+      # Los tres que van son los que no dependen de Tauri y compilan en un
+      # runner pelado, y son los que de verdad importan: este demonio es el que
+      # le entrega la contraseña del inicio de sesión a la sesión, y sus 33
+      # pruebas no corrían en ningún PR porque el paso se saltaba entero al no
+      # pasarse esta entrada. En `vasak-permissions` ya se hacía, y era el
+      # único lugar de la organización donde las pruebas de Rust se ejecutaban.
+      #
+      # `vasak-keyring-prompt` queda afuera a propósito, no por olvido: sus
+      # pruebas necesitan el mismo escritorio que el diálogo.
+      pruebas_rust: -p vasak-keyring -p vasak-keyring-derivacion -p pam-vasak-keyring
     # Sólo el token de SonarQube Cloud, y por nombre: `secrets: inherit`
     # le daría también el de crates.io y el de npm a un trabajo que
     # instala dependencias de terceros.

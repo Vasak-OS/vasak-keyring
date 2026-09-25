@@ -157,9 +157,7 @@ impl SecretBackend {
         // cualquier aplicación pasando su `app_id`: el backend no puede verificar
         // ese dato, sólo puede verificar quién lo trae.
         if !self.llama_el_portal(&cabecera).await {
-            eprintln!(
-                "vasak-keyring: se rechaza un pedido de secreto que no viene del portal"
-            );
+            eprintln!("vasak-keyring: se rechaza un pedido de secreto que no viene del portal");
             return (RESPUESTA_FALLO, HashMap::new());
         }
 
@@ -214,6 +212,8 @@ fn escribir_en_descriptor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
 
     #[test]
     fn el_nombre_del_backend_coincide_con_el_portal_instalado() {
@@ -263,15 +263,85 @@ mod tests {
         assert!(!es_el_portal(None));
     }
 
+    /// Dónde está el ejecutable del portal en esta máquina.
+    ///
+    /// La constante nombra una sola ruta, y mudarse de ruta es justo lo que esta
+    /// prueba tiene que detectar: si el ejecutable se movió, la puerta de
+    /// `es_el_portal` rechaza al portal de verdad y el backend se apaga en
+    /// silencio, sin ningún otro síntoma. Así que el portal se busca en todos los
+    /// lugares donde un paquete lo pondría, no sólo en el que dice la constante.
+    ///
+    /// Las rutas vuelven **resueltas**, sin enlaces, porque lo que se compara en
+    /// producción es `/proc/<pid>/exe`, que es el ejecutable real: un enlace en
+    /// `/usr/bin` tiene que contar como lo que apunta, y no como `/usr/bin`.
+    ///
+    /// Una lista vacía significa que en esta máquina no hay portal. No es un
+    /// fallo: es el runner del CI, que no es una máquina de VasakOS.
+    fn rutas_del_portal_instaladas() -> BTreeSet<PathBuf> {
+        const NOMBRE: &str = "xdg-desktop-portal";
+
+        let mut candidatas = vec![PathBuf::from(EJECUTABLE_DEL_PORTAL)];
+        if let Some(path) = std::env::var_os("PATH") {
+            candidatas.extend(std::env::split_paths(&path).map(|dir| dir.join(NOMBRE)));
+        }
+        // El `PATH` solo no alcanza: en Arch el ejecutable vive en `/usr/lib` sin
+        // enlace en `/usr/bin`, y una mudanza a `libexec` tampoco suele ponerse
+        // en el `PATH`. Estos son los dos directorios donde un paquete la pondría.
+        candidatas.extend(
+            [
+                "/usr/lib",
+                "/usr/libexec",
+                "/usr/local/lib",
+                "/usr/local/libexec",
+            ]
+            .into_iter()
+            .map(|dir| PathBuf::from(dir).join(NOMBRE)),
+        );
+
+        candidatas
+            .into_iter()
+            .filter(|candidata| candidata.is_file())
+            .filter_map(|candidata| candidata.canonicalize().ok())
+            .collect()
+    }
+
     /// El ejecutable que se exige tiene que ser el que la máquina realmente
-    /// tiene. Si el portal se mudara de ruta, el chequeo dejaría de aceptarlo y
-    /// la función se apagaría en silencio.
+    /// tiene.
+    ///
+    /// Antes miraba una sola cosa —que la ruta de la constante exista— y con eso
+    /// ya no miraba nada: el commit anterior la hizo saltarse cuando el portal no
+    /// estaba, porque el runner del CI no es una máquina de VasakOS, y lo que
+    /// quedó después de ese salto era exactamente la condición del salto. La
+    /// afirmación no podía fallar nunca, y con el portal mudado la prueba se
+    /// saltaba: el backend dejaba de darle secreto a nadie y la suite en verde.
+    ///
+    /// Ahora el portal se busca donde esté y se lo compara con lo que la puerta
+    /// acepta, que es lo que importa. Sin portal en la máquina se dice que se
+    /// saltó, que es el caso del runner del CI; con portal, se mira.
     #[test]
-    fn la_ruta_del_portal_existe_en_esta_maquina() {
-        let ruta = std::path::Path::new(EJECUTABLE_DEL_PORTAL);
+    fn el_portal_instalado_esta_donde_la_puerta_lo_busca() {
+        let rutas = rutas_del_portal_instaladas();
+        if rutas.is_empty() {
+            println!(
+                "se salta: en esta máquina no hay xdg-desktop-portal, \
+                 así que no hay ejecutable real contra el que comparar"
+            );
+            return;
+        }
+
+        // Que alguna coincida y no que todas: una máquina puede tener un portal
+        // propio además del del sistema, y lo que importa es que al del sistema
+        // —el único que el escritorio arranca— lo dejen entrar.
+        let aceptadas: Vec<&PathBuf> = rutas
+            .iter()
+            .filter(|ruta| es_el_portal(ruta.to_str()))
+            .collect();
+
         assert!(
-            ruta.exists(),
-            "{EJECUTABLE_DEL_PORTAL} no existe: el backend no aceptaría a nadie"
+            !aceptadas.is_empty(),
+            "la puerta sólo acepta a {EJECUTABLE_DEL_PORTAL} y el portal de esta máquina está \
+             en {rutas:?}: hay que cambiar EJECUTABLE_DEL_PORTAL, o el backend no le va a \
+             dar secreto a nadie"
         );
     }
 
@@ -284,8 +354,7 @@ mod tests {
 
         let (lector, escritor) = std::os::unix::net::UnixStream::pair().expect("par de sockets");
         let crudo = escritor.into_raw_fd();
-        let como_zvariant =
-            zbus::zvariant::OwnedFd::from(unsafe { OwnedFd::from_raw_fd(crudo) });
+        let como_zvariant = zbus::zvariant::OwnedFd::from(unsafe { OwnedFd::from_raw_fd(crudo) });
 
         let secreto = b"un secreto de prueba con acentos: \xc3\xb1";
         escribir_en_descriptor(como_zvariant, secreto).expect("escribir");

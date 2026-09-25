@@ -240,6 +240,25 @@ fn write_atomically(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> 
     result
 }
 
+/// Lee la base cifrada del disco, o devuelve `None` si todavía no hay archivo.
+///
+/// `None` es el caso normal de una máquina nueva. Cualquier otro error se
+/// propaga, y esa distinción es deliberada: una base que **existe** pero de la
+/// que no se puede leer no es una base vacía, y tratarla como si lo fuera haría
+/// que el primer guardado escribiera encima de una base que nunca se abrió.
+///
+/// Antes de esto cada llamador preguntaba primero con `Path::exists` y después
+/// leía. Son dos llamadas al sistema donde alcanza con una, la primera además
+/// es bloqueante, y entre las dos queda una carrera: un archivo que aparece o
+/// desaparece entre el `stat` y el `read` se pierde en silencio.
+async fn leer_base(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
+    match tokio::fs::read(path).await {
+        Ok(raw) => Ok(Some(raw)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 // ── shared state ──────────────────────────────────────────
 
 struct SessionInfo {
@@ -886,37 +905,35 @@ impl ServiceInterface {
     ) -> Result<(), zbus::fdo::Error> {
         let mut loaded: Vec<ItemInfo> = Vec::new();
         if let Some(db_path) = keyring_path() {
-            if db_path.exists() {
-                if let Ok(raw) = std::fs::read(&db_path) {
-                    if let Some(pwd) = master_password() {
-                        match crypto::decrypt_database(&raw, pwd.as_str()) {
-                            Ok(db) => {
-                                let items = &db.items;
-                                for si in items {
-                                    loaded.push(ItemInfo {
-                                        label: si.label.clone(),
-                                        attributes: si.attributes.clone(),
-                                        secret: si.secret.clone(),
-                                        content_type: "text/plain".into(),
-                                        created: now(),
-                                        modified: now(),
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("[vasak-keyring] cannot decrypt keyring.db: {e}");
+            if let Ok(Some(raw)) = leer_base(&db_path).await {
+                if let Some(pwd) = master_password() {
+                    match crypto::decrypt_database(&raw, pwd.as_str()) {
+                        Ok(db) => {
+                            let items = &db.items;
+                            for si in items {
+                                loaded.push(ItemInfo {
+                                    label: si.label.clone(),
+                                    attributes: si.attributes.clone(),
+                                    secret: si.secret.clone(),
+                                    content_type: "text/plain".into(),
+                                    created: now(),
+                                    modified: now(),
+                                });
                             }
                         }
-                    } else {
-                        // Lo normal al arrancar: la contraseña llega después, al
-                        // iniciar sesión. Se dice en tono informativo y no como
-                        // un fallo, que es como se leía en el diario de cada
-                        // arranque mientras el problema real estaba en otra parte.
-                        println!(
-                            "[vasak-keyring] hay una base en disco; \
-                             esperando la contraseña del inicio de sesión"
-                        );
+                        Err(e) => {
+                            eprintln!("[vasak-keyring] cannot decrypt keyring.db: {e}");
+                        }
                     }
+                } else {
+                    // Lo normal al arrancar: la contraseña llega después, al
+                    // iniciar sesión. Se dice en tono informativo y no como
+                    // un fallo, que es como se leía en el diario de cada
+                    // arranque mientras el problema real estaba en otra parte.
+                    println!(
+                        "[vasak-keyring] hay una base en disco; \
+                         esperando la contraseña del inicio de sesión"
+                    );
                 }
             }
         }
@@ -1547,17 +1564,18 @@ impl PamUnlockInterface {
         // cases the login password becomes the in-memory master, so the first
         // stored secret can create/persist the database. A wrong password for
         // an existing DB is rejected and NOT adopted.
-        let db = if path.exists() {
-            let raw = std::fs::read(&path).map_err(|e| dbus_err(format!("{e}")))?;
-            match crypto::decrypt_database(&raw, password) {
+        let db = match leer_base(&path).await {
+            Ok(Some(raw)) => match crypto::decrypt_database(&raw, password) {
                 Ok(db) => db,
                 Err(_) => {
                     note_failed_unlock();
                     return Ok(false);
                 }
-            }
-        } else {
-            crypto::KeyringDatabase { items: vec![] }
+            },
+            // Todavía no hay archivo: máquina nueva, y la contraseña que acaba
+            // de llegar es la maestra de la base que se va a crear.
+            Ok(None) => crypto::KeyringDatabase { items: vec![] },
+            Err(e) => return Err(dbus_err(format!("{e}"))),
         };
 
         set_master_password(password);
@@ -1818,6 +1836,98 @@ async fn buscar_secreto(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Un directorio propio para cada prueba, que se borra al terminar.
+    ///
+    /// No hay `tempfile` entre las dependencias y no compensa agregar una por
+    /// un directorio: el pid más un contador alcanzan, porque las pruebas de un
+    /// mismo binario corren como hilos de un mismo proceso.
+    struct DirDePrueba(PathBuf);
+
+    impl DirDePrueba {
+        fn nuevo(nombre: &str) -> Self {
+            static SIGUIENTE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SIGUIENTE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("vasak-keyring-{nombre}-{}-{n}", std::process::id()));
+            // Por si una corrida anterior murió sin llegar al `Drop`.
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("no se pudo crear el directorio de la prueba");
+            DirDePrueba(dir)
+        }
+
+        fn ruta(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    // El borrado va en `Drop` y no al final de cada prueba para que también
+    // corra cuando la prueba falla: el pánico desenrolla, y el `Drop` también.
+    impl Drop for DirDePrueba {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn una_base_inexistente_no_es_un_error() {
+        // El caso normal de una máquina recién instalada: no hay archivo y eso
+        // no es un fallo. Si esto volviera a ser un error, nadie podría
+        // desbloquear un llavero nuevo.
+        let dir = DirDePrueba::nuevo("sin-base");
+
+        let leido = leer_base(&dir.ruta().join("keyring.db"))
+            .await
+            .expect("una base que todavía no existe no puede fallar");
+
+        assert!(leido.is_none(), "todavía no hay nada que leer");
+    }
+
+    #[tokio::test]
+    async fn la_base_se_lee_entera() {
+        // Los bytes que salen tienen que ser los que están en el archivo, sin
+        // truncar ni alterar: de ahí sale el texto cifrado que después se
+        // descifra, y un cambio acá se manifiesta como «la contraseña no abre
+        // la base» con una base perfectamente buena.
+        let dir = DirDePrueba::nuevo("base");
+        let ruta = dir.ruta().join("keyring.db");
+        let crudo: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        tokio::fs::write(&ruta, &crudo).await.unwrap();
+
+        let leido = leer_base(&ruta)
+            .await
+            .expect("una base legible no puede fallar")
+            .expect("la base existe");
+
+        assert_eq!(leido, crudo);
+    }
+
+    #[tokio::test]
+    async fn una_base_ilegible_no_se_toma_por_una_base_vacia() {
+        // Un archivo que existe y del que no se puede leer no es una base
+        // nueva. Si volviera a tratarse como una vacía, el primer guardado
+        // escribiría encima de la base que la persona tenía.
+        let dir = DirDePrueba::nuevo("base-ilegible");
+        let archivo = dir.ruta().join("keyring.db");
+        tokio::fs::write(&archivo, b"no se puede leer esto")
+            .await
+            .unwrap();
+        // Un componente del camino que es un archivo: la lectura falla con
+        // ENOTDIR, que no es «no existe». Sirve para probar el caso sea cual
+        // sea el uid con el que corran las pruebas —un archivo en 0000 lo leen
+        // sin problema como root, y estas pruebas se corren en CI como root.
+        let debajo_de_un_archivo = archivo.join("keyring.db");
+
+        let error = leer_base(&debajo_de_un_archivo)
+            .await
+            .expect_err("leer debajo de un archivo tiene que fallar");
+
+        assert_ne!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "esto no es una base inexistente: es un error de lectura"
+        );
+    }
 
     #[test]
     fn the_database_hangs_off_the_data_directory() {

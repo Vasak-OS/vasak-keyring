@@ -59,8 +59,7 @@ const REPOSO_TRAS_FALLO: std::time::Duration = std::time::Duration::from_millis(
 
 /// La ruta del socket para un uid, la misma que arma el módulo de PAM.
 pub fn ruta_del_socket(uid: u32) -> std::path::PathBuf {
-    std::path::PathBuf::from(format!("/run/user/{uid}/vasak-keyring"))
-        .join("unlock.sock")
+    std::path::PathBuf::from(format!("/run/user/{uid}/vasak-keyring")).join("unlock.sock")
 }
 
 /// Quién puede entregar una contraseña por este socket.
@@ -95,6 +94,46 @@ pub fn interpretar_peticion(bytes: &[u8]) -> Result<String, &'static str> {
         .map_err(|_| "la contraseña no es UTF-8 válido")
 }
 
+/// Fija los permisos de `ruta` sin tapar un worker del runtime.
+///
+/// `tokio::fs` no trae equivalente a `set_permissions`, así que no hay forma de
+/// pedirlo asíncrono: la llamada va al pool de hilos de bloqueo, que es
+/// justamente para eso. Los modos no son negociables —0700 en el directorio,
+/// 0600 en el socket—, y por eso el atajo de dejar los permisos como venían no
+/// existe: `umask` decide, y `umask` no es una garantía.
+async fn fijar_permisos(ruta: &std::path::Path, modo: u32) -> std::io::Result<()> {
+    let ruta = ruta.to_path_buf();
+    match tokio::task::spawn_blocking(move || {
+        std::fs::set_permissions(&ruta, PermissionsExt::from_mode(modo))
+    })
+    .await
+    {
+        Ok(resultado) => resultado,
+        // El pool de bloqueo sólo se cae si lo de adentro entra en pánico, y
+        // un `chmod` no entra. Se traduce a `io::Error` igual, para no reventar
+        // el demonio del llavero y para no perder el tipo de error de quien
+        // llama.
+        Err(pánico) => Err(std::io::Error::other(pánico)),
+    }
+}
+
+/// Deja el directorio del socket listo y corre el socket de un arranque anterior.
+///
+/// Va antes del `bind` y en este orden, que es el único que sirve: el
+/// directorio tiene que existir y estar cerrado **antes** de que se cree el
+/// socket adentro, y el socket viejo tiene que estar fuera antes de que el
+/// `bind` intente tomar esa ruta. El 0600 del socket queda afuera, en
+/// `escuchar`, porque el archivo todavía no existe hasta que el `bind` lo crea.
+async fn preparar_ruta(ruta: &std::path::Path) -> std::io::Result<()> {
+    if let Some(padre) = ruta.parent() {
+        tokio::fs::create_dir_all(padre).await?;
+        fijar_permisos(padre, 0o700).await?;
+    }
+    // El socket de un demonio anterior hace fallar el bind con EADDRINUSE.
+    let _ = tokio::fs::remove_file(ruta).await;
+    Ok(())
+}
+
 /// Deja el socket escuchando y devuelve la tarea que lo atiende.
 ///
 /// Se llama **después** de reclamar el nombre de D-Bus: recién ahí se sabe que
@@ -108,16 +147,11 @@ pub async fn escuchar(
     let uid_propio = unsafe { libc::geteuid() };
     let ruta = ruta_del_socket(uid_propio);
 
-    if let Some(padre) = ruta.parent() {
-        std::fs::create_dir_all(padre)?;
-        std::fs::set_permissions(padre, PermissionsExt::from_mode(0o700))?;
-    }
-    // El socket de un demonio anterior hace fallar el bind con EADDRINUSE.
-    let _ = std::fs::remove_file(&ruta);
+    preparar_ruta(&ruta).await?;
 
     let listener = UnixListener::bind(&ruta)?;
     // 0600 después del bind, no antes: el archivo lo crea el bind.
-    std::fs::set_permissions(&ruta, PermissionsExt::from_mode(0o600))?;
+    fijar_permisos(&ruta, 0o600).await?;
 
     tokio::spawn(async move {
         loop {
@@ -238,6 +272,115 @@ async fn atender(
 mod tests {
     use super::*;
 
+    /// Un directorio propio para cada prueba, que se borra al terminar.
+    ///
+    /// No hay `tempfile` entre las dependencias y no compensa agregar una por
+    /// dos directorios: el pid más un contador alcanzan, porque las pruebas de
+    /// un mismo binario corren como hilos de un mismo proceso.
+    struct DirDePrueba(std::path::PathBuf);
+
+    impl DirDePrueba {
+        fn nuevo(nombre: &str) -> Self {
+            static SIGUIENTE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SIGUIENTE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("vasak-keyring-{nombre}-{}-{n}", std::process::id()));
+            // Por si una corrida anterior murió sin llegar al `Drop`.
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("no se pudo crear el directorio de la prueba");
+            DirDePrueba(dir)
+        }
+
+        fn ruta(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    // El borrado va en `Drop` y no al final de cada prueba para que también
+    // corra cuando la prueba falla: el pánico desenrolla, y el `Drop` también.
+    impl Drop for DirDePrueba {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn modo(ruta: &std::path::Path) -> u32 {
+        std::fs::metadata(ruta)
+            .expect("no se pudieron leer los permisos")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[tokio::test]
+    async fn el_directorio_del_socket_queda_cerrado_a_otros() {
+        // El 0700 es lo que impide que otra cuenta de la máquina liste el
+        // directorio donde vive el socket. Pasa por `spawn_blocking` porque
+        // `tokio::fs` no tiene `set_permissions`, y lo que se comprueba acá es
+        // que el modo sobreviva ese salto: nadie va a notar que sobre en
+        // papel y desaparezca en el disco.
+        let dir = DirDePrueba::nuevo("permisos");
+
+        fijar_permisos(dir.ruta(), 0o700)
+            .await
+            .expect("no se pudieron fijar permisos");
+
+        assert_eq!(
+            modo(dir.ruta()),
+            0o700,
+            "el directorio tiene que quedar en 0700"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_socket_inexistente_no_revienta_el_demonio() {
+        // El error tiene que volver como `io::Error` y no como un pánico del
+        // pool de bloqueo: quien llama decide qué hacer con él.
+        let dir = DirDePrueba::nuevo("permisos-faltantes");
+        let ruta = dir.ruta().join("no-existe.sock");
+
+        let error = fijar_permisos(&ruta, 0o600)
+            .await
+            .expect_err("fijar permisos sobre una ruta inexistente tiene que fallar");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn preparar_deja_el_directorio_cerrado_y_barre_el_socket_viejo() {
+        // El orden importa: el 0700 tiene que estar puesto antes de que se cree
+        // el socket adentro, y el socket de un demonio anterior tiene que estar
+        // fuera antes de que otro `bind` intente tomar esa ruta. Con el
+        // `bind` y el 0600 del socket adentro —que no se pueden probar sin
+        // `/run/user/<uid>`—, esto es la parte del arranque que sí se comprueba.
+        let dir = DirDePrueba::nuevo("preparar");
+        let ruta = dir.ruta().join("vasak-keyring").join("unlock.sock");
+        let padre = ruta.parent().unwrap();
+        tokio::fs::create_dir_all(padre).await.unwrap();
+        tokio::fs::write(&ruta, b"socket de un demonio anterior")
+            .await
+            .unwrap();
+        // 0777 a propósito: `preparar_ruta` tiene que dejar el directorio en
+        // 0700 aunque venga más abierto. Se usa el mismo `fijar_permisos` que
+        // usa el demonio, así que la prueba no se puede pasar mientras el
+        // código real esté roto.
+        fijar_permisos(padre, 0o777).await.unwrap();
+
+        preparar_ruta(&ruta)
+            .await
+            .expect("no se pudo preparar la ruta");
+
+        assert_eq!(
+            modo(padre),
+            0o700,
+            "el directorio padre tiene que quedar en 0700"
+        );
+        assert!(
+            !ruta.exists(),
+            "el socket del demonio anterior tiene que estar fuera antes del bind"
+        );
+    }
+
     #[test]
     fn la_ruta_se_deriva_del_uid_y_no_del_entorno() {
         assert_eq!(
@@ -251,7 +394,10 @@ mod tests {
 
     #[test]
     fn solo_root_y_el_dueno_pueden_entregar() {
-        assert!(par_autorizado(0, 1000), "root autentica el inicio de sesión");
+        assert!(
+            par_autorizado(0, 1000),
+            "root autentica el inicio de sesión"
+        );
         assert!(par_autorizado(1000, 1000), "el dueño del llavero");
         assert!(!par_autorizado(1001, 1000), "otra persona de la máquina");
         assert!(!par_autorizado(999, 1000), "una cuenta de servicio");
@@ -275,7 +421,10 @@ mod tests {
 
     #[test]
     fn una_contrasena_con_acentos_sobrevive_el_viaje() {
-        assert_eq!(interpretar_peticion("contraseña ñandú".as_bytes()).unwrap(), "contraseña ñandú");
+        assert_eq!(
+            interpretar_peticion("contraseña ñandú".as_bytes()).unwrap(),
+            "contraseña ñandú"
+        );
         assert!(interpretar_peticion(&[0xff, 0xfe]).is_err());
     }
 }

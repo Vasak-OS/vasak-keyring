@@ -24,6 +24,16 @@ const PAM_IGNORE: c_int = 25;
 const PAM_AUTHTOK: c_int = 6;
 const LOG_AUTH: c_int = 4;
 
+/// Lo que contesta `pam_set_data` cuando no hay lugar para guardar el dato, y lo
+/// que contesta `pam_get_data` cuando no hay nada bajo la clave.
+///
+/// No hacen falta en el camino de éxito, así que viven detrás de `cfg(test)` para
+/// no dejar constantes sin usar en la compilación normal.
+#[cfg(test)]
+const PAM_BUF_ERR: c_int = 5;
+#[cfg(test)]
+const PAM_NO_MODULE_DATA: c_int = 18;
+
 // ── Opaque PAM handle (only accessed through FFI) ──────────
 
 pub enum pam_handle_t {}
@@ -73,7 +83,9 @@ fn log(pamh: *mut pam_handle_t, msg: &str) {
     // mensajes fueron literales sin `%` no se notó; ahora que también se informa
     // el error del sistema —que puede traer una ruta o un texto ajeno— el
     // formato tiene que ser fijo y el mensaje un argumento.
-    unsafe { pam_syslog(pamh, LOG_AUTH, c"%s".as_ptr(), cmsg.as_ptr()); }
+    unsafe {
+        pam_syslog(pamh, LOG_AUTH, c"%s".as_ptr(), cmsg.as_ptr());
+    }
 }
 
 // ── Cleanup callback (called by PAM when data is released) ─
@@ -84,9 +96,181 @@ unsafe extern "C" fn password_cleanup(
     data: *mut std::ffi::c_void,
     _error_status: c_int,
 ) {
-    if !data.is_null() {
-        drop(Box::from_raw(data as *mut Zeroizing<String>));
+    soltar(data as *mut Zeroizing<String>);
+}
+
+/// El único lugar del archivo que libera la reserva de la contraseña.
+///
+/// Lo atraviesan las dos únicas vías por las que se puede soltar, y ninguna más:
+///
+/// - el `Drop` de `Reserva`, cuando PAM no quiso la reserva;
+/// - `password_cleanup`, que es la vía de PAM cuando sí la guardó.
+///
+/// Un `Box::from_raw` en cualquier otro punto del archivo sería una fuga si
+///ilibra de más, o una doble liberación si libera de menos, según de dónde
+/// venga. Por eso está solo y sin vecinos.
+///
+/// `unsafe` porque el puntero puede ser cualquiera: el de `password_cleanup` lo
+/// trae PAM y no hay forma de comprobar de dónde salió.
+unsafe fn soltar(crudo: *mut Zeroizing<String>) {
+    if crudo.is_null() {
+        return;
     }
+    #[cfg(test)]
+    SOLTAR_VECES.with(|veces| veces.set(veces.get() + 1));
+    drop(Box::from_raw(crudo));
+}
+
+// Cuántas veces liberó una reserva `soltar` en este hilo, sólo para las pruebas.
+//
+// No mira la memoria liberada —eso no se ve desde adentro del proceso— sino que
+// cuenta las veces que se pasó por el único camino de liberación. Es lo que las
+// pruebas necesitan afirmar: que un camino de error lo usa, y que el camino de
+// éxito deja de usarlo en el momento en que PAM pasa a ser el dueño.
+//
+// Por hilo y no global: el runner lanza una prueba por hilo y corre varias a la
+// vez, y las cuatro que pasan por acá liberarían en el mismo instante. Con un
+// contador compartido, una aserción del tipo «una más que antes» mide también lo
+// que liberaron las otras. Se comprobó: con el contador global la suite fallaba
+// una de cada cuarenta corridas.
+#[cfg(test)]
+thread_local! {
+    static SOLTAR_VECES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// La reserva de la contraseña mientras todavía es nuestra.
+///
+/// Nace en `pam_sm_authenticate` —el único lugar del archivo donde existe una
+/// contraseña en claro— y vive hasta que se la queda PAM o hasta que se cae de
+/// scope. Eso es todo lo que hace, y es la cosa que faltaba: mientras el objeto
+/// está vivo, la reserva está en su `Drop`, así que **ningún camino de error
+/// puede filtrarla sin tener que acordarse de escribir la línea que la libera**.
+///
+/// Tiene dos operaciones y ninguna más, y el orden entre las dos es lo que
+/// importa:
+///
+/// - `puntero()` **presta** el puntero crudo sin desarmar nada. Es lo que se le
+///   pasa a `pam_set_data`, que en ese momento todavía no es dueño de nada.
+/// - `transferir()` se consume y **desarma**: recién ahí PAM es el dueño, y lo
+///   que libere la reserva es su `password_cleanup`.
+///
+/// El orden correcto es ofrecer primero y transferir después, y sólo si PAM dijo
+/// que sí. Desarmar antes de ofrecer deja la fuga exactamente donde estaba: el
+/// guard ya no está, y si `pam_set_data` rechaza, nadie tiene la reserva. Por eso
+/// `puntero()` no consume y `transferir()` es una operación aparte: para que la
+/// transferencia no se pueda escribir antes de ver la respuesta.
+struct Reserva(*mut Zeroizing<String>);
+
+impl Reserva {
+    fn nuevo(contrasena: Zeroizing<String>) -> Self {
+        Reserva(Box::into_raw(Box::new(contrasena)))
+    }
+
+    /// El puntero crudo, **sin** desarmar la reserva.
+    ///
+    /// Prestar y no entregar: mientras este objeto siga vivo, la reserva se
+    /// libera sola si nadie se la queda.
+    fn puntero(&self) -> *mut std::ffi::c_void {
+        self.0 as *mut std::ffi::c_void
+    }
+
+    /// La reserva pasa a ser de PAM, que es lo que la va a liberar.
+    ///
+    /// Sin esto, el `Drop` de este objeto la liberaría y `password_cleanup` la
+    /// volvería a liberar. Por eso va **después** de que `pam_set_data` diga que
+    /// sí, y no antes.
+    fn transferir(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for Reserva {
+    fn drop(&mut self) {
+        // Único camino de liberación para el caso en que PAM no la guardó, y el
+        // mismo por el que pasa PAM cuando sí. `soltar` no entra en pánico: ni
+        // desde aquí ni desde el `Drop` de una `Zeroizing<String>`, y en el
+        // camino de login un pánico deja a la gente sin poder entrar.
+        unsafe { soltar(self.0) };
+    }
+}
+
+/// Le ofrece la reserva a PAM y la deja en manos de quien corresponde.
+///
+/// `guardar` es `pam_set_data` en producción y una imitación en las pruebas, y
+/// por eso el camino de rechazo se puede probar sin un `pam_handle_t` real. Lo
+/// único que se decide acá es la transferencia, que es justamente donde estaba
+/// la fuga: si PAM guardó, la reserva es suya; si no, se queda viva y se libera
+/// al caer `reserva` de scope.
+///
+/// La firma de `pam_set_data` —`extern` y con `pamh`— no se puede probar sin un
+/// handle de verdad, y el resto de esta función no la necesita.
+fn ofrecer_a_pam(reserva: Reserva, guardar: impl FnOnce(*mut std::ffi::c_void) -> c_int) -> c_int {
+    let ret = guardar(reserva.puntero());
+
+    if ret == PAM_SUCCESS {
+        reserva.transferir();
+    }
+
+    ret
+}
+
+/// Por qué no se pudo leer la contraseña del handle.
+///
+/// Cada una se informa por separado, porque se arreglan distinto. `Ausente` es
+/// el camino normal —nunca se autenticó con este módulo, o ya se entregó y la
+/// clave sigue reservada— y `Desalineado` significa que lo que había bajo la
+/// clave no lo puso este módulo. Un solo mensaje taparía las dos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FallaLectura {
+    Ausente,
+    Desalineado,
+}
+
+/// Recupera la contraseña que dejó `pam_sm_authenticate` en el handle de PAM.
+///
+/// **De dónde sale la validez del puntero**: lo produce `Reserva::nuevo` en este
+/// mismo archivo y lo devuelve `soltar` —por `password_cleanup` cuando PAM lo
+/// libera, y por el `Drop` de la reserva cuando PAM nunca lo guardó—, así que
+/// mientras el puntero esté vivo la reserva está viva, es del tamaño de
+/// `Zeroizing<String>` y tiene su alineación. Y se **clona**, no se mueve: eso es
+/// lo que deja a PAM como dueño y su limpieza como sigue siendo correcta
+/// después —el manual dice además que ese puntero se trata como constante—.
+/// Por eso leer dos veces seguidas da lo mismo —hay una prueba de eso— y por eso
+/// el alert de CodeQL sobre este acceso es una regla sintáctica: no puede ver la
+/// procedencia desde el mismo archivo.
+///
+/// Lo único que se puede comprobar sin conocer al productor es que el puntero no
+/// sea nulo y esté alineado, y se comprueba. No por paranoia: los módulos de una
+/// pila de PAM comparten el mismo handle, así que cualquiera de ellos podría
+/// escribir bajo esta clave y dejar un puntero de otro tipo, y desreferenciarlo
+/// sería comportamiento indefinido en un proceso que corre como root y del que
+/// depende el inicio de sesión. Con el chequeo eso es un `PAM_IGNORE` y una línea
+/// en el diario en vez de un arranque que se rompe.
+///
+/// Por eso no entra en pánico en ningún camino: devuelve. Un pánico acá se lleva
+/// puesto el inicio de sesión.
+fn leer_password(
+    ret_de_pam: c_int,
+    datos: *mut std::ffi::c_void,
+) -> Result<Zeroizing<String>, FallaLectura> {
+    // `pam_get_data` no escribe el puntero cuando no encuentra la clave, y ese
+    // es el caso normal. El que se le pasó venía en null, así que el puntero que
+    // llegue sin que PAM lo haya escrito se descarta igual —un `pam_get_data` que
+    // devolviera error con el búfer tocado sería una cosa que no depende de este
+    // módulo.
+    if ret_de_pam != PAM_SUCCESS || datos.is_null() {
+        return Err(FallaLectura::Ausente);
+    }
+
+    if !(datos as usize).is_multiple_of(std::mem::align_of::<Zeroizing<String>>()) {
+        return Err(FallaLectura::Desalineado);
+    }
+
+    // El único punto del archivo donde se crea una referencia a la reserva que
+    // tiene PAM. `*const` y no `*mut` porque lo que se hace es leer, y el
+    // `.clone()` en vez de un `ptr::read` porque el dueño sigue siendo PAM.
+    let leida: Zeroizing<String> = unsafe { (*(datos as *const Zeroizing<String>)).clone() };
+    Ok(leida)
 }
 
 // ── Entrega de la contraseña al demonio ────────────────────
@@ -337,21 +521,26 @@ pub extern "C" fn pam_sm_authenticate(
 
     let password = unsafe { CStr::from_ptr(authtok) };
     let owned = Zeroizing::new(password.to_string_lossy().into_owned());
-    let stored = Box::new(owned);
+    let reserva = Reserva::nuevo(owned);
 
     // Literal `c""`: no hay nada que construir ni desenvolver, y en un módulo
     // PAM un panic se lleva puesto el inicio de sesión.
     let key = c"vasak_keyring_password";
-    let ret = unsafe {
-        pam_set_data(
-            pamh,
-            key.as_ptr(),
-            Box::into_raw(stored) as *mut std::ffi::c_void,
-            Some(password_cleanup),
-        )
-    };
+    let ret = ofrecer_a_pam(reserva, |crudo| unsafe {
+        pam_set_data(pamh, key.as_ptr(), crudo, Some(password_cleanup))
+    });
 
     if ret != PAM_SUCCESS {
+        // Acá no hay nada que liberar, y esa es la idea: `pam_set_data` sólo toma
+        // posesión del puntero si lo guarda, y lo guarda en todos los caminos que
+        // devuelven `PAM_SUCCESS` —incluido el que reemplaza una clave que ya
+        // estaba—. Los que devuelven otra cosa son de recursos: la tabla de datos
+        // del handle llena o sin memoria para crecer. Raros, pero en el proceso
+        // del gestor de inicio de sesión, y desde ahí no se sale bien.
+        //
+        // Como `reserva` no se transfirió, sigue viva y se libera sola al salir de
+        // scope, por el mismo camino que usa PAM: la contraseña en claro no
+        // queda en el montón sin zeroizar hasta el final de la sesión.
         log(pamh, "pam_vasak_keyring: pam_set_data failed");
         return PAM_IGNORE;
     }
@@ -378,18 +567,30 @@ pub extern "C" fn pam_sm_open_session(
 
     let ret = unsafe { pam_get_data(pamh, key.as_ptr(), &mut data) };
 
-    if ret != PAM_SUCCESS || data.is_null() {
-        log(pamh, "pam_vasak_keyring: no stored password (already consumed or never set)");
-        return PAM_IGNORE;
-    }
-
-    let password: Zeroizing<String> = unsafe {
-        let bx = &*(data as *mut Zeroizing<String>);
-        bx.clone()
+    let password = match leer_password(ret, data) {
+        Ok(guardada) => guardada,
+        Err(FallaLectura::Desalineado) => {
+            log(
+                pamh,
+                "pam_vasak_keyring: lo que había bajo la clave no es una contraseña \
+                 guardada por este módulo; no se entrega",
+            );
+            return PAM_IGNORE;
+        }
+        Err(FallaLectura::Ausente) => {
+            log(
+                pamh,
+                "pam_vasak_keyring: no stored password (already consumed or never set)",
+            );
+            return PAM_IGNORE;
+        }
     };
 
     let Some(uid) = target_uid(pamh) else {
-        log(pamh, "pam_vasak_keyring: could not resolve the user of this login");
+        log(
+            pamh,
+            "pam_vasak_keyring: could not resolve the user of this login",
+        );
         return PAM_IGNORE;
     };
 
@@ -401,7 +602,10 @@ pub extern "C" fn pam_sm_open_session(
     // lleva el acceso al llavero —que ya tenía, por el Secret Service— y nada
     // más. Ver el crate `vasak-keyring-derivacion`.
     if password.is_empty() {
-        log(pamh, "pam_vasak_keyring: la contraseña guardada está vacía; no se entrega");
+        log(
+            pamh,
+            "pam_vasak_keyring: la contraseña guardada está vacía; no se entrega",
+        );
         return PAM_SUCCESS;
     }
 
@@ -433,9 +637,7 @@ pub extern "C" fn pam_sm_open_session(
         ),
         Entrega::Cortada(e) => log(
             pamh,
-            &format!(
-                "pam_vasak_keyring: se conectó al demonio pero la entrega falló ({e})"
-            ),
+            &format!("pam_vasak_keyring: se conectó al demonio pero la entrega falló ({e})"),
         ),
     }
 
@@ -655,7 +857,10 @@ mod tests_ruta {
         // contestaría ELOOP. Las dos sirven: lo que importa es que el open falle
         // en lugar de seguir el enlace.
         assert!(
-            matches!(error.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)),
+            matches!(
+                error.raw_os_error(),
+                Some(libc::ELOOP) | Some(libc::ENOTDIR)
+            ),
             "un enlace tiene que hacer fallar el open, y dio {error}"
         );
         // Y ELOOP no se reintenta: esperar no lo va a arreglar.
@@ -673,5 +878,202 @@ mod tests_ruta {
         assert_ne!(*maestra, cuenta);
         assert!(!maestra.contains("Contraseña"));
         assert_eq!(maestra.len(), 64, "hexadecimal de 32 bytes");
+    }
+}
+
+/// Cuántas veces se liberó una reserva en este hilo.
+#[cfg(test)]
+fn liberaciones() -> usize {
+    SOLTAR_VECES.with(std::cell::Cell::get)
+}
+
+/// Una reserva de la que ya es dueño PAM: el guard se desarma, como en
+/// `pam_sm_authenticate` cuando `pam_set_data` contesta que sí.
+///
+/// La prueba arma su reserva con el productor real y lo desarma por el camino real,
+/// de modo que si alguno de los dos cambiara, la prueba dejaría de compilar.
+#[cfg(test)]
+fn reservada_por_pam(contrasena: &str) -> *mut std::ffi::c_void {
+    let reserva = Reserva::nuevo(Zeroizing::new(contrasena.to_owned()));
+    let crudo = reserva.puntero();
+    reserva.transferir();
+    crudo
+}
+
+#[cfg(test)]
+mod tests_datos {
+    use super::*;
+
+    /// Lo que el alert de `access-invalid-pointer` no puede ver y sí importa:
+    /// leer la reserva **no la gasta**. Que siga viva después de la lectura es lo
+    /// que hace que la limpieza de PAM siga siendo correcta; si alguien cambiara
+    /// el `.clone()` por un `ptr::read` o por un `Box::from_raw`, la segunda
+    /// lectura de esta prueba se leería memoria liberada —y el proceso abortaría
+    /// al liberar de nuevo— en vez de dar la contraseña otra vez.
+    #[test]
+    fn leer_no_gasta_lo_que_pam_guarda() {
+        let crudo = reservada_por_pam("contraseña ñandú");
+        let en_caja = crudo as *mut Zeroizing<String>;
+
+        let primera = leer_password(PAM_SUCCESS, crudo).expect("está guardada");
+        let segunda = leer_password(PAM_SUCCESS, crudo).expect("sigue guardada");
+
+        assert_eq!(*primera, "contraseña ñandú");
+        assert_eq!(*segunda, "contraseña ñandú");
+        // Y cada lectura es una copia propia, no una segunda vista de la misma
+        // reserva: dos clones de un `String` no pueden compartir el búfer de texto.
+        assert_ne!(
+            primera.as_str().as_ptr(),
+            segunda.as_str().as_ptr(),
+            "cada lectura tiene que ser una copia"
+        );
+        assert_ne!(
+            primera.as_str().as_ptr(),
+            unsafe { (*en_caja).as_str().as_ptr() },
+            "lo leído no puede ser un alias de lo que tiene PAM"
+        );
+
+        // Recién ahora se libera, una sola vez, por el camino de siempre. Esta es
+        // la parte que, si la lectura hubiera movido el valor, abortaría el proceso.
+        unsafe { password_cleanup(std::ptr::null_mut(), crudo, PAM_SUCCESS) };
+    }
+
+    /// Sin datos guardados no hay contraseña, y eso no es un error: es lo que pasa
+    /// cuando el módulo no está en la pila de autenticación, o cuando la fase de
+    /// sesión se corre sin autenticación delante. Lo que no puede ser es un
+    /// pánico —en un módulo de PAM se lleva el inicio de sesión— ni una
+    /// desreferencia de un puntero nulo.
+    #[test]
+    fn sin_datos_guardados_no_hay_contrasena() {
+        assert_eq!(
+            leer_password(PAM_SUCCESS, std::ptr::null_mut()),
+            Err(FallaLectura::Ausente)
+        );
+        // Y que `pam_get_data` no encontrara la clave es indistinguible de un
+        // puntero que sigue en null: el que se le pasó venía en null.
+        assert_eq!(
+            leer_password(PAM_NO_MODULE_DATA, std::ptr::null_mut()),
+            Err(FallaLectura::Ausente)
+        );
+    }
+
+    /// Lo que sí puede pasar: otro módulo de la pila comparte el handle y escribe
+    /// bajo la misma clave con otro tipo. El puntero desalineado tiene que
+    /// rechazarse **sin desreferenciarse** —desreferenciarlo es comportamiento
+    /// indefinido en un proceso que corre como root— y sin entrar en pánico.
+    ///
+    /// Si el chequeo de alineación se saca, esta prueba pasa a desreferenciar un
+    /// `u64` como si fuera un `String`: o aborta, o falla la aserción. No puede
+    /// seguir pasando en verde.
+    #[test]
+    fn un_puntero_desalineado_se_rechaza_sin_desreferenciarlo() {
+        // `Box<u64>` sí está alineado, así que de ahí sale algo que por
+        // construcción no puede ser el principio de un `Zeroizing<String>`.
+        let ocho = Box::new(0u64);
+        let desalineado = (&*ocho as *const u64 as usize + 1) as *mut std::ffi::c_void;
+
+        assert_eq!(
+            leer_password(PAM_SUCCESS, desalineado),
+            Err(FallaLectura::Desalineado)
+        );
+    }
+
+    /// El camino de error no puede filtrar la reserva, y esta es la prueba que lo
+    /// dice: cuando PAM no la guarda, la reserva vuelve por el camino de
+    /// liberación.
+    ///
+    /// La imitación de `pam_set_data` es exacta en lo que importa: **no** guarda
+    /// el puntero y no va a llamar a ningún limpiador nunca, que es lo que hace el
+    /// `pam_set_data` de verdad cuando contesta `PAM_BUF_ERR`.
+    ///
+    /// Lo que se comprueba es que la cuenta de liberaciones suba. Borrrar el
+    /// `Drop` de `Reserva` —o el `soltar` que hay adentro— deja la cuenta igual y
+    /// esta prueba falla. Antes de que existiera el guard, la prueba equivalente
+    /// llamaba a `password_cleanup` a mano y pasaba en verde con la línea borrada:
+    /// comprobaba que el limpiador funciona, no que el camino de error lo use.
+    #[test]
+    fn un_pam_que_no_guarda_la_reserva_no_se_la_queda() {
+        let antes = liberaciones();
+
+        let ret = ofrecer_a_pam(
+            Reserva::nuevo(Zeroizing::new("contraseña ñandú".into())),
+            |crudo| {
+                assert!(!crudo.is_null(), "PAM recibe un puntero, no un hueco");
+                PAM_BUF_ERR
+            },
+        );
+
+        assert_ne!(
+            ret, PAM_SUCCESS,
+            "la imitación tiene que rechazar, como PAM"
+        );
+        assert_eq!(
+            liberaciones(),
+            antes + 1,
+            "la reserva tiene que liberarse sola al no quedársela a nadie"
+        );
+    }
+
+    /// Y el camino de éxito, al revés: si PAM guardó, la reserva es suya y este
+    /// módulo no la toca. Es la mitad del contrato de la transferencia, y la que
+    /// protege contra la doble liberación.
+    #[test]
+    fn un_pam_que_guarda_la_reserva_es_el_que_la_libera() {
+        let antes = liberaciones();
+        let mut de_pam = std::ptr::null_mut();
+
+        let ret = ofrecer_a_pam(
+            Reserva::nuevo(Zeroizing::new("contraseña ñandú".into())),
+            |crudo| {
+                de_pam = crudo;
+                PAM_SUCCESS
+            },
+        );
+
+        assert_eq!(ret, PAM_SUCCESS);
+        assert_eq!(
+            liberaciones(),
+            antes,
+            "si el guard también liberara, `password_cleanup` haría una segunda \
+             liberación de la misma reserva y el proceso abortaría"
+        );
+        // Que «no lo liberamos nosotros» quiera decir «sigue viva y es de PAM», y no
+        // «la perdimos por el camino».
+        assert_eq!(
+            *leer_password(PAM_SUCCESS, de_pam).expect("PAM la tiene"),
+            "contraseña ñandú"
+        );
+
+        // Ahora sí, la liberación de PAM. Una sola vez, por el mismo `soltar` que
+        // usó el camino de error: que las dos sumen al mismo contador es lo que
+        // dice que hay un solo camino de liberación en el archivo.
+        unsafe { password_cleanup(std::ptr::null_mut(), de_pam, PAM_SUCCESS) };
+        assert_eq!(
+            liberaciones(),
+            antes + 1,
+            "la liberación de PAM va por el mismo camino que la del guard"
+        );
+    }
+
+    /// Un puntero nulo no se libera: no hay nada que liberar, y desreferenciarlo
+    /// para averiguarlo sería comportamiento indefinido.
+    ///
+    /// `password_cleanup` es un callback de C: PAM lo llama con lo que había bajo
+    /// la clave, y un módulo que guardara un puntero nulo es legal para él. Esta
+    /// prueba es la que sostiene el `if crudo.is_null()` de `soltar`, que sin ella
+    /// nadie ejercita: todos los demás caminos pasan por punteros de verdad.
+    #[test]
+    fn una_reserva_nula_no_se_libera() {
+        let antes = liberaciones();
+
+        // `soltar` es `unsafe` porque el puntero puede ser cualquiera. Acá se le
+        // da a propósito el peor caso: uno que no es de nadie.
+        unsafe { soltar(std::ptr::null_mut()) };
+
+        assert_eq!(
+            liberaciones(),
+            antes,
+            "un puntero nulo no es una reserva: no hay nada que soltar"
+        );
     }
 }

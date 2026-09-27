@@ -298,29 +298,54 @@ fn writes_blocked() -> Option<String> {
         .and_then(|bloqueo| bloqueo.clone())
 }
 
+/// Por qué una escritura no puede seguir ahora, si es que no puede.
+///
+/// Los dos motivos se leen **una vez** y se devuelven tipados, y no como un
+/// texto, porque quien contesta por el bus tiene que poder ponerles nombres de
+/// error distintos a cada uno —[`escritura_bloqueada`]— y preguntar dos veces por
+/// el mismo estado es leerlo en dos momentos que pueden no ser el mismo.
+enum Escritura {
+    /// Se puede escribir.
+    Allowed,
+    /// No hay contraseña maestra en memoria: la colección está bloqueada.
+    Bloqueado,
+    /// Hay una base en el disco que esta sesión no abrió.
+    SinBaseDescifrada(String),
+}
+
+fn estado_de_escritura() -> Escritura {
+    // El bloqueo va antes que la contraseña, y no después: tener una en memoria
+    // no dice que haya abierto la base, y una que no la abre es precisamente el
+    // caso que hay que parar.
+    if let Some(motivo) = writes_blocked() {
+        return Escritura::SinBaseDescifrada(motivo);
+    }
+    match master_password() {
+        Some(_) => Escritura::Allowed,
+        None => Escritura::Bloqueado,
+    }
+}
+
 /// Checked before a write mutates anything, so a rejected store leaves no
 /// half-created item behind that a later lookup would find.
 ///
 /// `String` y no `zbus::fdo::Error` porque no todos los que preguntan están
 /// hablando por el bus: el backend del portal necesita el texto para el diario.
 fn ensure_unlocked() -> Result<(), String> {
-    // El bloqueo va antes que la contraseña, y no después: tener una en memoria
-    // no dice que haya abierto la base, y una que no la abre es precisamente el
-    // caso que hay que parar.
-    if let Some(motivo) = writes_blocked() {
-        return Err(motivo);
-    }
-    match master_password() {
-        Some(_) => Ok(()),
-        None => Err(LOCKED_MESSAGE.to_string()),
+    match estado_de_escritura() {
+        Escritura::Allowed => Ok(()),
+        Escritura::Bloqueado => Err(LOCKED_MESSAGE.to_string()),
+        Escritura::SinBaseDescifrada(motivo) => Err(motivo),
     }
 }
 
-/// El error de una escritura rechazada, para los métodos que hablan por el bus.
+/// Falla si una escritura no puede seguir ahora, con el nombre del estándar.
 ///
-/// [`ensure_unlocked`] falla por dos motivos que el cliente tiene que poder
-/// separar, y por eso el nombre se decide por **estado** —¿hay contraseña
-/// maestra?— y no por el texto del motivo:
+/// Es [`ensure_unlocked`] con el motivo tipado: el portal pide el texto y los
+/// métodos de D-Bus el nombre, y los dos leen el mismo estado una vez.
+///
+/// Los dos motivos de [`estado_de_escritura`] se separan, y por eso el nombre se
+/// decide por el **estado** y no por el texto del motivo:
 ///
 /// - Sin contraseña maestra no hay nada que leer ni que escribir: eso es
 ///   `IsLocked`, y es lo que [`ItemInterface::get_secret`] contesta cuando la
@@ -332,11 +357,11 @@ fn ensure_unlocked() -> Result<(), String> {
 ///   cliente a un camino de desbloqueo que no abre la base —no hay contraseña
 ///   que la abra en esta sesión— y por eso sigue siendo un `Failed`, con el
 ///   texto entero que dice qué hacer.
-fn escritura_bloqueada(motivo: String) -> SecretError {
-    if master_password().is_none() {
-        SecretError::IsLocked(motivo)
-    } else {
-        SecretError::Plain(dbus_err(motivo))
+fn escritura_bloqueada() -> Result<(), SecretError> {
+    match estado_de_escritura() {
+        Escritura::Allowed => Ok(()),
+        Escritura::Bloqueado => Err(SecretError::IsLocked(LOCKED_MESSAGE.to_string())),
+        Escritura::SinBaseDescifrada(motivo) => Err(SecretError::Plain(dbus_err(motivo))),
     }
 }
 
@@ -672,7 +697,7 @@ impl ItemInterface {
     }
 
     async fn set_secret(&mut self, secret: SecretStruct) -> Result<(), SecretError> {
-        ensure_unlocked().map_err(escritura_bloqueada)?;
+        escritura_bloqueada()?;
 
         let col_path = {
             let mut state = self.state.lock().await;
@@ -852,7 +877,7 @@ impl CollectionInterface {
         secret: SecretStruct,
         replace: bool,
     ) -> Result<(OwnedObjectPath, OwnedObjectPath), SecretError> {
-        ensure_unlocked().map_err(escritura_bloqueada)?;
+        escritura_bloqueada()?;
 
         let label = properties
             .get("org.freedesktop.Secret.Item.Label")
@@ -1696,15 +1721,30 @@ impl ServiceInterface {
             return Ok((Vec::new(), self.spawn_unlock_prompt(objects).await));
         }
 
-        let mut state = self.state.lock().await;
         let mut out = Vec::new();
-        for obj in &objects {
-            let s = obj.as_str().to_string();
-            if let Some(col) = state.collections.get_mut(&s) {
-                col.locked = false;
-                out.push(obj.clone());
+        // Igual que en `lock`: las colecciones que cambian de verdad, con sus
+        // ítems, se anotan adentro y se avisan con el candado suelto.
+        let mut abiertas: Vec<(String, Vec<String>)> = Vec::new();
+        {
+            let mut state = self.state.lock().await;
+            for obj in &objects {
+                let s = obj.as_str().to_string();
+                if let Some(col) = state.collections.get_mut(&s) {
+                    col.locked = false;
+                    abiertas.push((s, col.items.clone()));
+                    out.push(obj.clone());
+                }
             }
         }
+
+        // **Avisar el desbloqueo es lo mismo que avisar el bloqueo.** Si sólo se
+        // avisara uno de los dos sentidos, el cliente que oyó «se bloqueó» se
+        // quedaría creyendo que el llavero sigue bloqueado después del
+        // `Unlock`, que es el otro camino para levantarlo.
+        for (path, items) in &abiertas {
+            announce_locked_changed(&self.conn, path, items).await;
+        }
+
         Ok((out, owned_path("/")))
     }
 
@@ -3084,17 +3124,21 @@ mod tests {
         )
     }
 
-    /// Deja una contraseña maestra en memoria lo que dura la prueba.
+    /// Deja la contraseña maestra de la sesión como la quiere la prueba, y
+    /// vuelve a dejarla como estaba.
     ///
-    /// Sin ella `effectively_locked` da `true` siempre, y no se puede probar
-    /// ni que el bloqueo *cambie* algo ni que un método que no lee un secreto
-    /// siga contestando. El estado es del proceso entero, así que la prueba
-    /// toma [`estado_de_la_sesion`] y el guardián devuelve lo que había al
-    /// terminar: una prueba que deja el llavero abierto le cambia el `Locked` a
-    /// todas las que corren en paralelo.
-    struct SesionAbierta(Option<Zeroizing<String>>);
+    /// Sin esto ninguna prueba puede confiar en el estado: `master_password()` es
+    /// del proceso entero, y las pruebas de escritura de la base —que llaman a
+    /// `adopt_password`— **dejan una contraseña puesta** para la que corra
+    /// después. Una prueba que necesita «sin contraseña en memoria» y no lo
+    /// impone se entera tarde, y de la peor manera: con la contraseña puesta,
+    /// `CreateItem` no se rechaza y guarda de verdad.
+    ///
+    /// La prueba toma [`estado_de_la_sesion`] mientras dura, que es lo que
+    /// serializa esto con las otras que tocan el mismo estado.
+    struct Sesion(Option<Zeroizing<String>>);
 
-    impl Drop for SesionAbierta {
+    impl Drop for Sesion {
         fn drop(&mut self) {
             if let Ok(mut guard) = master_store().lock() {
                 *guard = self.0.take();
@@ -3102,10 +3146,26 @@ mod tests {
         }
     }
 
-    async fn sesion_abierta() -> SesionAbierta {
+    /// Sin `effectively_locked` da `true` siempre, y no se puede probar ni que el
+    /// bloqueo *cambie* algo ni que un método que no lee un secreto siga
+    /// contestando.
+    fn sesion_abierta() -> Sesion {
+        sesion(Some("la-de-la-prueba"))
+    }
+
+    /// Una sesión nueva, o una que se reinició: la contraseña todavía no llegó.
+    fn sesion_cerrada() -> Sesion {
+        sesion(None)
+    }
+
+    fn sesion(clave: Option<&str>) -> Sesion {
         let antes = master_store().lock().ok().and_then(|g| g.clone());
-        set_master_password("la-de-la-prueba");
-        SesionAbierta(antes)
+        if let Some(clave) = clave {
+            set_master_password(clave);
+        } else if let Ok(mut guard) = master_store().lock() {
+            *guard = None;
+        }
+        Sesion(antes)
     }
 
     /// Deja el bloqueo de escritura como estaba, y lo vuelve a dejar al
@@ -3139,7 +3199,7 @@ mod tests {
     #[tokio::test]
     async fn bloquear_avisa_que_cambio_locked() {
         let _sesion = estado_de_la_sesion().lock().await;
-        let _abierta = sesion_abierta().await;
+        let _abierta = sesion_abierta();
         let (demonio, cliente) = llavero().await;
 
         let mut de_la_coleccion = cambios_de(&cliente, COLECCION_DEL_LOGIN).await;
@@ -3186,6 +3246,65 @@ mod tests {
         drop(demonio);
     }
 
+    /// El otro sentido también avisa. `Service.Unlock` es el camino por el que un
+    /// cliente levanta el bloqueo de una colección, y si no dijera nada, el que
+    /// oyó «se bloqueó» se quedaría creyendo que el llavero sigue bloqueado
+    /// después del desbloqueo: el aviso de un sentido sin el del otro es peor que
+    /// no avisar.
+    ///
+    /// Sin el fix, `Unlock` levanta la bandera y sale en silencio, así que la
+    /// espera se vence.
+    #[tokio::test]
+    async fn desbloquear_tambien_avisa_que_cambio_locked() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let (demonio, cliente) = llavero().await;
+
+        let mut de_la_coleccion = cambios_de(&cliente, COLECCION_DEL_LOGIN).await;
+        let mut del_item = cambios_de(&cliente, ITEM).await;
+
+        let _ = bloquear(&cliente).await;
+        assert_eq!(
+            primer_aviso(&mut de_la_coleccion).await,
+            Some(Some(true)),
+            "el aviso del bloqueo es el que prepara la prueba"
+        );
+        let _ = primer_aviso(&mut del_item).await;
+
+        // Y ahora el desbloqueo, que también tiene que avisar.
+        let respuesta = llamar(
+            &cliente,
+            SERVICIO,
+            IFACE_SERVICIO,
+            "Unlock",
+            &(vec![OwnedObjectPath::try_from(COLECCION_DEL_LOGIN).unwrap()],),
+        )
+        .await
+        .expect("desbloquear una colección con la contraseña en memoria no puede fallar");
+        let (desbloqueadas, dialogo): (Vec<OwnedObjectPath>, OwnedObjectPath) = respuesta
+            .body()
+            .deserialize()
+            .expect("la respuesta de `Unlock` no se entiende");
+        assert_eq!(dialogo.as_str(), "/", "desbloquear no abre ningún diálogo");
+        assert_eq!(
+            desbloqueadas.len(),
+            1,
+            "la colección del login se desbloqueó"
+        );
+
+        assert_eq!(
+            primer_aviso(&mut de_la_coleccion).await,
+            Some(Some(false)),
+            "desbloquear también tiene que avisar, y a `false`: el aviso no llegó"
+        );
+        assert_eq!(
+            primer_aviso(&mut del_item).await,
+            Some(Some(false)),
+            "y en el ítem, que es donde cada aplicación mira su propio `Locked`: el aviso no llegó"
+        );
+        drop(demonio);
+    }
+
     /// Leer un secreto con el llavero bloqueado se avisa con el nombre del
     /// estándar, `org.freedesktop.Secret.Error.IsLocked`, y no con un `Failed` y
     /// un texto: es lo que le dice al cliente que tiene que desbloquear y
@@ -3196,7 +3315,7 @@ mod tests {
     #[tokio::test]
     async fn leer_un_secreto_con_el_llavero_bloqueado_responde_is_locked() {
         let _sesion = estado_de_la_sesion().lock().await;
-        let _abierta = sesion_abierta().await;
+        let _abierta = sesion_abierta();
         let (demonio, cliente) = llavero().await;
         let sesion = OwnedObjectPath::try_from(SESION).unwrap();
 
@@ -3234,6 +3353,7 @@ mod tests {
     #[tokio::test]
     async fn guardar_con_el_llavero_bloqueado_responde_is_locked() {
         let _sesion = estado_de_la_sesion().lock().await;
+        let _cerrada = sesion_cerrada();
         let (demonio, cliente) = llavero().await;
 
         let error = llamar(
@@ -3295,7 +3415,7 @@ mod tests {
 
         // Con la contraseña maestra puesta, la colección **no** está bloqueada:
         // se puede leer. Lo que no se puede es guardar.
-        let _abierta = sesion_abierta().await;
+        let _abierta = sesion_abierta();
         let (demonio, cliente) = llavero().await;
         let sesion = OwnedObjectPath::try_from(SESION).unwrap();
 

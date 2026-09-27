@@ -17,6 +17,86 @@ fn dbus_err(msg: impl Into<String>) -> zbus::fdo::Error {
     zbus::fdo::Error::Failed(msg.into())
 }
 
+/// Lo que contesta una interfaz de Secret Service, con los nombres de error que
+/// el estándar define.
+///
+/// `zbus::fdo::Error` sólo trae los de `org.freedesktop.DBus.Error`, y
+/// `org.freedesktop.Secret.Error` —del que `IsLocked` es el que más se usa— no
+/// está. No se puede agregar un nombre suelto: `zbus::Error::MethodError` es
+/// `#[non_exhaustive]` y no se arma fuera del crate de zbus. Lo que sí funciona
+/// es implementar [`zbus::DBusError`] a mano, porque el macro `#[interface]`
+/// acepta cualquier error que lo implemente, y `zbus::message::Message::error`
+/// —con el que se arma la respuesta— es público.
+///
+/// El derive `zbus::DBusError` habría servido con un solo prefijo, pero acá
+/// hacen falta dos: los nombres del estándar de Secret Service y los de D-Bus,
+/// que es lo que contesta el resto de los fallos. Por eso el nombre lo decide
+/// el **variante**, no el mensaje: es el estado del llavero el que dice que está
+/// bloqueado, nunca una palabra en el texto —que además lo escribe el servidor,
+/// en el idioma del servidor, y es exactamente lo que un cliente no debería
+/// tener que adivinar.
+#[derive(Debug)]
+enum SecretError {
+    /// La colección está bloqueada, y por eso no sale el secreto.
+    IsLocked(String),
+    /// Cualquier otro fallo, con el nombre que ya le daba `zbus::fdo::Error`.
+    Plain(zbus::fdo::Error),
+}
+
+impl From<zbus::fdo::Error> for SecretError {
+    fn from(e: zbus::fdo::Error) -> Self {
+        Self::Plain(e)
+    }
+}
+
+impl From<zbus::Error> for SecretError {
+    fn from(e: zbus::Error) -> Self {
+        Self::Plain(zbus::fdo::Error::ZBus(e))
+    }
+}
+
+impl std::fmt::Display for SecretError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IsLocked(d) => write!(f, "{d}"),
+            Self::Plain(e) => write!(f, "{}", zbus::DBusError::description(e).unwrap_or_default()),
+        }
+    }
+}
+
+impl std::error::Error for SecretError {}
+
+impl zbus::DBusError for SecretError {
+    fn name(&self) -> zbus::names::ErrorName<'_> {
+        match self {
+            Self::IsLocked(_) => zbus::names::ErrorName::from_static_str_unchecked(
+                "org.freedesktop.Secret.Error.IsLocked",
+            ),
+            Self::Plain(e) => zbus::DBusError::name(e),
+        }
+    }
+
+    fn description(&self) -> Option<&str> {
+        match self {
+            Self::IsLocked(d) => Some(d),
+            Self::Plain(e) => zbus::DBusError::description(e),
+        }
+    }
+
+    fn create_reply(
+        &self,
+        call: &zbus::message::Header<'_>,
+    ) -> zbus::Result<zbus::message::Message> {
+        let name = self.name();
+        // El cuerpo de un error de D-Bus es un texto, y va o no va: el nombre es
+        // lo que el cliente mira, y el texto es para quien lee el diario.
+        match self.description() {
+            Some(d) => zbus::message::Message::error(call, name)?.build(&d),
+            None => zbus::message::Message::error(call, name)?.build(&()),
+        }
+    }
+}
+
 /// Ruta de objeto de D-Bus, cayendo a la raíz si no es válida.
 ///
 /// Todos los llamadores actuales pasan `"/"` o una ruta armada acá, así que el
@@ -163,6 +243,17 @@ const UNDECRYPTED_MESSAGE: &str = "la base del llavero del disco existe y esta s
      dejaría vacía. Hay que volver a iniciar sesión, o responder en el diálogo de desbloqueo con la \
      contraseña que la abre.";
 
+/// Message shown when a secret cannot be read because its collection is locked.
+///
+/// Uno solo para los dos casos que `effectively_locked` junta —el bloqueo
+/// por colección de `Service.Lock` y la falta de contraseña maestra—, porque
+/// quien lo lee no puede distinguirlos desde afuera: los dos son «desbloqueá y
+/// preguntá de nuevo», y el texto de la contraseña maestra [`LOCKED_MESSAGE`] ya
+/// se lleva el que corresponde cuando el motivo se conoce, que es en los caminos
+/// de escritura ([`escritura_bloqueada`]).
+const COLLECTION_LOCKED_MESSAGE: &str = "la colección está bloqueada: hay que desbloquear el \
+     llavero para leer sus secretos.";
+
 /// Por qué no se puede escribir la base todavía, si es que no se puede.
 ///
 /// `None` es lo normal y lo que se quiere casi siempre. `Some(motivo)` significa
@@ -222,6 +313,30 @@ fn ensure_unlocked() -> Result<(), String> {
     match master_password() {
         Some(_) => Ok(()),
         None => Err(LOCKED_MESSAGE.to_string()),
+    }
+}
+
+/// El error de una escritura rechazada, para los métodos que hablan por el bus.
+///
+/// [`ensure_unlocked`] falla por dos motivos que el cliente tiene que poder
+/// separar, y por eso el nombre se decide por **estado** —¿hay contraseña
+/// maestra?— y no por el texto del motivo:
+///
+/// - Sin contraseña maestra no hay nada que leer ni que escribir: eso es
+///   `IsLocked`, y es lo que [`ItemInterface::get_secret`] contesta cuando la
+///   colección está bloqueada. Es el mismo nombre porque es la misma situación
+///   desde el punto de vista del cliente.
+/// - «La base del disco existe y esta sesión no la abrió» **no** es un bloqueo
+///   de la colección: la colección puede estar abierta y consultable, lo que no
+///   se puede es escribir un archivo que ya tiene. `IsLocked` ahí mandaría al
+///   cliente a un camino de desbloqueo que no abre la base —no hay contraseña
+///   que la abra en esta sesión— y por eso sigue siendo un `Failed`, con el
+///   texto entero que dice qué hacer.
+fn escritura_bloqueada(motivo: String) -> SecretError {
+    if master_password().is_none() {
+        SecretError::IsLocked(motivo)
+    } else {
+        SecretError::Plain(dbus_err(motivo))
     }
 }
 
@@ -522,10 +637,12 @@ impl ItemInterface {
     /// made zbus flatten it into four separate out-arguments (`oayays`), and
     /// libsecret rejected every reply as a signature mismatch against the
     /// `((oayays))` the spec declares.
-    async fn get_secret(
-        &self,
-        session: OwnedObjectPath,
-    ) -> Result<(SecretStruct,), zbus::fdo::Error> {
+    ///
+    /// La colección bloqueada se avisa con el nombre del estándar
+    /// ([`SecretError::IsLocked`]) y no con `Failed` y un texto: es lo que le
+    /// dice a un cliente que tiene que **desbloquear** y reintentar, en vez de
+    /// quedarse adivinando por el mensaje.
+    async fn get_secret(&self, session: OwnedObjectPath) -> Result<(SecretStruct,), SecretError> {
         let state = self.state.lock().await;
         // Never release a secret from a locked collection.
         if state
@@ -533,7 +650,7 @@ impl ItemInterface {
             .values()
             .any(|c| effectively_locked(c.locked) && c.items.contains(&self.path))
         {
-            return Err(dbus_err("collection is locked"));
+            return Err(SecretError::IsLocked(COLLECTION_LOCKED_MESSAGE.into()));
         }
         let item = state
             .items
@@ -554,8 +671,8 @@ impl ItemInterface {
         },))
     }
 
-    async fn set_secret(&mut self, secret: SecretStruct) -> Result<(), zbus::fdo::Error> {
-        ensure_unlocked().map_err(dbus_err)?;
+    async fn set_secret(&mut self, secret: SecretStruct) -> Result<(), SecretError> {
+        ensure_unlocked().map_err(escritura_bloqueada)?;
 
         let col_path = {
             let mut state = self.state.lock().await;
@@ -572,7 +689,7 @@ impl ItemInterface {
                     item.content_type = secret.content_type;
                     item.modified = now();
                 }
-                None => return Err(dbus_err("item not found")),
+                None => return Err(dbus_err("item not found").into()),
             }
             state
                 .collections
@@ -734,8 +851,8 @@ impl CollectionInterface {
         properties: HashMap<String, Value<'_>>,
         secret: SecretStruct,
         replace: bool,
-    ) -> Result<(OwnedObjectPath, OwnedObjectPath), zbus::fdo::Error> {
-        ensure_unlocked().map_err(dbus_err)?;
+    ) -> Result<(OwnedObjectPath, OwnedObjectPath), SecretError> {
+        ensure_unlocked().map_err(escritura_bloqueada)?;
 
         let label = properties
             .get("org.freedesktop.Secret.Item.Label")
@@ -880,6 +997,50 @@ impl CollectionInterface {
             state.items.values().cloned().collect()
         };
         save_db(&items).map_err(dbus_err)
+    }
+}
+
+// ── El aviso de que `Locked` cambió ────────────────────────
+
+/// Emite `PropertiesChanged` de `Locked` para una colección y para los ítems que
+/// tiene, con el valor **actual** de la propiedad.
+///
+/// No es específico de un sentido: bloquear y desbloquear se avisan igual, y por
+/// eso el nombre no dice ninguno de los dos. Lo que se emite es la propiedad
+/// releída del estado, así que un cliente que recibe el aviso tiene que volver
+/// a leerla —que es lo que hacen todos— en vez de interpretar el aviso.
+///
+/// Vive afuera del `#[interface]` a propósito: es un helper interno, no algo
+/// para exponer en el bus. Los fallos se ignoran porque el llavero ya quedó
+/// como tenía que quedar cuando esto se llama, y un cliente que pierde la señal
+/// igual lee bien la propiedad después; lo que no puede es decidir si usar el
+/// llavero a ciegas.
+///
+/// **El candado del estado tiene que estar soltado cuando se llama.** Tanto
+/// `object_server().interface()` como el envío son `await` sobre el bus, que
+/// puede tardar lo que quiera, y `KeyringState` está detrás de un
+/// `tokio::Mutex` del que dependen todas las propiedades y todos los métodos
+/// del demonio: emitir con el candado tomado puede dejarlo entero sin
+/// contestar.
+async fn announce_locked_changed(conn: &Connection, coll_path: &str, item_paths: &[String]) {
+    let server = conn.object_server();
+
+    if let Ok(iface) = server.interface::<_, CollectionInterface>(coll_path).await {
+        let _ = iface
+            .get()
+            .await
+            .locked_changed(iface.signal_emitter())
+            .await;
+    }
+
+    for ip in item_paths {
+        if let Ok(iface) = server.interface::<_, ItemInterface>(ip.as_str()).await {
+            let _ = iface
+                .get()
+                .await
+                .locked_changed(iface.signal_emitter())
+                .await;
+        }
     }
 }
 
@@ -1551,18 +1712,47 @@ impl ServiceInterface {
         &mut self,
         objects: Vec<OwnedObjectPath>,
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath), zbus::fdo::Error> {
-        let mut state = self.state.lock().await;
         let mut out = Vec::new();
-        for obj in &objects {
-            let s = obj.as_str().to_string();
-            if let Some(col) = state.collections.get_mut(&s) {
-                col.locked = true;
-                out.push(obj.clone());
+        // La colección que quedó bloqueada, con los ítems que tiene, para
+        // avisar abajo. Se anotan **dentro** del recorrido porque es el único
+        // lugar donde se sabe cuáles eran.
+        let mut bloqueadas: Vec<(String, Vec<String>)> = Vec::new();
+        {
+            let mut state = self.state.lock().await;
+            for obj in &objects {
+                let s = obj.as_str().to_string();
+                if let Some(col) = state.collections.get_mut(&s) {
+                    col.locked = true;
+                    bloqueadas.push((s, col.items.clone()));
+                    out.push(obj.clone());
+                }
             }
         }
+
+        // El candado del estado ya está soltado, y por algo: emitir con el
+        // tomado puede dejar al demonio entero sin contestar, y `Locked` acaba
+        // de cambiar. Es el mismo cuidado que en el camino del desbloqueo, que
+        // registra los objetos y avisa con el candado suelto.
+        for (path, items) in &bloqueadas {
+            announce_locked_changed(&self.conn, path, items).await;
+        }
+
         Ok((out, owned_path("/")))
     }
 
+    /// Los secretos de varios ítems, de una vez.
+    ///
+    /// **Acá no va `IsLocked`, y es a propósito.** Los ítems de una colección
+    /// bloqueada se omiten y se devuelve el mapa parcial: es lo que contesta
+    /// desde siempre, y pasarlo a error cambiaría el contrato con cada cliente
+    /// que anda bien hoy —`libsecret` incluido, que ya sabe qué hacer con un
+    /// `IsLocked— sin que el issue lo pida. Queda anotado acá para que la
+    /// próxima vez que se toque no parezca un olvido: si algún día se decide
+    /// pasarlo a error, es una decisión de contrato, no un nombre de error.
+    ///
+    /// La lectura de a uno sí lleva el nombre del estándar
+    /// ([`ItemInterface::get_secret`]), y es la que usa el sincronizador de
+    /// `vasak-accounts`.
     async fn get_secrets(
         &self,
         items: Vec<OwnedObjectPath>,
@@ -1824,33 +2014,6 @@ impl PamUnlockInterface {
     pub fn new(state: Arc<Mutex<KeyringState>>, conn: Connection) -> Self {
         Self { state, conn }
     }
-
-    /// Emits `PropertiesChanged` for every `Locked` property that just flipped.
-    /// Lives outside the `#[interface]` block on purpose: it is an internal
-    /// helper, not something to expose on the bus. Failures are ignored because
-    /// the keyring is already usable by then, and a client that misses the
-    /// signal still gets the right answer next time it reads the property.
-    async fn announce_unlocked(&self, coll_path: &str, item_paths: &[String]) {
-        let server = self.conn.object_server();
-
-        if let Ok(iface) = server.interface::<_, CollectionInterface>(coll_path).await {
-            let _ = iface
-                .get()
-                .await
-                .locked_changed(iface.signal_emitter())
-                .await;
-        }
-
-        for ip in item_paths {
-            if let Ok(iface) = server.interface::<_, ItemInterface>(ip.as_str()).await {
-                let _ = iface
-                    .get()
-                    .await
-                    .locked_changed(iface.signal_emitter())
-                    .await;
-            }
-        }
-    }
 }
 
 impl PamUnlockInterface {
@@ -1929,7 +2092,7 @@ impl PamUnlockInterface {
         // true to false. Applications started before the unlock cached the old
         // value, so without a change notification they keep believing the
         // keyring is unusable for the rest of the session.
-        self.announce_unlocked(&coll_path, &item_paths).await;
+        announce_locked_changed(&self.conn, &coll_path, &item_paths).await;
 
         Ok(true)
     }
@@ -2708,5 +2871,542 @@ mod tests {
     #[test]
     fn no_base_means_no_path() {
         assert_eq!(keyring_path_under(None), None);
+    }
+
+    // ── El llavero entero, del otro lado de una conexión punto a punto ──────
+    //
+    // Sin `dbus-daemon`: dos puntas de un `UnixStream::pair()`, una con el
+    // demonio y la otra con el cliente. Lo que se prueba es el servicio de
+    // verdad, con los mismos mensajes que viajan por el bus de sesión —el
+    // nombre del error y la señal, no una función de Rust que los devuelve.
+    //
+    // El estado se arma a mano y no con `register_default_collection`, que lee
+    // la base del disco: una prueba no puede escribir en el llavero real de
+    // quien la corre.
+
+    const SERVICIO: &str = "/org/freedesktop/secrets";
+    const IFACE_SERVICIO: &str = "org.freedesktop.Secret.Service";
+    const IFACE_COLECCION: &str = "org.freedesktop.Secret.Collection";
+    const IFACE_ITEM: &str = "org.freedesktop.Secret.Item";
+    const IFACE_PROPIEDADES: &str = "org.freedesktop.DBus.Properties";
+    const ITEM: &str = "/org/freedesktop/secrets/collection/login/items/0";
+    const SESION: &str = "/org/freedesktop/secrets/session/s0";
+    const ESPERA: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// El llavero de la prueba: el demonio de un lado, el cliente del otro, y
+    /// el estado con una colección abierta, un ítem y una sesión `plain`.
+    ///
+    /// Las dos conexiones se devuelven y se quedan vivas en la prueba: si se
+    /// suelta la del demonio, el bus de la otra punta se corta y los avisos no
+    /// llegan.
+    async fn llavero() -> (zbus::Connection, zbus::Connection) {
+        let state = Arc::new(Mutex::new(KeyringState::new()));
+        {
+            let mut s = state.lock().await;
+            s.collections.insert(
+                COLECCION_DEL_LOGIN.to_string(),
+                CollectionInfo {
+                    label: "Default collection".into(),
+                    locked: false,
+                    items: vec![ITEM.to_string()],
+                    created: 1700,
+                    modified: 1700,
+                },
+            );
+            s.aliases
+                .insert("default".into(), COLECCION_DEL_LOGIN.to_string());
+            s.items.insert(
+                ITEM.to_string(),
+                ItemInfo {
+                    label: "el de la prueba".into(),
+                    attributes: HashMap::new(),
+                    secret: b"el secreto".to_vec(),
+                    content_type: "text/plain".into(),
+                    created: 1700,
+                    modified: 1700,
+                },
+            );
+            s.sessions.insert(
+                SESION.to_string(),
+                SessionInfo {
+                    algorithm: "plain".into(),
+                    shared_key: None,
+                    created: 1700,
+                },
+            );
+        }
+
+        let (extremo_del_demonio, extremo_del_cliente) = tokio::net::UnixStream::pair().unwrap();
+        let demonio = zbus::connection::Builder::unix_stream(extremo_del_demonio)
+            .server(zbus::Guid::generate())
+            .unwrap()
+            .p2p()
+            .build();
+        let cliente = zbus::connection::Builder::unix_stream(extremo_del_cliente)
+            .p2p()
+            .build();
+        let (demonio, cliente) = tokio::join!(demonio, cliente);
+        let demonio = demonio.expect("no se pudo levantar el bus de la prueba");
+        let cliente = cliente.expect("no se pudo levantar el cliente de la prueba");
+
+        demonio
+            .object_server()
+            .at(
+                SERVICIO,
+                ServiceInterface::new(demonio.clone(), Arc::clone(&state)),
+            )
+            .await
+            .expect("no se pudo publicar el servicio");
+        demonio
+            .object_server()
+            .at(
+                COLECCION_DEL_LOGIN,
+                CollectionInterface {
+                    state: Arc::clone(&state),
+                    conn: demonio.clone(),
+                    path: COLECCION_DEL_LOGIN.to_string(),
+                    alias: "login".into(),
+                },
+            )
+            .await
+            .expect("no se pudo publicar la colección");
+        demonio
+            .object_server()
+            .at(
+                ITEM,
+                ItemInterface {
+                    state: Arc::clone(&state),
+                    conn: demonio.clone(),
+                    path: ITEM.to_string(),
+                },
+            )
+            .await
+            .expect("no se pudo publicar el ítem");
+
+        (demonio, cliente)
+    }
+
+    /// Una llamada al demonio por nombre de método.
+    ///
+    /// Sin destino, que en una conexión punto a punto es la otra punta: es lo
+    /// único que hay. Devuelve el mensaje entero, para que cada prueba mire la
+    /// parte que le importa —el cuerpo, o el nombre del error— y no una
+    /// función de Rust que la traduzca.
+    async fn llamar<B>(
+        cliente: &zbus::Connection,
+        ruta: &str,
+        iface: &str,
+        metodo: &str,
+        cuerpo: &B,
+    ) -> zbus::Result<zbus::Message>
+    where
+        B: serde::Serialize + zbus::zvariant::DynamicType,
+    {
+        cliente
+            .call_method(
+                None::<&str>,
+                ruta.to_string(),
+                Some(iface.to_string()),
+                metodo.to_string(),
+                cuerpo,
+            )
+            .await
+    }
+
+    /// El nombre del error con el que contestó el demonio.
+    fn nombre_del_error(e: &zbus::Error) -> String {
+        match e {
+            zbus::Error::MethodError(nombre, _, _) => nombre.to_string(),
+            otro => panic!("se esperaba un error de método del demonio y llegó {otro:?}"),
+        }
+    }
+
+    /// `Service.Lock` sobre la colección del login.
+    async fn bloquear(cliente: &zbus::Connection) -> Vec<OwnedObjectPath> {
+        let respuesta = llamar(
+            cliente,
+            SERVICIO,
+            IFACE_SERVICIO,
+            "Lock",
+            &(vec![OwnedObjectPath::try_from(COLECCION_DEL_LOGIN).unwrap()],),
+        )
+        .await
+        .expect("bloquear una colección abierta no puede fallar");
+        let (bloqueadas, dialogo): (Vec<OwnedObjectPath>, OwnedObjectPath) = respuesta
+            .body()
+            .deserialize()
+            .expect("la respuesta de `Lock` no se entiende");
+        assert_eq!(
+            dialogo.as_str(),
+            "/",
+            "bloquear no puede abrir un diálogo de desbloqueo"
+        );
+        bloqueadas
+    }
+
+    /// Los `PropertiesChanged` de una ruta, en el orden en que llegan.
+    async fn cambios_de(cliente: &zbus::Connection, ruta: &'static str) -> zbus::MessageStream {
+        let regla = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .path(ruta)
+            .and_then(|r| r.interface(IFACE_PROPIEDADES))
+            .and_then(|r| r.member("PropertiesChanged"))
+            .expect("no se pudo armar el filtro")
+            .build();
+        zbus::MessageStream::for_match_rule(regla, cliente, None)
+            .await
+            .expect("no se pudo escuchar la ruta")
+    }
+
+    /// El primer aviso que habla de `Locked`, o `None` si la espera se venció.
+    ///
+    /// `None` es exactamente lo que devuelve un `lock()` que no avisa: por eso
+    /// el mensaje del fallo tiene que decir que no llegó nada, y no inventar un
+    /// motivo.
+    async fn primer_aviso(cambios: &mut zbus::MessageStream) -> Option<Option<bool>> {
+        use futures_util::StreamExt;
+        let mensaje = match tokio::time::timeout(ESPERA, cambios.next()).await {
+            Ok(Some(Ok(mensaje))) => mensaje,
+            _ => return None,
+        };
+        let (iface, cambiadas, _): (String, HashMap<String, OwnedValue>, Vec<String>) = mensaje
+            .body()
+            .deserialize()
+            .expect("un `PropertiesChanged` que no se entiende");
+        if iface != IFACE_COLECCION && iface != IFACE_ITEM {
+            return None;
+        }
+        Some(
+            cambiadas
+                .get("Locked")
+                .cloned()
+                .and_then(|v| bool::try_from(v).ok()),
+        )
+    }
+
+    /// Deja una contraseña maestra en memoria lo que dura la prueba.
+    ///
+    /// Sin ella `effectively_locked` da `true` siempre, y no se puede probar
+    /// ni que el bloqueo *cambie* algo ni que un método que no lee un secreto
+    /// siga contestando. El estado es del proceso entero, así que la prueba
+    /// toma [`estado_de_la_sesion`] y el guardián devuelve lo que había al
+    /// terminar: una prueba que deja el llavero abierto le cambia el `Locked` a
+    /// todas las que corren en paralelo.
+    struct SesionAbierta(Option<Zeroizing<String>>);
+
+    impl Drop for SesionAbierta {
+        fn drop(&mut self) {
+            if let Ok(mut guard) = master_store().lock() {
+                *guard = self.0.take();
+            }
+        }
+    }
+
+    async fn sesion_abierta() -> SesionAbierta {
+        let antes = master_store().lock().ok().and_then(|g| g.clone());
+        set_master_password("la-de-la-prueba");
+        SesionAbierta(antes)
+    }
+
+    /// Deja el bloqueo de escritura como estaba, y lo vuelve a dejar al
+    /// terminar.
+    ///
+    /// El estado es del proceso entero: una prueba que se lo deja puesto hace
+    /// fallar a la que corra después —que es la que comprueba que un arranque
+    /// sin contraseña no le bloquea el llavero a nadie—.
+    struct EscrituraComoEstaba(Option<String>);
+
+    impl EscrituraComoEstaba {
+        fn nuevo() -> Self {
+            Self(writes_blocked())
+        }
+    }
+
+    impl Drop for EscrituraComoEstaba {
+        fn drop(&mut self) {
+            if let Ok(mut bloqueo) = write_block().lock() {
+                *bloqueo = self.0.take();
+            }
+        }
+    }
+
+    /// El aviso que el sincronizador de `vasak-accounts` espera al bloquear, y
+    /// que hoy no llega: sin él, la clave de una base cifrada sigue en memoria
+    /// hasta la próxima revisión del servicio, que es cada **300 segundos**.
+    ///
+    /// Sin el fix, `Service.Lock` cambia la bandera y sale sin emitir nada, así
+    /// que la espera se vence y el mensaje del fallo dice que el aviso no llegó.
+    #[tokio::test]
+    async fn bloquear_avisa_que_cambio_locked() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta().await;
+        let (demonio, cliente) = llavero().await;
+
+        let mut de_la_coleccion = cambios_de(&cliente, COLECCION_DEL_LOGIN).await;
+        let mut del_item = cambios_de(&cliente, ITEM).await;
+
+        assert_eq!(
+            bloquear(&cliente).await,
+            vec![OwnedObjectPath::try_from(COLECCION_DEL_LOGIN).unwrap()],
+            "la colección bloqueada es la que se devuelve"
+        );
+
+        assert_eq!(
+            primer_aviso(&mut de_la_coleccion).await,
+            Some(Some(true)),
+            "bloquear tiene que avisar en la colección que cambió `Locked`, y a `true`: el aviso \
+             no llegó"
+        );
+        assert_eq!(
+            primer_aviso(&mut del_item).await,
+            Some(Some(true)),
+            "y en el ítem, que es donde cada aplicación mira su propio `Locked`: el aviso no llegó"
+        );
+
+        // La propiedad releída dice lo mismo que el aviso: por eso el aviso
+        // alcanza con «puede haber cambiado» y el cliente tiene que leerla.
+        let respuesta = llamar(
+            &cliente,
+            COLECCION_DEL_LOGIN,
+            IFACE_PROPIEDADES,
+            "Get",
+            &(IFACE_COLECCION, "Locked"),
+        )
+        .await
+        .expect("la propiedad tiene que contestar");
+        let valor: OwnedValue = respuesta
+            .body()
+            .deserialize()
+            .expect("respuesta del demonio");
+        assert_eq!(
+            bool::try_from(valor).ok(),
+            Some(true),
+            "la propiedad y el aviso tienen que decir lo mismo"
+        );
+        drop(demonio);
+    }
+
+    /// Leer un secreto con el llavero bloqueado se avisa con el nombre del
+    /// estándar, `org.freedesktop.Secret.Error.IsLocked`, y no con un `Failed` y
+    /// un texto: es lo que le dice al cliente que tiene que desbloquear y
+    /// reintentar.
+    ///
+    /// La misma llamada con la colección abierta tiene que servir el secreto, o
+    /// el error no probaría que lo causa el bloqueo.
+    #[tokio::test]
+    async fn leer_un_secreto_con_el_llavero_bloqueado_responde_is_locked() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta().await;
+        let (demonio, cliente) = llavero().await;
+        let sesion = OwnedObjectPath::try_from(SESION).unwrap();
+
+        // Abierta: el secreto sale.
+        let respuesta = llamar(&cliente, ITEM, IFACE_ITEM, "GetSecret", &(&sesion,))
+            .await
+            .expect("con el llavero abierto el secreto se lee");
+        let (secreto,): (SecretStruct,) = respuesta.body().deserialize().expect("respuesta");
+        assert_eq!(secreto.value, b"el secreto");
+
+        // Bloqueada: el mismo camino, y ahora el nombre del estándar.
+        let _ = bloquear(&cliente).await;
+        let error = llamar(&cliente, ITEM, IFACE_ITEM, "GetSecret", &(&sesion,))
+            .await
+            .expect_err("con la colección bloqueada el secreto no puede salir");
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.Secret.Error.IsLocked",
+            "leer un secreto bloqueado se avisa con el nombre del estándar, no con el texto de un \
+             `Failed` que el cliente tiene que adivinar"
+        );
+        drop(demonio);
+    }
+
+    /// Guardar con el llavero bloqueado también lleva el nombre del estándar, y
+    /// por el motivo que dejó de lado al consumidor: el que guarda tiene que
+    /// poder separar «desbloqueá y volvé a intentar» de «falló», sin leer el
+    /// texto.
+    ///
+    /// El caso es **sin contraseña maestra en memoria**, que es como arranca una
+    /// sesión nueva y como queda una que se reinició. Con la contraseña puesta
+    /// y la colección marcada con `Service.Lock` la escritura sigue: ese
+    /// bloqueo es por colección y no toca la base, que es justo lo que
+    /// `ensure_unlocked` decide —y lo que `vasak-keyring#24` va a revisar.
+    #[tokio::test]
+    async fn guardar_con_el_llavero_bloqueado_responde_is_locked() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let (demonio, cliente) = llavero().await;
+
+        let error = llamar(
+            &cliente,
+            COLECCION_DEL_LOGIN,
+            IFACE_COLECCION,
+            "CreateItem",
+            &(
+                HashMap::from([(
+                    "org.freedesktop.Secret.Item.Label".to_string(),
+                    Value::from("el nuevo"),
+                )]),
+                SecretStruct {
+                    session: OwnedObjectPath::try_from(SESION).unwrap(),
+                    parameters: Vec::new(),
+                    value: "0".repeat(64).into_bytes(),
+                    content_type: "text/plain".into(),
+                },
+                true,
+            ),
+        )
+        .await
+        .expect_err("con el llavero bloqueado no se puede guardar");
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.Secret.Error.IsLocked",
+            "guardar con el llavero bloqueado se avisa con el nombre del estándar"
+        );
+        drop(demonio);
+    }
+
+    /// **`IsLocked` donde no corresponde es tan confuso como el `Failed` que
+    /// estaba antes.** Un `IsLocked` manda al cliente a un camino de desbloqueo
+    /// que no va a funcionar, así que lo que no lee un secreto tiene que seguir
+    /// contestando lo de siempre:
+    ///
+    /// - `SearchItems` devuelve vacío —que es lo que el estándar dice para una
+    ///   colección bloqueada— y no un error;
+    /// - `ReadAlias` contesta la ruta de la colección, bloqueada o no;
+    /// - `CreateItem` con la base del disco sin descifrar **no** es un bloqueo de
+    ///   la colección: la colección puede estar abierta y consultable, lo que no
+    ///   se puede es escribir un archivo que ya hay. Eso sigue siendo `Failed`,
+    ///   con el texto entero que dice qué hacer.
+    #[tokio::test]
+    async fn con_el_llavero_bloqueado_solo_lo_que_lee_un_secreto_responde_is_locked() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        // Hay una base en el disco que esta sesión no abre: la escritura queda
+        // bloqueada con un motivo que **no** es la falta de contraseña maestra.
+        let _escritura = EscrituraComoEstaba::nuevo();
+        let dir = DirDePrueba::nuevo("bloqueo-por-coherencia");
+        let ruta = dir.ruta().join("keyring.db");
+        base_con_una_entrada(&ruta, "la-buena").await;
+        let carga = items_from_disk(&ruta, Some("la-mala"))
+            .await
+            .expect("no poder descifrar todavía no es un fallo");
+        assert!(carga.undecrypted);
+        seed_items(carga);
+        assert!(writes_blocked().is_some(), "arrancó sin poder escribir");
+
+        // Con la contraseña maestra puesta, la colección **no** está bloqueada:
+        // se puede leer. Lo que no se puede es guardar.
+        let _abierta = sesion_abierta().await;
+        let (demonio, cliente) = llavero().await;
+        let sesion = OwnedObjectPath::try_from(SESION).unwrap();
+
+        let leido = llamar(&cliente, ITEM, IFACE_ITEM, "GetSecret", &(&sesion,)).await;
+        assert!(
+            leido.is_ok(),
+            "con la contraseña maestra el secreto se lee: una base sin descifrar en el disco no \
+             bloquea la lectura"
+        );
+
+        // Ahora sí, bloqueada: `SearchItems` vacío y `ReadAlias` con la ruta.
+        let bloqueadas = bloquear(&cliente).await;
+        assert_eq!(bloqueadas.len(), 1, "la colección del login se bloqueó");
+
+        let respuesta = llamar(
+            &cliente,
+            COLECCION_DEL_LOGIN,
+            IFACE_COLECCION,
+            "SearchItems",
+            &(HashMap::<String, String>::new(),),
+        )
+        .await
+        .expect(
+            "una búsqueda no lee un secreto, y con la colección bloqueada tampoco se avisa \
+                  con un `IsLocked`: contesta las rutas y cada cliente mira el `Locked` de lo que \
+                  encuentra",
+        );
+        let encontrados: Vec<OwnedObjectPath> = respuesta.body().deserialize().expect("respuesta");
+        assert_eq!(
+            encontrados,
+            vec![OwnedObjectPath::try_from(ITEM).unwrap()],
+            "la búsqueda de una colección devuelve sus ítems, esté bloqueada o no"
+        );
+
+        let respuesta = llamar(
+            &cliente,
+            SERVICIO,
+            IFACE_SERVICIO,
+            "ReadAlias",
+            &("default",),
+        )
+        .await
+        .expect("leer un alias no toca un secreto");
+        let alias: OwnedObjectPath = respuesta.body().deserialize().expect("respuesta");
+        assert_eq!(
+            alias.as_str(),
+            COLECCION_DEL_LOGIN,
+            "`ReadAlias` contesta la ruta también con la colección bloqueada"
+        );
+
+        // Y guardar con la base del disco sin descifrar no es `IsLocked`.
+        let error = llamar(
+            &cliente,
+            COLECCION_DEL_LOGIN,
+            IFACE_COLECCION,
+            "CreateItem",
+            &(
+                HashMap::from([(
+                    "org.freedesktop.Secret.Item.Label".to_string(),
+                    Value::from("el nuevo"),
+                )]),
+                SecretStruct {
+                    session: sesion,
+                    parameters: Vec::new(),
+                    value: "0".repeat(64).into_bytes(),
+                    content_type: "text/plain".into(),
+                },
+                true,
+            ),
+        )
+        .await
+        .expect_err("no se puede guardar sobre una base sin descifrar");
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.DBus.Error.Failed",
+            "«la base del disco no está descifrada» no es un bloqueo de la colección: mandar a \
+             desbloquear no la abre, así que no puede ser `IsLocked`"
+        );
+        drop(demonio);
+    }
+
+    /// Un `Failed` cualquiera no es un bloqueo, y el texto no cambia el nombre:
+    /// el nombre lo decide el estado del llavero.
+    #[test]
+    fn el_nombre_del_error_lo_decide_el_variante_y_no_el_texto() {
+        use zbus::DBusError as _;
+
+        let bloqueado = SecretError::IsLocked("cualquier cosa".into());
+        assert_eq!(
+            bloqueado.name().as_str(),
+            "org.freedesktop.Secret.Error.IsLocked"
+        );
+        for texto in [
+            "el llavero está bloqueado",
+            "collection is locked",
+            "",
+            "no se pudo leer el secreto",
+        ] {
+            assert_eq!(
+                SecretError::IsLocked(texto.into()).name().as_str(),
+                "org.freedesktop.Secret.Error.IsLocked",
+                "el texto {texto:?} no puede cambiar el nombre"
+            );
+        }
+
+        assert_eq!(
+            SecretError::Plain(dbus_err("la base del disco está sin descifrar"))
+                .name()
+                .as_str(),
+            "org.freedesktop.DBus.Error.Failed",
+            "todo lo que no es un bloqueo conserva el nombre que ya tenía"
+        );
     }
 }

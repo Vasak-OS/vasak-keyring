@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "vasak-keyring"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2021"
 
 [dependencies]
@@ -30,3 +30,16 @@ hkdf = "0.12"
 aes = "0.8"
 cbc = { version = "0.1", features = ["block-padding"] }
 cipher = { version = "0.4", features = ["alloc", "block-padding"] }
+
+[dev-dependencies]
+# Para await en un `MessageStream` de zbus, que implementa `Stream` del mundo de
+# `futures` y no trae el `next` por su cuenta. Sólo para las pruebas: lo que las
+# necesita es poder mirar la señal de `Locked` que llega por el bus, y sin esto
+# el aviso del bloqueo no se podría comprobar.
+futures-util = "0.3"
+# La construcción de una conexión punto a punto es de zbus con la característica
+# `p2p`, que el demonio no usa y no tiene activa. Va acá y no en `[dependencies]`
+# a propósito: es lo que permite mirar la señal y el nombre del error como
+# viajan por el bus, con dos puntas de un `UnixStream` y sin `dbus-daemon`, y no
+# pesa en el binario que se instala.
+zbus = { version = "5", features = ["tokio", "p2p"] }

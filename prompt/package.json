@@ -15,21 +15,21 @@
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",
-    "@tauri-apps/api": "^2.11.1",
-    "@vasakgroup/plugin-config-manager": "^2.6.0",
-    "@vasakgroup/vue-libvasak": "^0.6.0",
+    "@tauri-apps/api": "^2.12.0",
+    "@vasakgroup/plugin-config-manager": "^2.9.0",
+    "@vasakgroup/vue-libvasak": "^1.9.0",
     "path": "^0.12.7",
     "pinia": "^3.0.4",
     "url": "^0.11.4",
-    "vue": "^3.5.42"
+    "vue": "^3.5.43"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.12",
+    "@biomejs/biome": "^2.5.14",
     "@happy-dom/global-registrator": "^20.14.5",
     "@tailwindcss/postcss": "^4.3.3",
-    "@tauri-apps/cli": "^2.11.4",
-    "@types/node": "^25.9.5",
-    "@vitejs/plugin-vue": "^6.0.8",
+    "@tauri-apps/cli": "^2.12.0",
+    "@types/node": "^26.6.3",
+    "@vitejs/plugin-vue": "^6.0.9",
     "@vue/test-utils": "^2.5.1",
     "happy-dom": "^20.14.5",
     "postcss": "^8.5.28",
@@ -37,5 +37,12 @@
     "typescript": "^5.9.3",
     "vite": "^7.3.6",
     "vue-tsc": "^3.3.11"
+  },
+  "vasak": {
+    "bibliotecasAtrasadas": {
+      "pinia": "La 4 es un salto mayor de una biblioteca que usa el taller entero: la mayoría de las aplicaciones están en pinia 3 y subir sólo ésta parte el vocabulario compartido. Va en su propio PR, coordinado con el resto.",
+      "typescript": "La 7 (el compilador reescrito) no trae `typescript/lib/tsc` y vue-tsc 3.3 lo busca ahí: `bun run build` se cae con ERR_PACKAGE_PATH_NOT_EXPORTED antes de mirar un archivo. Se saca cuando vue-tsc publique una versión que soporte TypeScript 7.",
+      "vite": "La 8 cambia rollup por rolldown. Acá compila limpia y las pruebas pasan, pero es cambiar cómo se empaqueta la ventana y eso no lo verifica ninguna prueba: va en su propio PR, que abra los tres diálogos (contraseña, SSH, GPG) en una sesión con `--features custom-protocol`. Se saca con ese PR."
+    }
   }
 }

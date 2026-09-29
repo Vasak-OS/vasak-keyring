@@ -21,6 +21,19 @@ elige el llamador y por lo tanto no prueba nada. El PID tampoco lo manda el
 cliente: el demonio lo saca de `SO_PEERCRED` al autenticar, y ese vínculo queda
 fijado durante toda la vida de la conexión.
 
+Para leer `/proc/<pid>/exe` de otro proceso de la sesión, el demonio **no puede
+correr en un namespace de usuario propio**, y en una unidad de usuario de
+systemd lo crea cualquiera de `PrivateTmp`, `PrivateDevices`, `ProtectSystem`,
+`ProtectHome`, `ProtectHostname`, `ProtectClock`, `ProtectControlGroups` o los
+`ProtectKernel*` (medido con systemd 261: `systemd-run --user -p <opción>=yes
+readlink /proc/<pid>/exe` da `EACCES` con cada una, y `/proc/self/ns/user` sale
+distinto del de la sesión). Desde el 3/09 la unidad tenía varias: la lectura daba
+`EACCES`, y tanto este control como el del portal rechazaban a todo el mundo,
+también al sincronizador y al portal de verdad. Por eso `vasak-keyring.service`
+no las tiene, y una prueba (`la_unidad_deja_leer_quien_pide`) falla si vuelven.
+El aislamiento que queda —sin red, `NoNewPrivileges`, filtro de llamadas al
+sistema, `MemoryDenyWriteExecute`, `RestrictNamespaces`— no crea namespaces.
+
 El control es **por ítem**: el resto de los secretos se sigue entregando
 normalmente, que es lo que necesitan el navegador, el cliente de correo y el
 resto del escritorio.

@@ -31,16 +31,24 @@ UMask=0077
 # sesión abierto a todos por igual.
 KeyringMode=private
 CapabilityBoundingSet=
-PrivateDevices=yes
-PrivateTmp=yes
-ProtectClock=yes
-ProtectControlGroups=yes
-ProtectHostname=yes
-ProtectKernelLogs=yes
-ProtectKernelModules=yes
-ProtectKernelTunables=yes
-# Los demás procesos del sistema dejan de verse desde acá.
-ProtectProc=invisible
+
+# Lo que **no** está, y por qué: `PrivateTmp`, `PrivateDevices`,
+# `ProtectSystem`, `ProtectHostname`, `ProtectClock`, `ProtectControlGroups` y
+# los tres `ProtectKernel*`. En una unidad de usuario, cualquiera de ellas hace
+# que el gestor le cree al servicio un namespace de usuario propio, y desde
+# adentro de ese namespace `/proc/<pid>/exe` de los procesos de la sesión da
+# `EACCES`. Es la lectura con la que las dos puertas de este demonio saben
+# quién les pide —el portal para `RetrieveSecret`, el sincronizador para la
+# clave del almacén cifrado—, así que con ellas puestas no dejaban pasar a
+# nadie, tampoco a los de verdad. Entre aislar al llavero y saber a quién le
+# entrega un secreto, lo segundo es el trabajo del llavero.
+#
+# `ProtectProc=invisible` tampoco está: en una unidad de usuario no tiene
+# efecto —se siguen viendo todos los procesos—, y si lo tuviera ocultaría
+# justo los `/proc/<pid>` que las puertas necesitan leer.
+#
+# Lo que sigue no crea namespaces y no toca esa lectura. Hay una prueba en
+# `src/portal_secret.rs` que falla si alguna de las de arriba vuelve.
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
@@ -53,14 +61,6 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@privileged
 SystemCallFilter=~@resources
 SystemCallErrorNumber=EPERM
-
-# `full` y no `strict` como en vasak-permissions, y es a propósito: `strict`
-# deja **todo** el árbol de sólo lectura, y este demonio tiene que poder crear
-# `~/.local/share/vasak-keyring/` la primera vez que corre. Con `strict` habría
-# que abrirle el directorio padre entero con `ReadWritePaths`, que es más
-# permiso del que se ahorra. `full` ya le cierra /usr, /boot y /etc, que es de
-# donde vendría un cambio persistente al sistema.
-ProtectSystem=full
 
 [Install]
 WantedBy=default.target

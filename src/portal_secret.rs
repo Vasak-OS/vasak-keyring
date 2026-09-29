@@ -176,7 +176,10 @@ async fn ejecutable_de(conn: &zbus::Connection, emisor: &str) -> Result<String, 
         .and_then(|r| r.body().deserialize())
         .map_err(|e| format!("el bus no dio el pid de {emisor}: {e}"))?;
 
-    std::fs::read_link(format!("/proc/{pid}/exe"))
+    // `tokio::fs` y no `std::fs`: esto corre en el hilo del bus, y una lectura
+    // bloqueante ahí frena a todos los demás pedidos mientras tanto.
+    tokio::fs::read_link(format!("/proc/{pid}/exe"))
+        .await
         .map(|r| r.to_string_lossy().into_owned())
         .map_err(|e| format!("no se pudo leer /proc/{pid}/exe: {e}"))
 }

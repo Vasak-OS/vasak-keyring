@@ -25,7 +25,9 @@ Para leer `/proc/<pid>/exe` de otro proceso de la sesión, el demonio **no puede
 correr en un namespace de usuario propio**, y en una unidad de usuario de
 systemd lo crea cualquiera de `PrivateTmp`, `PrivateDevices`, `ProtectSystem`,
 `ProtectHome`, `ProtectHostname`, `ProtectClock`, `ProtectControlGroups` o los
-`ProtectKernel*`. Desde el 3/09 la unidad tenía varias: la lectura daba
+`ProtectKernel*` (medido con systemd 261: `systemd-run --user -p <opción>=yes
+readlink /proc/<pid>/exe` da `EACCES` con cada una, y `/proc/self/ns/user` sale
+distinto del de la sesión). Desde el 3/09 la unidad tenía varias: la lectura daba
 `EACCES`, y tanto este control como el del portal rechazaban a todo el mundo,
 también al sincronizador y al portal de verdad. Por eso `vasak-keyring.service`
 no las tiene, y una prueba (`la_unidad_deja_leer_quien_pide`) falla si vuelven.

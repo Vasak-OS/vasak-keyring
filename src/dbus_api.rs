@@ -480,7 +480,16 @@ fn acceso_permitido(item: &ItemInfo, autorizado: bool) -> bool {
 
 /// Verifica si el proceso que llama está autorizado para acceder a un esquema protegido.
 ///
-/// Solo `/usr/bin/vasak-accounts-sync` puede leer ítems con el esquema protegido.
+/// Sólo `/usr/bin/vasak-accounts-sync` puede leer ítems con el esquema protegido.
+///
+/// **Lo que esto autentica es el binario, no a quien lo ejecuta.** Un proceso del
+/// mismo UID al que el sincronizador le pase su conexión D-Bus la usa sin
+/// problema —el bus devuelve el PID de quien *abrió* la conexión, no el de quien
+/// escribe— y el código inyectado dentro del propio sincronizador pasa el
+/// control de la misma manera. Ninguna comprobación más sobre `/proc` cierra
+/// esos dos casos: hacen falta un UID propio o un sandbox. Está anotado igual en
+/// el `README.md`, y es la misma frontera que ya tenían `vasak-permissions` y el
+/// control del portal.
 async fn autorizado_para_esquema_protegido(
     conn: &Connection,
     cabecera: &zbus::message::Header<'_>,

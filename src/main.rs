@@ -1,14 +1,16 @@
 #![allow(dead_code)]
 mod crypto;
 mod dbus_api;
-mod session_crypto;
 mod portal_secret;
+mod session_crypto;
+#[cfg(test)]
+mod test_bus;
 mod unlock_socket;
 
+use dbus_api::{KeyringState, PamUnlockInterface, ServiceInterface};
+use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use dbus_api::{ServiceInterface, PamUnlockInterface, KeyringState};
-use std::error::Error;
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 
 #[tokio::main]
@@ -122,9 +124,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 ),
             }
         }
-        Err(e) => eprintln!(
-            "vasak-keyring: no se pudo preparar la conexión del backend del portal ({e})"
-        ),
+        Err(e) => {
+            eprintln!("vasak-keyring: no se pudo preparar la conexión del backend del portal ({e})")
+        }
     }
 
     println!("vasak-keyring: D-Bus services ready");

@@ -602,7 +602,12 @@ async fn ejecutable_del_emisor(
         None => return Err("el bus no dio su pid".to_owned()),
     };
 
-    ejecutable_de(pid).map_err(|e| format!("no se pudo leer /proc/{pid}/exe: {e}"))
+    // En un hilo aparte: esto corre en el hilo del bus, y una lectura
+    // bloqueante ahí frena a todos los demás pedidos mientras tanto.
+    tokio::task::spawn_blocking(move || ejecutable_de(pid))
+        .await
+        .map_err(|e| format!("se cortó la lectura de /proc/{pid}/exe: {e}"))?
+        .map_err(|e| format!("no se pudo leer /proc/{pid}/exe: {e}"))
 }
 
 /// Si la conexión que llama es la del sincronizador.

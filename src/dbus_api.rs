@@ -39,6 +39,8 @@ fn dbus_err(msg: impl Into<String>) -> zbus::fdo::Error {
 enum SecretError {
     /// La colección está bloqueada, y por eso no sale el secreto.
     IsLocked(String),
+    /// El proceso que llama no tiene permiso para acceder a este ítem.
+    AccessDenied,
     /// Cualquier otro fallo, con el nombre que ya le daba `zbus::fdo::Error`.
     Plain(zbus::fdo::Error),
 }
@@ -59,6 +61,7 @@ impl std::fmt::Display for SecretError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::IsLocked(d) => write!(f, "{d}"),
+            Self::AccessDenied => write!(f, "access denied"),
             Self::Plain(e) => write!(f, "{}", zbus::DBusError::description(e).unwrap_or_default()),
         }
     }
@@ -72,6 +75,15 @@ impl zbus::DBusError for SecretError {
             Self::IsLocked(_) => zbus::names::ErrorName::from_static_str_unchecked(
                 "org.freedesktop.Secret.Error.IsLocked",
             ),
+            // El nombre del **bus**, no uno inventado con prefijo `Secret`:
+            // `org.freedesktop.Secret.Error.AccessDenied` no existe en ninguna
+            // especificación, y un cliente que no lo reconoce lo trata como un
+            // fallo genérico —igual que un llavero roto—. El nombre que sabe
+            // distinguir «no tenés permiso» es el de D-Bus, y es el que libsecret
+            // traduce a `SECRET_ERROR_ACCESS_DENIED`.
+            Self::AccessDenied => zbus::names::ErrorName::from_static_str_unchecked(
+                "org.freedesktop.DBus.Error.AccessDenied",
+            ),
             Self::Plain(e) => zbus::DBusError::name(e),
         }
     }
@@ -79,6 +91,7 @@ impl zbus::DBusError for SecretError {
     fn description(&self) -> Option<&str> {
         match self {
             Self::IsLocked(d) => Some(d),
+            Self::AccessDenied => Some("access denied"),
             Self::Plain(e) => zbus::DBusError::description(e),
         }
     }
@@ -380,6 +393,95 @@ fn effectively_locked(collection_locked: bool) -> bool {
     collection_locked || master_password().is_none()
 }
 
+/// El esquema que protege el almacén de cuentas de Vasak-OS.
+///
+/// Los ítems con este esquema en `xdg:schema` solo pueden ser leídos por
+/// `/usr/bin/vasak-accounts-sync`, identificado por su ejecutable.
+const ESQUEMA_PROTEGIDO: &str = "ar.net.vasak.os.AccountsStore";
+const ATRIBUTO_ESQUEMA: &str = "xdg:schema";
+const EJECUTABLE_AUTORIZADO: &str = "/usr/bin/vasak-accounts-sync";
+
+/// Obtiene el PID del proceso que envió el mensaje D-Bus.
+///
+/// Pregunta al bus de sesión por el PID asociado a la conexión del remitente.
+/// Si algo falla, devuelve `None`.
+async fn pid_del_emisor(conn: &Connection, cabecera: &zbus::message::Header<'_>) -> Option<u32> {
+    let emisor = cabecera.sender()?;
+    let respuesta = conn
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "GetConnectionUnixProcessID",
+            &(emisor.as_str(),),
+        )
+        .await
+        .ok()?;
+    respuesta.body().deserialize().ok()
+}
+
+/// Obtiene la ruta del ejecutable a partir del PID.
+fn ejecutable_de(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|r| r.to_string_lossy().into_owned())
+}
+
+/// Verifica si un ítem tiene un esquema protegido.
+fn es_esquema_protegido(item: &ItemInfo) -> bool {
+    item.attributes
+        .get(ATRIBUTO_ESQUEMA)
+        .is_some_and(|s| s == ESQUEMA_PROTEGIDO)
+}
+
+/// Si a quien pregunta se le puede entregar este ítem.
+///
+/// Es la decisión sola, sin bus ni async, a propósito: el «quién pregunta» se
+/// resuelve con `pid_del_emisor` —una ida y vuelta al bus que en una prueba
+/// real no se puede simular—, pero una vez que ese `bool` está, decidir si el
+/// ítem se entrega depende sólo de una regla de dos líneas, y esa regla tiene
+/// que poder probarse sin montar un bus. Por eso vive acá y no repartida en
+/// los dos métodos que la usan: los dos la llaman, ninguno la reimplementa.
+fn acceso_permitido(item: &ItemInfo, autorizado: bool) -> bool {
+    !es_esquema_protegido(item) || autorizado
+}
+
+/// Verifica si el proceso que llama está autorizado para acceder a un esquema protegido.
+///
+/// Solo `/usr/bin/vasak-accounts-sync` puede leer ítems con el esquema protegido.
+async fn autorizado_para_esquema_protegido(
+    conn: &Connection,
+    cabecera: &zbus::message::Header<'_>,
+) -> bool {
+    // `match` y no `let...else`: el inicializador de un `let...else` no
+    // parsea cuando termina en `.await`, y esto vive dentro de un `async fn`.
+    // Se comprobó con rustc 1.98 antes de escribir esto, no de theorycraft.
+    let pid = match pid_del_emisor(conn, cabecera).await {
+        Some(pid) => pid,
+        None => return false,
+    };
+    let ejecutable = match ejecutable_de(pid) {
+        Some(ejecutable) => ejecutable,
+        None => return false,
+    };
+    es_el_autorizado(&ejecutable)
+}
+
+/// Si esta ruta de ejecutable es la del sincronizador.
+///
+/// La comparación es exacta y no por prefijo, y eso es el punto: con un
+/// `starts_with`, `/usr/bin/vasak-accounts-sync.malicioso` —o cualquier
+/// `...-sync2`— pasaría por el sincronizador. No hace falta ser root para
+/// exploitear eso, alcanza con poder dejar un archivo en un directorio que esté
+/// en el `PATH` del atacante... salvo que el camino esté completo, que es
+/// justamente por lo que se compara contra la ruta entera y no contra el
+/// nombre. Separáda de `autorizado_para_esquema_protegido` para que se pueda
+/// probar sin un bus: la de acá es la regla, y una regla que no se prueba sola
+/// termina cediendo en el `if` de arriba.
+fn es_el_autorizado(ejecutable: &str) -> bool {
+    ejecutable == EJECUTABLE_AUTORIZADO
+}
+
 /// Writes every item to the encrypted database.
 ///
 /// Returns an error instead of only logging one: a store that cannot reach the
@@ -667,7 +769,17 @@ impl ItemInterface {
     /// ([`SecretError::IsLocked`]) y no con `Failed` y un texto: es lo que le
     /// dice a un cliente que tiene que **desbloquear** y reintentar, en vez de
     /// quedarse adivinando por el mensaje.
-    async fn get_secret(&self, session: OwnedObjectPath) -> Result<(SecretStruct,), SecretError> {
+    async fn get_secret(
+        &self,
+        #[zbus(header)] cabecera: zbus::message::Header<'_>,
+        session: OwnedObjectPath,
+    ) -> Result<(SecretStruct,), SecretError> {
+        // La identidad del emisor se resuelve **antes** del lock del estado.
+        // `GetConnectionUnixProcessID` es una ida y vuelta al bus, y hacerla con
+        // el lock tomado deja a todos los demás llamantes esperando a que un
+        // proceso ajeno conteste.
+        let autorizado = autorizado_para_esquema_protegido(&self.conn, &cabecera).await;
+
         let state = self.state.lock().await;
         // Never release a secret from a locked collection.
         if state
@@ -681,6 +793,11 @@ impl ItemInterface {
             .items
             .get(&self.path)
             .ok_or_else(|| dbus_err("item not found"))?;
+
+        if !acceso_permitido(item, autorizado) {
+            return Err(SecretError::AccessDenied);
+        }
+
         let ses = state
             .sessions
             .get(session.as_str())
@@ -1795,11 +1912,17 @@ impl ServiceInterface {
     /// `vasak-accounts`.
     async fn get_secrets(
         &self,
+        #[zbus(header)] cabecera: zbus::message::Header<'_>,
         items: Vec<OwnedObjectPath>,
         session: OwnedObjectPath,
         // Keyed by object path, not string: the spec declares `a{o(oayays)}`
         // and libsecret refuses the `a{s(oayays)}` a String key produces.
     ) -> Result<HashMap<OwnedObjectPath, SecretStruct>, zbus::fdo::Error> {
+        // Una sola vez por llamada, y antes del lock: el chequeo no depende del
+        // ítem —depende de quién pregunta—, así que preguntarlo adentro del
+        // `for` era una ida y vuelta al bus por cada ítem protegido de la lista.
+        let autorizado = autorizado_para_esquema_protegido(&self.conn, &cabecera).await;
+
         let state = self.state.lock().await;
         let mut result = HashMap::new();
         for ip in &items {
@@ -1814,6 +1937,13 @@ impl ServiceInterface {
             }
             if let Some(item) = state.items.get(ip.as_str()) {
                 if let Some(ses) = state.sessions.get(session.as_str()) {
+                    // Un ítem protegido se omite pero no corta el mapa entero:
+                    // es el mismo trato que reciben las colecciones bloqueadas
+                    // acá arriba, y el contrato de `GetSecrets` es devolver la
+                    // parte que sí se puede leer.
+                    if !acceso_permitido(item, autorizado) {
+                        continue;
+                    }
                     // Encrypted sessions used to be skipped outright here, so a
                     // client that opened one got an empty map back from
                     // GetSecrets and concluded it had no stored passwords.
@@ -2880,6 +3010,302 @@ mod tests {
         assert_eq!(guardado.items[1].secret, b"el secreto nuevo");
     }
 
+    // ── Control de acceso por ítem (#24) ────────────────────────
+
+    /// Un ítem del almacén de cuentas, con el atributo que lo marca como protegido.
+    fn entrada_protegida(secret: &[u8]) -> ItemInfo {
+        ItemInfo {
+            attributes: HashMap::from([(
+                ATRIBUTO_ESQUEMA.to_string(),
+                ESQUEMA_PROTEGIDO.to_string(),
+            )]),
+            ..entrada(secret)
+        }
+    }
+
+    /// El bug: `vasak-keyring` es un Secret Service estándar, así que cualquier
+    /// proceso de la sesión —un navegador, un script, un `.desktop` mal puesto—
+    /// podía pedir la clave del almacén cifrado y abrir la base. El cifrado
+    /// protege en reposo, no contra código que corre como la misma persona.
+    ///
+    /// Lo que decide esto no es el nombre de la conexión sino el ejecutable del
+    /// proceso que pregunta: el nombre de la conexión se lo elige el llamador,
+    /// y por lo tanto no prueba nada.
+    #[test]
+    fn un_item_protegido_no_se_le_entrega_a_un_proceso_no_autorizado() {
+        let item = entrada_protegida(b"la clave del almacen");
+
+        assert!(
+            !acceso_permitido(&item, false),
+            "un proceso que no es el sincronizador no puede leer el item protegido: \
+             el llavero lo entregaba a cualquiera"
+        );
+    }
+
+    /// El caso que no puede romperse para tapar el anterior: el control es por
+    /// ítem, no una negación general. Si esto fallara, el navegador, el cliente
+    /// de correo y el resto de las aplicaciones que hoy andan bien se quedarían
+    /// sin llavero, y el arreglo de un agujero sería romper el escritorio.
+    #[test]
+    fn un_item_sin_proteger_se_sigue_entregando_a_cualquier_proceso() {
+        let item = entrada("la contraseña del navegador".as_bytes());
+
+        assert!(
+            acceso_permitido(&item, false),
+            "el control es sobre el item protegido, no sobre el llavero entero"
+        );
+    }
+
+    /// El otro lado del mismo control: el sincronizador de cuentas tiene que poder
+    /// leer lo suyo. Si esto fallara, el arreglo del #24 sería apagarle el
+    /// almacén a la única aplicación que lo debe usar.
+    #[test]
+    fn el_proceso_autorizado_si_puede_leer_el_item_protegido() {
+        let item = entrada_protegida(b"la clave del almacen");
+
+        assert!(
+            acceso_permitido(&item, true),
+            "el sincronizador de cuentas es el que puede leer el almacen"
+        );
+    }
+
+    /// Un atributo con otro valor no es el esquema protegido, aunque se parezca.
+    ///
+    /// El filtro es una igualdad exacta contra `ESQUEMA_PROTEGIDO`: si fuera un
+    /// `contains` o un prefijo, cualquier aplicación que se Vie con
+    /// `ar.net.vasak.os.AccountsStoreBackup` quedaría protegida por accidente —o,
+    /// al revés, se le negaría su propia clave sin que nadie entienda por qué.
+    #[test]
+    fn un_esquema_que_solo_se_parece_al_protegido_no_lo_es() {
+        let parecidos = [
+            "ar.net.vasak.os.AccountsStore2",
+            "ar.net.vasak.os.accountsstore",
+            "ar.net.vasak.os.AccountsStore ",
+            "com.otro.Programa",
+        ];
+        for esquema in parecidos {
+            let item = ItemInfo {
+                attributes: HashMap::from([(ATRIBUTO_ESQUEMA.to_string(), esquema.to_string())]),
+                ..entrada(b"secreto")
+            };
+            assert!(
+                acceso_permitido(&item, false),
+                "`{esquema}` no es el esquema protegido y no puede quedar bloqueado"
+            );
+        }
+    }
+
+    /// Un ítem sin `xdg:schema` tampoco es un problema, y esto importa porque es
+    /// lo que tiene la mayoría: el `CreateItem` de cualquier aplicación trae lo
+    /// que la aplicación quiera, y la mayoría no trae nada.
+    #[test]
+    fn un_item_sin_el_atributo_de_esquema_no_queda_bloqueado() {
+        let item = ItemInfo {
+            attributes: HashMap::from([("otra-cosa".to_string(), "lo-que-sea".to_string())]),
+            ..entrada(b"secreto")
+        };
+
+        assert!(
+            acceso_permitido(&item, false),
+            "sin el atributo no hay nada que proteger"
+        );
+    }
+
+    /// El nombre del error es parte del contrato, no un detalle interno.
+    ///
+    /// Un cliente que recibe `org.freedesktop.DBus.Error.AccessDenied` —el
+    /// nombre que dice la especificación— puede decir «este programa no tiene
+    /// permiso» y seguir andando. Si volviera a salir `org.freedesktop.Secret.Error.Failed`,
+    /// el cliente vería un fallo genérico y una clave protegida se confundiría
+    /// con un llavero roto.
+    #[test]
+    fn el_negativo_usa_el_nombre_de_error_del_estandar() {
+        let nombre = <SecretError as zbus::DBusError>::name(&SecretError::AccessDenied);
+
+        assert_eq!(
+            nombre.as_str(),
+            "org.freedesktop.DBus.Error.AccessDenied",
+            "el cliente tiene que poder distinguir un permiso denegado de un llavero roto"
+        );
+    }
+
+    /// Y ese mismo error se distingue de `IsLocked`, que significa otra cosa y
+    /// trae una acción distinta: desbloquear y reintentar.
+    ///
+    /// Si los dos salieran con el mismo nombre, un cliente que no puede leer la
+    /// clave por permiso le preguntaría a la persona su contraseña de nuevo, para
+    /// siempre, sin que eso sirva de nada.
+    #[test]
+    fn el_permiso_denegado_no_se_confunde_con_el_llavero_bloqueado() {
+        let denegado = <SecretError as zbus::DBusError>::name(&SecretError::AccessDenied);
+        let error_bloqueado = SecretError::IsLocked("bloqueada".into());
+        let bloqueado = <SecretError as zbus::DBusError>::name(&error_bloqueado);
+
+        assert_ne!(
+            denegado.as_str(),
+            bloqueado.as_str(),
+            "el bloqueo se resuelve desbloquear; el permiso, no"
+        );
+    }
+
+    /// El mismo bug, pero por el camino que de verdad lo exercise un atacante:
+    /// una llamada `GetSecret` de verdad, por el bus, contra el demonio de verdad.
+    ///
+    /// La prueba de `acceso_permitido` comprobaría una función; ésta comprueba el
+    /// método. La diferencia importa porque lo que estaba roto no era la regla,
+    /// era que `GetSecret` no la llamaba —y una función correcta que nadie invoca
+    /// deja el agujero abierto con la suite en verde—.
+    ///
+    /// El cliente es el proceso de la prueba, y su ejecutable no es
+    /// `/usr/bin/vasak-accounts-sync`, así que es exactamente el caso que tiene
+    /// que ser negativo.
+    #[tokio::test]
+    async fn leer_un_secreto_protegido_por_dbus_no_se_le_concede() {
+        // El mutex va primero: la contraseña maestra y el estado de la sesion son
+        // del proceso entero, y una prueba que corra en paralelo las pisa.
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let (demonio, cliente) = llavero_con_item_protegido().await;
+        let _demonio = demonio;
+        let sesion = OwnedObjectPath::try_from(SESION).unwrap();
+
+        let error = llamar(&cliente, ITEM, IFACE_ITEM, "GetSecret", &(&sesion,))
+            .await
+            .expect_err(
+                "un item protegido no se le entrega a un proceso que no es el sincronizador",
+            );
+
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.DBus.Error.AccessDenied",
+            "y se dice con el nombre del estándar, no con un fallo genérico"
+        );
+    }
+
+    /// Lo que el control **no** puede hacer, comprobado por el mismo camino.
+    ///
+    /// El ítem de al lado no está protegido y se tiene que leer igual. Si el
+    /// filtro fuera «todo ítem del login» o «toda consulta de este cliente»,
+    /// esta prueba lo diría —y el síntoma del otro lado sería que ningún programa
+    /// del escritorio pudiera volver a guardar una contraseña—.
+    #[tokio::test]
+    async fn el_control_no_toca_los_items_sin_proteger() {
+        // El mutex va primero: la contraseña maestra y el estado de la sesion son
+        // del proceso entero, y una prueba que corra en paralelo las pisa.
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let (demonio, cliente) = llavero_con_item_protegido().await;
+        let _demonio = demonio;
+        let sesion = OwnedObjectPath::try_from(SESION).unwrap();
+
+        llamar(&cliente, ITEM_COMUN, IFACE_ITEM, "GetSecret", &(&sesion,))
+            .await
+            .expect("un item sin proteger se sigue leyendo: el control es por item");
+    }
+
+    /// `GetSecrets` con una lista mezclada devuelve la parte que sí se puede leer
+    /// y omite la protegida, en vez de un mapa vacío o de cortar la llamada.
+    ///
+    /// El motivo de que sea el mapa parcial y no un error es que es el contrato
+    /// que ya tiene: las colecciones bloqueadas hacen exactamente esto desde
+    /// siempre, y `GetSecrets` es lo que usan las aplicaciones que guardan varios
+    /// secretos juntos. Si pasara a error, un solo ítem protegido en la lista
+    /// rompería a todos los clientes de una vez.
+    #[tokio::test]
+    async fn get_secrets_omite_el_protegido_y_sigue_devolviendo_el_resto() {
+        // El mutex va primero: la contraseña maestra y el estado de la sesion son
+        // del proceso entero, y una prueba que corra en paralelo las pisa.
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let (demonio, cliente) = llavero_con_item_protegido().await;
+        let _demonio = demonio;
+        let sesion = OwnedObjectPath::try_from(SESION).unwrap();
+        let pedidos = vec![
+            OwnedObjectPath::try_from(ITEM).unwrap(),
+            OwnedObjectPath::try_from(ITEM_COMUN).unwrap(),
+        ];
+
+        let respuesta = llamar(
+            &cliente,
+            SERVICIO,
+            IFACE_SERVICIO,
+            "GetSecrets",
+            &(&pedidos, &sesion),
+        )
+        .await
+        .expect("una lista con un item protegido se responde con la parte legible");
+        let mapa: HashMap<OwnedObjectPath, SecretStruct> =
+            respuesta.body().deserialize().expect("respuesta");
+
+        assert!(
+            !mapa.contains_key(&OwnedObjectPath::try_from(ITEM).unwrap()),
+            "el item protegido no puede aparecer en el mapa"
+        );
+        assert!(
+            mapa.contains_key(&OwnedObjectPath::try_from(ITEM_COMUN).unwrap()),
+            "el item sin proteger sí tiene que estar: `GetSecrets` devuelve la parte que puede"
+        );
+    }
+
+    /// El ejecutable se compara por la ruta entera, no por el nombre ni por un
+    /// prefijo.
+    ///
+    /// Con un `starts_with`, `/usr/bin/vasak-accounts-sync.malicioso` pasaba por
+    /// el sincronizador. Con un `ends_with` o una comparación contra el nombre
+    /// pelado, alcanzaba con un binario con el mismo nombre en otro directorio.
+    /// Esta prueba llama a la comparación real —no a las constantes— justamente
+    /// porque una versión anterior suya comparaba `EJECUTABLE_AUTORIZADO` contra
+    /// sí mismo y daba verde aunque el código usara `starts_with`.
+    #[test]
+    fn un_ejecutable_que_solo_se_parece_al_autorizado_no_lo_es() {
+        let parecidos = [
+            "/usr/bin/vasak-accounts-sync.malicioso",
+            "/usr/bin/vasak-accounts-sync2",
+            "/usr/bin/vasak-accounts-syn",
+            "/tmp/vasak-accounts-sync",
+            "/usr/local/bin/vasak-accounts-sync",
+            "vasak-accounts-sync",
+            "",
+        ];
+
+        for ejecutable in parecidos {
+            assert!(
+                !es_el_autorizado(ejecutable),
+                "`{ejecutable}` no es el sincronizador y no puede pasar por él"
+            );
+        }
+    }
+
+    /// Y el otro lado, que es el que hace que el sistema ande: el binario real
+    /// tiene que pasar, o el almacén cifrado se queda sin quien lo abra.
+    #[test]
+    fn el_ejecutable_del_sincronizador_es_autorizado() {
+        assert!(
+            es_el_autorizado(EJECUTABLE_AUTORIZADO),
+            "el sincronizador de cuentas tiene que poder leer el almacen"
+        );
+    }
+
+    /// El esquema protegido y el atributo que lo marca tienen que ser los mismos
+    /// que usa `vasak-accounts`, y no una copia aproximada.
+    ///
+    /// El llavero no importa `SCHEMA` de ningún lado: son dos números parejos que
+    /// hay que mantener iguales a mano. Si el sincronizador guardara con un
+    /// esquema distinto, esta comparación seguiría dando verde acá y la clave
+    /// seguiría saliendo para cualquiera. Lo que se puede comprobar sin la otra
+    /// mitad del sistema es que el valor sea el declarado.
+    #[test]
+    fn el_esquema_protegido_es_el_del_almacen_de_cuentas() {
+        assert_eq!(
+            ESQUEMA_PROTEGIDO, "ar.net.vasak.os.AccountsStore",
+            "este valor tiene que coincidir con store::key::SCHEMA de vasak-accounts"
+        );
+        assert_eq!(
+            ATRIBUTO_ESQUEMA, "xdg:schema",
+            "este es el atributo por el que se marca el esquema"
+        );
+    }
+
     #[test]
     fn the_database_hangs_off_the_data_directory() {
         assert_eq!(
@@ -2930,6 +3356,9 @@ mod tests {
     const IFACE_ITEM: &str = "org.freedesktop.Secret.Item";
     const IFACE_PROPIEDADES: &str = "org.freedesktop.DBus.Properties";
     const ITEM: &str = "/org/freedesktop/secrets/collection/login/items/0";
+    /// El ítem de la colección que no depende del control de acceso, en el
+    /// llavero de la prueba protegida.
+    const ITEM_COMUN: &str = "/org/freedesktop/secrets/collection/login/items/1";
     const SESION: &str = "/org/freedesktop/secrets/session/s0";
     const ESPERA: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -3022,6 +3451,105 @@ mod tests {
             )
             .await
             .expect("no se pudo publicar el ítem");
+
+        (demonio, cliente)
+    }
+
+    /// El mismo llavero de la prueba, con el ítem marcado como protegido.
+    ///
+    /// Va aparte de `llavero()` en vez de darle un parámetro: el caso normal y el
+    /// protegido se leen distinto de un vistazo, y un `llavero(true)` esconde
+    /// justo el dato que cada prueba viene a mirar. La segunda entrada es la que
+    /// no depende de este control, y está para comprobar que el filtro es por
+    /// ítem y no una negación general —si el control tapara el servicio entero,
+    /// las contraseñas de los navegadores se dejarían de guardar y ni una prueba
+    /// que mire sólo el ítem protegido lo notaría—.
+    async fn llavero_con_item_protegido() -> (zbus::Connection, zbus::Connection) {
+        let state = Arc::new(Mutex::new(KeyringState::new()));
+        {
+            let mut s = state.lock().await;
+            s.collections.insert(
+                COLECCION_DEL_LOGIN.to_string(),
+                CollectionInfo {
+                    label: "Default collection".into(),
+                    locked: false,
+                    items: vec![ITEM.to_string(), ITEM_COMUN.to_string()],
+                    created: 1700,
+                    modified: 1700,
+                },
+            );
+            s.aliases
+                .insert("default".into(), COLECCION_DEL_LOGIN.to_string());
+            s.items.insert(
+                ITEM.to_string(),
+                ItemInfo {
+                    label: "la clave del almacen".into(),
+                    attributes: HashMap::from([(
+                        ATRIBUTO_ESQUEMA.to_string(),
+                        ESQUEMA_PROTEGIDO.to_string(),
+                    )]),
+                    secret: b"la clave del almacen".to_vec(),
+                    content_type: "text/plain".into(),
+                    created: 1700,
+                    modified: 1700,
+                },
+            );
+            s.items.insert(
+                ITEM_COMUN.to_string(),
+                ItemInfo {
+                    label: "la del navegador".into(),
+                    attributes: HashMap::new(),
+                    secret: b"la contrasena del navegador".to_vec(),
+                    content_type: "text/plain".into(),
+                    created: 1700,
+                    modified: 1700,
+                },
+            );
+            s.sessions.insert(
+                SESION.to_string(),
+                SessionInfo {
+                    algorithm: "plain".into(),
+                    shared_key: None,
+                    created: 1700,
+                },
+            );
+        }
+
+        let (extremo_del_demonio, extremo_del_cliente) = tokio::net::UnixStream::pair().unwrap();
+        let demonio = zbus::connection::Builder::unix_stream(extremo_del_demonio)
+            .server(zbus::Guid::generate())
+            .unwrap()
+            .p2p()
+            .build();
+        let cliente = zbus::connection::Builder::unix_stream(extremo_del_cliente)
+            .p2p()
+            .build();
+        let (demonio, cliente) = tokio::join!(demonio, cliente);
+        let demonio = demonio.expect("no se pudo levantar el bus de la prueba");
+        let cliente = cliente.expect("no se pudo levantar el cliente de la prueba");
+
+        demonio
+            .object_server()
+            .at(
+                SERVICIO,
+                ServiceInterface::new(demonio.clone(), Arc::clone(&state)),
+            )
+            .await
+            .expect("no se pudo publicar el servicio");
+        for ruta in [ITEM, ITEM_COMUN] {
+            demonio
+                .object_server()
+                .at(
+                    ruta,
+                    ItemInterface {
+                        state: Arc::clone(&state),
+                        conn: demonio.clone(),
+                        path: ruta.to_string(),
+                    },
+                )
+                .await
+                .expect("no se pudo publicar el ítem");
+        }
 
         (demonio, cliente)
     }

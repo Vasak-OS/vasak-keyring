@@ -2,6 +2,24 @@
 
 Llavero nativo de VasakOS. Reemplazo de `gnome-keyring` con cifrado AES-256-GCM y derivación de clave Argon2id.
 
+## Qué no abre
+
+Como todo Secret Service estándar, este llavero entrega los secretos a
+cualquier proceso que corra como la persona. El cifrado protege **en reposo**:
+un disco robado, una copia de seguridad, la computadora de otra persona. No
+protege contra un programa que corre en la misma sesión.
+
+Para lo que sí hace falta una frontera —la clave del almacén cifrado de
+`vasak-accounts`— hay un control por ítem. Los ítems marcados con
+`xdg:schema = "ar.net.vasak.os.AccountsStore"` sólo se entregan a
+`/usr/bin/vasak-accounts-sync`, identificado por el ejecutable del proceso que
+pregunta y no por el nombre de la conexión, que es lo único que el llamador no
+puede firmar. A los demás les responde `org.freedesktop.DBus.Error.AccessDenied`.
+
+El control es **por ítem**: el resto de los secretos se sigue entregando
+normalmente, que es lo que necesitan el navegador, el cliente de correo y el
+resto del escritorio.
+
 ## Uso
 
 ```rust

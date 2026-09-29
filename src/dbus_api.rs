@@ -946,13 +946,25 @@ impl ItemInterface {
         #[zbus(header)] cabecera: zbus::message::Header<'_>,
         session: OwnedObjectPath,
     ) -> Result<(SecretStruct,), SecretError> {
-        // La identidad del emisor se resuelve **antes** del lock del estado.
-        // `GetConnectionUnixProcessID` es una ida y vuelta al bus, y hacerla con
-        // el lock tomado deja a todos los demás llamantes esperando a que un
-        // proceso ajeno conteste. Del estado sólo se copia antes qué ejecutable
-        // se espera, y el lock se suelta enseguida.
-        let esperado = self.state.lock().await.ejecutable_del_sincronizador();
-        let autorizado = autorizado_para_esquema_protegido(&self.conn, &cabecera, &esperado).await;
+        // La identidad del emisor se resuelve **antes** del lock del estado, y
+        // sólo si el ítem es del almacén. Son dos idas y vueltas al bus y una
+        // lectura de `/proc`: hacerlas con el lock tomado deja a todos los demás
+        // esperando a que un proceso ajeno conteste, y hacerlas para cualquier
+        // ítem le cobra eso —y una línea de «se rechaza» en el diario— a cada
+        // contraseña que lee el navegador.
+        //
+        // Entre las dos tomas del lock el ítem puede cambiar. Si pasa a ser
+        // protegido, `autorizado` quedó en `false` y se niega: falla cerrado.
+        let (protegido, esperado) = {
+            let state = self.state.lock().await;
+            let protegido = state
+                .items
+                .get(&self.path)
+                .is_some_and(es_esquema_protegido);
+            (protegido, state.ejecutable_del_sincronizador())
+        };
+        let autorizado =
+            protegido && autorizado_para_esquema_protegido(&self.conn, &cabecera, &esperado).await;
 
         let state = self.state.lock().await;
         // Never release a secret from a locked collection.
@@ -2092,11 +2104,22 @@ impl ServiceInterface {
         // Keyed by object path, not string: the spec declares `a{o(oayays)}`
         // and libsecret refuses the `a{s(oayays)}` a String key produces.
     ) -> Result<HashMap<OwnedObjectPath, SecretStruct>, zbus::fdo::Error> {
-        // Una sola vez por llamada, y antes del lock: el chequeo no depende del
-        // ítem —depende de quién pregunta—, así que preguntarlo adentro del
-        // `for` era una ida y vuelta al bus por cada ítem protegido de la lista.
-        let esperado = self.state.lock().await.ejecutable_del_sincronizador();
-        let autorizado = autorizado_para_esquema_protegido(&self.conn, &cabecera, &esperado).await;
+        // Una sola vez por llamada, antes del lock, y sólo si la lista tiene
+        // algún ítem del almacén: el chequeo no depende del ítem —depende de
+        // quién pregunta—, y para una lista de contraseñas comunes no hace falta.
+        // Ver `get_secret`.
+        let (alguno_protegido, esperado) = {
+            let state = self.state.lock().await;
+            let alguno = items.iter().any(|ip| {
+                state
+                    .items
+                    .get(ip.as_str())
+                    .is_some_and(es_esquema_protegido)
+            });
+            (alguno, state.ejecutable_del_sincronizador())
+        };
+        let autorizado = alguno_protegido
+            && autorizado_para_esquema_protegido(&self.conn, &cabecera, &esperado).await;
 
         let state = self.state.lock().await;
         let mut result = HashMap::new();
@@ -3764,8 +3787,13 @@ mod tests {
     /// Un `GetSecret` con el emisor que se le ponga en la cabecera. Ver
     /// [`test_bus::armar`] para por qué el emisor va a mano.
     fn peticion(emisor: Option<&str>) -> zbus::Message {
+        peticion_de(ITEM, emisor)
+    }
+
+    /// Lo mismo, para el ítem que se quiera.
+    fn peticion_de(item: &str, emisor: Option<&str>) -> zbus::Message {
         let sesion = OwnedObjectPath::try_from(SESION).expect("la sesión de la prueba");
-        test_bus::armar(ITEM, IFACE_ITEM, "GetSecret", emisor, &(&sesion,))
+        test_bus::armar(item, IFACE_ITEM, "GetSecret", emisor, &(&sesion,))
     }
 
     /// El llavero de la prueba con un bus falso detrás.
@@ -3822,7 +3850,16 @@ mod tests {
         /// Un `GetSecret` de punta a punta: entra por el bus, lo decide el
         /// demonio, y lo que se mira es el mensaje que volvió.
         async fn pedir_secreto(&self, emisor: Option<&str>) -> zbus::Result<zbus::Message> {
-            let peticion = peticion(emisor);
+            self.pedir_secreto_de(ITEM, emisor).await
+        }
+
+        /// Lo mismo, para el ítem que se quiera.
+        async fn pedir_secreto_de(
+            &self,
+            item: &str,
+            emisor: Option<&str>,
+        ) -> zbus::Result<zbus::Message> {
+            let peticion = peticion_de(item, emisor);
             let serial = peticion.header().primary().serial_num();
 
             let mut salientes = zbus::MessageStream::from(&self.cliente);
@@ -4117,6 +4154,101 @@ mod tests {
             !preguntados.is_empty() && preguntados.iter().all(|n| n == NOMBRE_DEL_SINCRONIZADOR),
             "en un `GetSecret` de verdad la puerta tiene que preguntar por \
              {NOMBRE_DEL_SINCRONIZADOR}, y preguntó por {preguntados:?}"
+        );
+    }
+
+    /// Una contraseña común se entrega sin preguntar nada del sincronizador.
+    ///
+    /// La puerta es sólo para los ítems del almacén. Correrla en cada lectura le
+    /// cobraba a cada contraseña del navegador dos idas y vueltas al bus, una
+    /// lectura de `/proc` y una línea de «se rechaza la lectura de un ítem del
+    /// almacén» en el diario, para un pedido que igual se entregaba. Lo marcó
+    /// CodeRabbit.
+    #[tokio::test]
+    async fn una_contrasena_comun_no_pasa_por_la_puerta_del_almacen() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let almacen = Almacen::nuevo(Some(DEL_SINCRONIZADOR), Some(pid_inexistente())).await;
+
+        let respuesta = almacen
+            .pedir_secreto_de(ITEM_COMUN, Some(DE_UN_IMPOSTOR))
+            .await
+            .expect("una contraseña común se le entrega a cualquier proceso de la sesión");
+        let (secreto,): (SecretStruct,) = respuesta
+            .body()
+            .deserialize()
+            .expect("la respuesta de `GetSecret` no se entiende");
+        assert!(secreto.value == b"la contrasena del navegador");
+
+        assert!(
+            almacen.preguntados().await.is_empty(),
+            "para un ítem que no es del almacén no hay que preguntarle al bus quién tiene \
+             {NOMBRE_DEL_SINCRONIZADOR}"
+        );
+    }
+
+    /// Lo mismo por `GetSecrets`: una lista de contraseñas comunes no pregunta
+    /// por el sincronizador, y una que incluye la clave del almacén sí.
+    #[tokio::test]
+    async fn get_secrets_consulta_la_puerta_solo_si_hay_un_item_del_almacen() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let almacen = Almacen::nuevo(Some(DEL_SINCRONIZADOR), Some(pid_inexistente())).await;
+        let sesion = OwnedObjectPath::try_from(SESION).expect("la sesión de la prueba");
+
+        let pedir = |items: Vec<&str>| {
+            let items: Vec<OwnedObjectPath> = items
+                .into_iter()
+                .map(|i| OwnedObjectPath::try_from(i).expect("ruta del ítem"))
+                .collect();
+            test_bus::armar(
+                SERVICIO,
+                IFACE_SERVICIO,
+                "GetSecrets",
+                Some(DE_UN_IMPOSTOR),
+                &(items, &sesion),
+            )
+        };
+
+        let mut salientes = zbus::MessageStream::from(&almacen.cliente);
+        let comunes = pedir(vec![ITEM_COMUN]);
+        let serial = comunes.header().primary().serial_num();
+        almacen
+            .cliente
+            .send(&comunes)
+            .await
+            .expect("mandar GetSecrets");
+        let respuesta = test_bus::primera_respuesta(&mut salientes, serial).await;
+        let secretos: HashMap<OwnedObjectPath, SecretStruct> = respuesta
+            .body()
+            .deserialize()
+            .expect("la respuesta de GetSecrets");
+        assert_eq!(secretos.len(), 1, "la contraseña común se entrega");
+        assert!(
+            almacen.preguntados().await.is_empty(),
+            "sin ítems del almacén en la lista no hay que preguntar por {NOMBRE_DEL_SINCRONIZADOR}"
+        );
+
+        let con_el_almacen = pedir(vec![ITEM_COMUN, ITEM]);
+        let serial = con_el_almacen.header().primary().serial_num();
+        almacen
+            .cliente
+            .send(&con_el_almacen)
+            .await
+            .expect("mandar GetSecrets");
+        let respuesta = test_bus::primera_respuesta(&mut salientes, serial).await;
+        let secretos: HashMap<OwnedObjectPath, SecretStruct> = respuesta
+            .body()
+            .deserialize()
+            .expect("la respuesta de GetSecrets");
+        assert_eq!(
+            secretos.len(),
+            1,
+            "a un impostor se le entrega la común y se le omite la del almacén"
+        );
+        assert!(
+            !almacen.preguntados().await.is_empty(),
+            "con un ítem del almacén en la lista la puerta se consulta"
         );
     }
 

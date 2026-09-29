@@ -421,11 +421,43 @@ async fn pid_del_emisor(conn: &Connection, cabecera: &zbus::message::Header<'_>)
 }
 
 /// Obtiene la ruta del ejecutable a partir del PID.
+/// La ruta del ejecutable de un proceso, sin el adorno de los borrados.
+///
+/// `readlink /proc/<pid>/exe` no devuelve la ruta del archivo: devuelve la del
+/// inodo que se está ejecutando, y si ese archivo ya no está —porque `pacman`
+/// lo desenlazó para instalar la versión nueva— le cuelga `" (deleted)"` al
+/// final. Comprobado sobre un binario borrado en caliente: `readlink` da
+/// `/tmp/x/miapp (deleted)`.
+///
+/// Sin quitarlo, una actualización del sistema con la unidad del sincronizador
+/// corriendo le negaría el acceso al proceso **legítimo** en cada `GetSecret`
+/// hasta que se reinicie la unidad, y el síntoma —«el almacén de cuentas se
+/// rompió después de actualizar»— no lleva a ninguna parte. Falla cerrado, que
+/// es lo correcto; lo que no es correcto es que falle.
+///
+/// El sufijo se quita y no se recorta: la comparación de abajo sigue siendo
+/// exacta contra la ruta entera, así que quitarlo no abre la puerta a que un
+/// `/usr/bin/vasak-accounts-sync.malicioso` passe por el sincronizador.
 fn ejecutable_de(pid: u32) -> Option<String> {
     std::fs::read_link(format!("/proc/{pid}/exe"))
         .ok()
         .map(|r| r.to_string_lossy().into_owned())
+        .map(|r| sin_adorno_de_borrado(&r).to_string())
 }
+
+/// Saca el `" (deleted)"` que el kernel le cuelga a un inodo sin archivo.
+///
+/// Va aparte de `ejecutable_de` por la misma razón que `es_el_autorizado` va
+/// aparte de `autorizado_para_esquema_protegido`: la regla se prueba sola, sin
+/// un proceso que haya que arrancar ni un `/proc` que haya que existido. Que la
+/// cadena con el adorno llegue como llega, eso lo comprueba la otra prueba, que
+/// sí arranca un proceso de verdad.
+fn sin_adorno_de_borrado(ruta: &str) -> &str {
+    ruta.strip_suffix(SUFIJO_DE_BORRADO).unwrap_or(ruta)
+}
+
+/// Lo que le cuelga el kernel a la ruta de un inodo que ya no tiene archivo.
+const SUFIJO_DE_BORRADO: &str = " (deleted)";
 
 /// Verifica si un ítem tiene un esquema protegido.
 fn es_esquema_protegido(item: &ItemInfo) -> bool {
@@ -2425,6 +2457,7 @@ async fn buscar_secreto(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     /// Un directorio propio para cada prueba, que se borra al terminar.
@@ -3284,6 +3317,182 @@ mod tests {
             es_el_autorizado(EJECUTABLE_AUTORIZADO),
             "el sincronizador de cuentas tiene que poder leer el almacen"
         );
+    }
+
+    /// El binario que la puerta exige tiene que ser el que la máquina realmente
+    /// tiene.
+    ///
+    /// Sin esto, cambiar el nombre o el lugar del binario rompe el control en
+    /// silencio: el almacen deja de abrirse y no hay ningun error en ningun lado,
+    /// porque lo que falla es una negacion —que es exactamente la clase de
+    /// fallo que no se ve. El sintoma es «el almacen de cuentas se rompio» y
+    /// nada mas. Lo mismo que ya hace `portal_secret` con su ejecutable, y por
+    /// el mismo motivo.
+    ///
+    /// Sin el binario instalado en ninguna parte —el caso del runner del CI, que
+    /// no es una maquina de VasakOS— no hay nada que comparar y se dice.
+    #[test]
+    fn el_sincronizador_instalado_esta_donde_la_puerta_lo_busca() {
+        let rutas = rutas_del_sincronizador_instaladas();
+        if rutas.is_empty() {
+            println!(
+                "se salta: en esta máquina no hay vasak-accounts-sync, así que no hay \
+                 ejecutable real contra el que comparar"
+            );
+            return;
+        }
+
+        // Que alguna coincida y no que todas: lo que importa es que la puerta
+        // deje entrar al sincronizador de verdad, no que rechace a un segundo
+        // binario igual que alguien tenga instalado al lado.
+        let aceptadas: Vec<&PathBuf> = rutas
+            .iter()
+            .filter(|ruta| es_el_autorizado(ruta.to_str().unwrap_or_default()))
+            .collect();
+
+        assert!(
+            !aceptadas.is_empty(),
+            "la puerta sólo acepta a {EJECUTABLE_AUTORIZADO} y el sincronizador de esta máquina \
+             está en {rutas:?}: hay que cambiar EJECUTABLE_AUTORIZADO, o el almacen de cuentas \
+             no se va a poder abrir nunca y no va a haber ningún error que lo diga"
+        );
+    }
+
+    /// Dónde puede estar un `vasak-accounts-sync` instalado.
+    ///
+    /// **Se busca en todos los lugares donde un paquete lo pondría, no sólo en el
+    /// que dice la constante.** Una versión anterior de la prueba de arriba
+    /// miraba `Path::new(EJECUTABLE_AUTORIZADO).is_file()` y se saltaba si no
+    /// estaba: con la constante desactualizada no encuentra nada ahí, se salta,
+    /// y da verde —que es el mismo salto que casi se lleva por delante la del
+    /// portal—. Buscar el binario de verdad y compararlo es lo único que
+    /// detecta una mudanza.
+    ///
+    /// Las rutas vuelven **resueltas**, sin enlaces, porque lo que se compara en
+    /// producción es `/proc/<pid>/exe`, que es el ejecutable real.
+    fn rutas_del_sincronizador_instaladas() -> BTreeSet<PathBuf> {
+        const NOMBRE: &str = "vasak-accounts-sync";
+
+        let mut candidatas = vec![PathBuf::from(EJECUTABLE_AUTORIZADO)];
+        if let Some(path) = std::env::var_os("PATH") {
+            candidatas.extend(std::env::split_paths(&path).map(|dir| dir.join(NOMBRE)));
+        }
+        candidatas.extend(
+            [
+                "/usr/bin",
+                "/usr/lib",
+                "/usr/libexec",
+                "/usr/local/bin",
+                "/usr/local/libexec",
+            ]
+            .into_iter()
+            .map(|dir| PathBuf::from(dir).join(NOMBRE)),
+        );
+
+        candidatas
+            .into_iter()
+            .filter(|candidata| candidata.is_file())
+            .filter_map(|candidata| candidata.canonicalize().ok())
+            .collect()
+    }
+
+    /// Lo que el kernel le cuelga a un binario que se actualizó con el proceso
+    /// corriendo no puede hacer que la puerta le cierre al proceso legítimo.
+    ///
+    /// Es el fallo que motivó `SUFIJO_DE_BORRADO`: con `pacman -Syu` y la unidad
+    /// del sincronizador viva, el inodo viejo sigue ejecutándose y `readlink`
+    /// devuelve la ruta con `" (deleted)"` pegado. La comparación exacta daba
+    /// `false`, y el proceso que sí tenía derecho se quedaba sin almacen.
+    ///
+    /// La prueba arma el caso de verdad —copia un binario, lo borra mientras
+    /// corre— en vez de escribir la cadena a mano, porque lo que se comprueba es
+    /// que el kernel la ponga así. Si algún día `/usr/bin/sleep` no estuviera
+    /// donde se espera, se dice y se salta en vez de dar un falso verde.
+    #[tokio::test]
+    async fn un_binario_borrado_en_caliente_sigue_siendo_reconocido() {
+        let dir = DirDePrueba::nuevo("borrado-en-caliente");
+        let ruta = dir.ruta().join("sincronizador-de-prueba");
+        if std::fs::copy("/usr/bin/sleep", &ruta).is_err() {
+            println!("se salta: no hay un binario que copiar en esta máquina");
+            return;
+        }
+
+        let mut hijo = tokio::process::Command::new(&ruta)
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("no se pudo arrancar el binario de prueba");
+        let pid = hijo.id().expect("el proceso no tiene pid");
+
+        // El archivo tiene que estar ahí *mientras corre*, que es el estado en
+        // que lo pone un `pacman -Syu`.
+        let con_archivo = ejecutable_de(pid).expect("el proceso tiene que estar corriendo");
+        assert!(
+            con_archivo.ends_with("sincronizador-de-prueba"),
+            "la ruta tiene que ser la del archivo que se arrancó, no {con_archivo}"
+        );
+
+        std::fs::remove_file(&ruta).expect("no se pudo borrar el binario en caliente");
+
+        // Y ahora la puerta tiene que dejarlo entrar igual. El nombre de la
+        // ruta es el del archivo más el adorno del kernel.
+        let sin_archivo = ejecutable_de(pid).expect("el proceso sigue corriendo");
+        assert_eq!(
+            sin_archivo, con_archivo,
+            "con el archivo borrado en caliente la ruta tiene que seguir siendo la misma, \
+             no {:?} — si cambia, `ejecutable_de` tiene que estar sacando otra cosa y esta \
+             prueba no está probando lo que dice",
+            sin_archivo
+        );
+        let _ = hijo.kill().await;
+    }
+
+    /// Y la comparación de la puerta, sobre esa misma ruta, tiene que dar lo
+    /// mismo antes y después del adorno.
+    ///
+    /// El reparto importa: el adorno se saca en `ejecutable_de`, no en
+    /// `es_el_autorizado`. Por eso esta prueba compone las dos como lo hace el
+    /// camino real —limpiar y después comparar— en vez de pasarle la ruta con
+    /// el adorno a la puerta: si el adorno se sacara en el lugar equivocado, esta
+    /// forma de probarlo no se enteraría.
+    #[test]
+    fn el_adorno_de_borrado_no_altera_la_comparacion_de_la_puerta() {
+        let con_adorno = format!("{EJECUTABLE_AUTORIZADO}{SUFIJO_DE_BORRADO}");
+
+        assert!(
+            es_el_autorizado(sin_adorno_de_borrado(&con_adorno)),
+            "una actualización del sistema no le puede cerrar el almacen al sincronizador \
+             legítimo: `pacman` borra el archivo mientras el proceso sigue corriendo, y el \
+             kernel cuelga el adorno a la ruta"
+        );
+        // Y quitar el adorno no abre la puerta de al lado: la comparación sigue
+        // siendo exacta contra la ruta entera, que es lo que impide que un
+        // `...-sync.malicioso` pase por el sincronizador.
+        assert!(
+            !es_el_autorizado(sin_adorno_de_borrado(&format!(
+                "{EJECUTABLE_AUTORIZADO}.malicioso{SUFIJO_DE_BORRADO}"
+            ))),
+            "quitar el adorno no puede convertir un nombre parecido en el sincronizador"
+        );
+    }
+
+    /// Y una ruta que no tiene el adorno sale igual, porque si no, el `unwrap_or`
+    /// del medio estaría devolviendo algo distinto de lo que entró.
+    #[test]
+    fn una_ruta_sin_el_adorno_sale_igual_que_entra() {
+        for ruta in ["/usr/bin/vasak-accounts-sync", "/usr/bin/otro", ""] {
+            assert_eq!(sin_adorno_de_borrado(ruta), ruta, "no había nada que sacar");
+        }
+    }
+
+    /// Una ruta que es **sólo** el adorno se queda vacía, y eso es lo correcto:
+    /// el kernel no devuelve nunca una cosa así, y un `unwrap_or(ruta)` que
+    /// devolviera la ruta entera haría que `es_el_autorizado` comparara contra
+    /// `" (deleted)"` —que no es el sincronizador, así que no abriría nada—.
+    /// Se anota para que el cambio de `unwrap_or` a otra cosa se piense.
+    #[test]
+    fn una_ruta_que_es_solo_el_adorno_queda_vacia() {
+        assert_eq!(sin_adorno_de_borrado(SUFIJO_DE_BORRADO), "");
     }
 
     /// El esquema protegido y el atributo que lo marca tienen que ser los mismos

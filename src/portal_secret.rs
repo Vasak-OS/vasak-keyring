@@ -33,11 +33,10 @@
 //!
 //! Por eso dos cosas:
 //!
-//! 1. Se comprueba que quien llama **sea** el portal. Se lo pregunta el bus, que
-//!    es la única fuente de verdad: la conexión del pedido tiene que ser la que
-//!    tiene tomado `org.freedesktop.portal.Desktop`. Antes se preguntaba por el
-//!    ejecutable del pid, y eso dejó de poder contestarse —ver
-//!    [`deja_pasar`]—, que es lo que dejó al backend sin darle secreto a nadie.
+//! 1. Se comprueba que quien llama **sea** el portal, con dos condiciones que
+//!    hacen falta juntas: la conexión del pedido tiene que ser la que tiene
+//!    tomado `org.freedesktop.portal.Desktop`, y el ejecutable de su pid tiene
+//!    que ser el del portal. Ver [`deja_pasar`].
 //! 2. Va en una **conexión propia** al bus, aparte de la que sirve el Secret
 //!    Service. Con las dos en la misma conexión, un permiso de sandbox concedido
 //!    sobre `org.freedesktop.secrets` alcanzaría para hablar con este backend: el
@@ -66,33 +65,40 @@ const RESPUESTA_FALLO: u32 = 2;
 
 /// El nombre que xdg-desktop-portal toma en el bus de la sesión.
 ///
-/// La fuente de verdad de «¿es el portal?». Mientras el portal esté andando lo
-/// tiene tomado, y un `RequestName` de cualquiera que no sea él vuelve con
-/// `org.freedesktop.DBus.Error.NameExists`: eso es lo que hace la prueba
-/// imposible de suplantar desde la sesión. Lo que sí puede es tomar el nombre
-/// **después** de que el portal muera, y para entonces no queda a quién
-/// engañar: sin portal no hay pedidos que darle la vuelta.
+/// Una de las dos condiciones de [`deja_pasar`], y **no alcanza sola**. Mientras
+/// el portal esté andando lo tiene tomado y un `RequestName` de otro vuelve con
+/// `NameExists`, pero un nombre lo puede tomar cualquiera que llegue primero:
+/// antes de que el portal arranque, o después de que muera. Ese proceso podría
+/// pedir `RetrieveSecret` con el `app_id` de cualquier aplicación. Por eso el
+/// ejecutable también se exige.
 const NOMBRE_DEL_PORTAL: &str = "org.freedesktop.portal.Desktop";
 
-/// El ejecutable que refuerza que quien llama es el portal.
-///
-/// Antes era la única condición, y sola no podía ser: `/proc/<pid>/exe` de un
-/// proceso de la sesión da `EACCES` desde adentro del namespace de usuario en que
-/// corre la unidad —lo crea cualquiera de `PrivateTmp`, `ProtectSystem`,
-/// `PrivateDevices`, `ProtectHostname` o `ProtectClock`, y no se elige cuál—,
-/// y la lectura se tragaba el error con `.ok()`. El backend rechazaba entonces al
-/// portal de verdad y sin dejar rastro.
+/// El ejecutable del portal, la otra condición de [`deja_pasar`].
 ///
 /// La ruta está en `/usr/lib`, donde escribir requiere root, así que ningún
-/// programa del usuario puede hacerse pasar por él.
+/// programa del usuario puede hacerse pasar por él, y `/proc/<pid>/exe` lo da
+/// el núcleo, no quien llama.
+///
+/// Para poder leerlo, la unidad no puede tener un namespace de usuario propio:
+/// cualquiera de `PrivateTmp`, `ProtectSystem`, `PrivateDevices`,
+/// `ProtectHostname` o `ProtectClock` —entre otras— se lo crea, y desde adentro
+/// `/proc/<pid>/exe` de la sesión da `EACCES`. Así estuvo desde el 3/09: la
+/// lectura se tragaba el error con `.ok()` y el backend rechazaba al portal de
+/// verdad sin dejar rastro. Esas opciones salieron de `vasak-keyring.service`, y
+/// `la_unidad_deja_leer_quien_pide` falla si vuelven.
 const EJECUTABLE_DEL_PORTAL: &str = "/usr/lib/xdg-desktop-portal";
 
 /// Si el ejecutable es el del portal.
 ///
-/// `None` es «no se pudo saber», no «sí». Por eso la decisión de dejar pasar
-/// no es la de acá sino la de [`deja_pasar`], que sabe qué hacer con ese `None`.
+/// `None` es «no se pudo saber», y lo que no se sabe no es un sí.
 pub fn es_el_portal(ejecutable: Option<&str>) -> bool {
-    ejecutable == Some(EJECUTABLE_DEL_PORTAL)
+    es_el_ejecutable(ejecutable, EJECUTABLE_DEL_PORTAL)
+}
+
+/// Si `ejecutable` es exactamente `esperado`. Igualdad y no `starts_with`: un
+/// `/usr/lib/xdg-desktop-portal-falso` no es el portal.
+fn es_el_ejecutable(ejecutable: Option<&str>, esperado: &str) -> bool {
+    ejecutable == Some(esperado)
 }
 
 /// Si la conexión que llama es la del portal.
@@ -106,25 +112,34 @@ pub fn es_del_portal(emisor: &str, duenia: Option<&str>) -> bool {
 
 /// La puerta, entera y sin bus.
 ///
-/// Son dos condiciones, y la segunda depende de si el ejecutable se pudo leer:
+/// Son dos condiciones y hacen falta las dos:
 ///
-/// 1. La conexión que llama tiene que ser la del portal. La contesta el bus, que
-///    sí responde desde adentro del namespace de usuario de la unidad.
-/// 2. Si el ejecutable de su pid se pudo leer, tiene que ser el del portal. Un
-///    `None` acá no es un no: con la unidad aislada es lo de todos los pedidos, no
-///    la excepción, y en ese caso decide la primera.
+/// 1. La conexión que llama tiene que ser la dueña del nombre del portal. La
+///    contesta el bus.
+/// 2. El ejecutable del pid de esa conexión tiene que ser `esperado`. Un `None`
+///    —no se pudo leer— es un no: el nombre solo lo puede tener cualquiera que
+///    haya llegado primero, y el ejecutable es lo que no se puede fingir.
 ///
-/// Que la segunda no baste por sí sola es justamente lo que la distingue de la
-/// puerta anterior, que era la única y por eso no dejaba pasar a nadie.
-pub fn deja_pasar(emisor: &str, duenia: Option<&str>, ejecutable: Option<&str>) -> bool {
-    es_del_portal(emisor, duenia) && ejecutable.is_none_or(|ruta| es_el_portal(Some(ruta)))
+/// `esperado` es [`EJECUTABLE_DEL_PORTAL`] en producción. Va de parámetro para
+/// que las pruebas puedan recorrer el camino que acepta con un ejecutable que
+/// existe en la máquina que las corre.
+pub fn deja_pasar(
+    emisor: &str,
+    duenia: Option<&str>,
+    ejecutable: Option<&str>,
+    esperado: &str,
+) -> bool {
+    es_del_portal(emisor, duenia) && es_el_ejecutable(ejecutable, esperado)
 }
 
 /// Quién tiene un nombre en el bus, o `None` si nadie lo tiene.
 ///
 /// `GetNameOwner` contesta con un error cuando el nombre no lo tiene nadie, y
 /// eso no es una pregunta que salió mal: es la respuesta.
-pub(crate) async fn dueno_de(conn: &zbus::Connection, nombre: &str) -> Result<Option<String>, zbus::Error> {
+pub(crate) async fn dueno_de(
+    conn: &zbus::Connection,
+    nombre: &str,
+) -> Result<Option<String>, zbus::Error> {
     const SIN_DUENO: &str = "org.freedesktop.DBus.Error.NameHasNoOwner";
 
     match conn
@@ -145,10 +160,9 @@ pub(crate) async fn dueno_de(conn: &zbus::Connection, nombre: &str) -> Result<Op
 
 /// El ejecutable del pid que el bus asocia a una conexión.
 ///
-/// Va aparte de la puerta porque casi siempre **no se puede saber**, y cuando no
-/// se puede hay que decirlo: el `Err` es el motivo, y suele ser `EACCES` del
-/// namespace de usuario de la unidad. Tragar el error con `.ok()` es lo que
-/// dejó al portal afuera sin que se viera.
+/// Cuando no se puede saber hay que decirlo: el `Err` es el motivo. Tragar el
+/// error con `.ok()` es lo que dejó al portal afuera sin que se viera, cuando la
+/// unidad tenía un namespace de usuario propio y la lectura daba `EACCES`.
 async fn ejecutable_de(conn: &zbus::Connection, emisor: &str) -> Result<String, String> {
     let pid: u32 = conn
         .call_method(
@@ -170,25 +184,39 @@ async fn ejecutable_de(conn: &zbus::Connection, emisor: &str) -> Result<String, 
 pub struct SecretBackend {
     state: Arc<Mutex<KeyringState>>,
     conn: zbus::Connection,
+    /// El ejecutable que tiene que tener quien llama. Siempre
+    /// [`EJECUTABLE_DEL_PORTAL`] fuera de las pruebas.
+    ejecutable_esperado: String,
 }
 
 impl SecretBackend {
     pub fn new(state: Arc<Mutex<KeyringState>>, conn: zbus::Connection) -> Self {
-        Self { state, conn }
+        Self {
+            state,
+            conn,
+            ejecutable_esperado: EJECUTABLE_DEL_PORTAL.to_owned(),
+        }
+    }
+
+    /// El mismo backend, pero reconociendo como portal a otro ejecutable. Sólo
+    /// para las pruebas, que no tienen un xdg-desktop-portal de verdad al otro
+    /// lado del bus.
+    #[cfg(test)]
+    fn reconociendo(mut self, ejecutable: &str) -> Self {
+        self.ejecutable_esperado = ejecutable.to_owned();
+        self
     }
 }
 
 impl SecretBackend {
     /// Si el mensaje viene de la conexión del portal.
     ///
-    /// La pregunta se la hace al bus, que contesta desde adentro del namespace de
-    /// usuario de la unidad. El ejecutable del pid se mira después, y sólo de
-    /// refuerzo: se deja constancia cuando no se puede leer, porque es lo que pasa
-    /// siempre y antes era la única condición, con el error tragado y sin rastro.
+    /// Le pregunta al bus quién tiene el nombre del portal y lee el ejecutable
+    /// del pid del emisor; ver [`deja_pasar`].
     ///
     /// Cada negativa dice su motivo. Antes todas decían lo mismo —«no viene del
     /// portal»—, que era cierto y no servía para nada: no distinguía un impostor
-    /// de un `/proc` que no se deja leer, que es el caso real.
+    /// de un `/proc` que no se deja leer, que fue el caso real.
     async fn llama_el_portal(&self, cabecera: &zbus::message::Header<'_>) -> bool {
         let emisor = match cabecera.sender() {
             Some(emisor) => emisor.as_str().to_owned(),
@@ -213,21 +241,25 @@ impl SecretBackend {
         };
 
         let ejecutable = match ejecutable_de(&self.conn, &emisor).await {
-            Ok(ejecutable) => Some(ejecutable),
+            Ok(ejecutable) => ejecutable,
             Err(motivo) => {
-                // No es un no. Queda anotado igual, porque es el caso de todos los
-                // pedidos con la unidad aislada y es lo primero que hay que ver si
-                // la puerta vuelve a rechazar a alguien.
+                // Sin ejecutable no hay puerta: el nombre solo no alcanza. Si esto
+                // aparece con el portal de verdad, lo primero es mirar si la unidad
+                // volvió a tener un namespace de usuario propio.
                 eprintln!(
-                    "vasak-keyring: de {emisor} no se pudo saber el ejecutable: {motivo}. La \
-                     puerta queda con la comparación del nombre solamente, que es lo que \
-                     corresponde: con la unidad aislada, /proc/<pid>/exe de la sesión no se deja leer"
+                    "vasak-keyring: se rechaza un pedido de secreto de {emisor}: no se pudo \
+                     saber su ejecutable ({motivo}), y sin él el nombre no alcanza"
                 );
-                None
+                return false;
             }
         };
 
-        if deja_pasar(&emisor, duenia.as_deref(), ejecutable.as_deref()) {
+        if deja_pasar(
+            &emisor,
+            duenia.as_deref(),
+            Some(&ejecutable),
+            &self.ejecutable_esperado,
+        ) {
             return true;
         }
 
@@ -245,8 +277,8 @@ impl SecretBackend {
         } else {
             eprintln!(
                 "vasak-keyring: se rechaza un pedido de secreto de {emisor}: tiene el nombre del \
-                 portal pero su ejecutable es {} y no {EJECUTABLE_DEL_PORTAL}",
-                ejecutable.unwrap_or_default()
+                 portal pero su ejecutable es {ejecutable} y no {}",
+                self.ejecutable_esperado
             );
         }
         false
@@ -362,18 +394,70 @@ mod tests {
         assert!(portal.contains("UseIn=Vasak;"), "UseIn tiene que ser Vasak");
     }
 
+    /// Que la unidad no se encierre en un namespace de usuario propio.
+    ///
+    /// Es lo que rompió las dos puertas del demonio desde el 3/09: en una unidad
+    /// de usuario, cada una de estas opciones hace que el gestor le cree un
+    /// namespace de usuario al servicio, y desde adentro `/proc/<pid>/exe` de la
+    /// sesión da `EACCES`. Sin ejecutable no pasa nadie —ni el portal ni el
+    /// sincronizador—, y ninguna prueba de la puerta lo ve, porque las pruebas
+    /// no corren dentro de la unidad. Comprobado una por una con
+    /// `systemd-run --user -p <opción> readlink /proc/<pid>/exe`.
+    ///
+    /// `ProtectProc` va en la lista por otro motivo: en una unidad de usuario no
+    /// hace nada, y si algún día hiciera, escondería justo esos `/proc/<pid>`.
+    #[test]
+    fn la_unidad_deja_leer_quien_pide() {
+        const ENCIERRAN: &[&str] = &[
+            "PrivateTmp",
+            "PrivateDevices",
+            "PrivateUsers",
+            "PrivateMounts",
+            "ProtectSystem",
+            "ProtectHome",
+            "ProtectHostname",
+            "ProtectClock",
+            "ProtectControlGroups",
+            "ProtectKernelLogs",
+            "ProtectKernelModules",
+            "ProtectKernelTunables",
+            "ProtectProc",
+        ];
+        let unidad = include_str!("../vasak-keyring.service");
+        let claves: Vec<&str> = unidad
+            .lines()
+            .map(str::trim)
+            .filter(|linea| !linea.starts_with('#') && !linea.starts_with(';'))
+            .filter_map(|linea| linea.split_once('=').map(|(clave, _)| clave.trim()))
+            .collect();
+
+        // El control: si el lector no viera nada, lo de abajo pasaría siempre.
+        assert!(
+            claves.contains(&"RestrictAddressFamilies"),
+            "la unidad se leyó mal: no aparece RestrictAddressFamilies, y está"
+        );
+
+        let puestas: Vec<&&str> = ENCIERRAN
+            .iter()
+            .filter(|opcion| claves.contains(opcion))
+            .collect();
+        assert!(
+            puestas.is_empty(),
+            "vasak-keyring.service tiene {puestas:?}: en una unidad de usuario le crean un \
+             namespace de usuario propio, /proc/<pid>/exe deja de leerse y las puertas del \
+             portal y del almacén no dejan pasar a nadie"
+        );
+    }
+
     /// Si el ejecutable es el del portal, y sólo el del portal.
     ///
-    /// Esto ya **no** es la puerta: es el refuerzo de la segunda condición de
-    /// [`deja_pasar`]. Si esta función desapareciera, la puerta seguiría
-    /// cerrando, porque la primera condición —que la conexión que llama tenga
-    /// tomado `org.freedesktop.portal.Desktop`— no se toca. Y es la que
-    /// comprueba lo que el nombre no alcanza: un nombre lo puede tomar, después
-    /// de morir quien lo tenía, cualquiera que llegue al `RequestName` primero.
+    /// Es la segunda condición de [`deja_pasar`], y la que comprueba lo que el
+    /// nombre no alcanza: un nombre lo puede tomar cualquiera que llegue al
+    /// `RequestName` primero, el ejecutable no.
     ///
-    /// Sigue siendo la que evita el agujero grande, el de pedir el secreto de
-    /// otra aplicación pasando su `app_id`: eso lo dice quien llama y el backend
-    /// no lo puede verificar. Nada de lo de arriba lo arregla por sí solo.
+    /// Es la que evita el agujero grande, el de pedir el secreto de otra
+    /// aplicación pasando su `app_id`: eso lo dice quien llama y el backend no lo
+    /// puede verificar, sólo puede verificar quién lo trae.
     #[test]
     fn solo_el_ejecutable_del_portal_puede_pedir() {
         assert!(es_el_portal(Some("/usr/lib/xdg-desktop-portal")));
@@ -386,20 +470,8 @@ mod tests {
         assert!(!es_el_portal(Some("/usr/bin/algo")));
     }
 
-    /// Lo que no se sabe no se convierte en permiso.
-    ///
-    /// `es_el_portal(None)` sigue dando `false`, y conviene que siga: la función
-    /// no puede afirmar que un ejecutable que no leyó es el del portal.
-    ///
-    /// Lo que cambia es lo que ese `false` significa. Antes el `None` era la
-    /// puerta entera —el `.ok()` se lo tragaba y el pedido moría ahí—, y por eso
-    /// decir «no» parecía lo prudente. Hoy es la segunda condición de
-    /// [`deja_pasar`], que con el nombre confirmado **entra igual**: con la
-    /// unidad aislada, `/proc/<pid>/exe` de la sesión no se puede leer, y eso es
-    /// lo de todos los pedidos y no la excepción.
-    ///
-    /// El hueco sigue cerrado, pero por la otra condición, y ésa no se abre desde
-    /// adentro: un `None` no es una puerta, es la falta de una comparación.
+    /// Lo que no se sabe no se convierte en permiso: la función no puede afirmar
+    /// que un ejecutable que no leyó es el del portal.
     #[test]
     fn sin_poder_saber_quien_llama_se_dice_que_no() {
         assert!(!es_el_portal(None));
@@ -513,48 +585,65 @@ mod tests {
         assert!(!es_del_portal(portal, None));
     }
 
-    /// El caso del bug: el portal de verdad, con su `/proc/<pid>/exe` ilegible.
-    ///
-    /// Es la situación de la unidad como está —`PrivateTmp`, `ProtectSystem`,
-    /// `PrivateDevices`, `ProtectHostname`, `ProtectClock` la encierran en un
-    /// namespace de usuario propio—, y la que hace que un `None` acá sea lo de
-    /// todos los pedidos y no la excepción. Antes esto daba `false` y el
-    /// backend no le daba el secreto a nadie, tampoco al portal.
+    /// Con el nombre y el ejecutable del portal, pasa.
     #[test]
-    fn el_portal_pasa_aunque_no_se_pueda_leer_su_ejecutable() {
-        let portal = ":1.42";
-
-        assert!(deja_pasar(portal, Some(portal), None));
-    }
-
-    /// Con el ejecutable legible, tiene que ser el del portal.
-    ///
-    /// La segunda condición no se afloja por lo anterior: sólo deja de decidir
-    /// cuando no hay nada que comparar. Si el ejecutable se pudo leer y no es el
-    /// del portal, el que tiene el nombre tampoco pasa.
-    #[test]
-    fn el_duenio_del_nombre_no_pasa_con_otro_ejecutable() {
+    fn el_portal_con_su_nombre_y_su_ejecutable_pasa() {
         let portal = ":1.42";
 
         assert!(deja_pasar(
             portal,
             Some(portal),
-            Some(EJECUTABLE_DEL_PORTAL)
+            Some(EJECUTABLE_DEL_PORTAL),
+            EJECUTABLE_DEL_PORTAL
         ));
-        assert!(!deja_pasar(portal, Some(portal), Some("/usr/bin/algo")));
+    }
+
+    /// El nombre solo no alcanza: sin ejecutable legible no pasa nadie, tampoco
+    /// quien tiene el nombre del portal.
+    ///
+    /// Es la decisión que separa esta puerta de la que tuvo este PR en su primera
+    /// versión, donde un `None` acá dejaba pasar. Un nombre lo toma cualquiera que
+    /// llegue primero; el ejecutable no se finge. Si esto falla con el portal de
+    /// verdad, el arreglo no es aflojar la puerta: es que la unidad dejó otra vez
+    /// de poder leer `/proc/<pid>/exe` (ver `la_unidad_deja_leer_quien_pide`).
+    #[test]
+    fn sin_ejecutable_no_pasa_ni_quien_tiene_el_nombre() {
+        let portal = ":1.42";
+
+        assert!(!deja_pasar(
+            portal,
+            Some(portal),
+            None,
+            EJECUTABLE_DEL_PORTAL
+        ));
+    }
+
+    /// Con el ejecutable legible, tiene que ser el del portal: el que tiene el
+    /// nombre y ejecuta otra cosa no pasa.
+    #[test]
+    fn el_duenio_del_nombre_no_pasa_con_otro_ejecutable() {
+        let portal = ":1.42";
+
+        assert!(!deja_pasar(
+            portal,
+            Some(portal),
+            Some("/usr/bin/algo"),
+            EJECUTABLE_DEL_PORTAL
+        ));
         // Un impostor con nombre parecido, que es la forma en que este chequeo se
         // rompe si se hace con `contains` o `starts_with`.
         assert!(!deja_pasar(
             portal,
             Some(portal),
-            Some("/usr/lib/xdg-desktop-portal-falso")
+            Some("/usr/lib/xdg-desktop-portal-falso"),
+            EJECUTABLE_DEL_PORTAL
         ));
     }
 
     /// El ejecutable del portal no alcanza: el nombre es lo que se exige.
     ///
     /// Al revés de los casos anteriores, y es el que importa para la seguridad:
-    /// un programa cualquiera que achieve a parecer el portal —con el nombre
+    /// un programa cualquiera que logre parecer el portal —con el nombre
     /// del portal, o con un ejecutable que se le parezca— no puede pedir el
     /// secreto de otra aplicación, porque el nombre del portal no lo tiene él.
     #[test]
@@ -563,17 +652,22 @@ mod tests {
 
         // Nombre del portal, ejecutable del portal, y no es el portal: el
         // impostor queda afuera igual.
+        let esperado = EJECUTABLE_DEL_PORTAL;
         assert!(!deja_pasar(
             impostor,
             Some(":1.42"),
-            Some(EJECUTABLE_DEL_PORTAL)
+            Some(EJECUTABLE_DEL_PORTAL),
+            esperado
         ));
-        // Y tampoco cuando su ejecutable tampoco se puede leer: sin nombre no
-        // hay caso en que se sepa algo de él.
-        assert!(!deja_pasar(impostor, Some(":1.42"), None));
+        assert!(!deja_pasar(impostor, Some(":1.42"), None, esperado));
         // El nombre no lo tiene nadie: no hay portal al que se lo hayan pedido.
-        assert!(!deja_pasar(impostor, None, Some(EJECUTABLE_DEL_PORTAL)));
-        assert!(!deja_pasar(impostor, None, None));
+        assert!(!deja_pasar(
+            impostor,
+            None,
+            Some(EJECUTABLE_DEL_PORTAL),
+            esperado
+        ));
+        assert!(!deja_pasar(impostor, None, None, esperado));
     }
 
     // ── La puerta, con un bus de verdad detrás ────────────────────────
@@ -583,11 +677,10 @@ mod tests {
     // `org.freedesktop.DBus` falso en la otra punta que contesta lo que el bus
     // de la sesión contestaría.
     //
-    // Es la capa que faltaba, porque lo que el arreglo volvió importante son
-    // dos cosas que antes no existían: preguntar al bus quién tiene
-    // `org.freedesktop.portal.Desktop`, y **no** leer el `Err` de
-    // `/proc/<pid>/exe` como un «no». Las dos viajan por el bus, y una función
-    // de Rust a la que se le pasa un `Option` no las prueba.
+    // Es la capa que faltaba, porque las dos condiciones salen del bus:
+    // preguntar quién tiene `org.freedesktop.portal.Desktop`, y leer el
+    // ejecutable del pid que el bus le atribuye al emisor. Una función de Rust
+    // a la que se le pasa un `Option` no prueba ninguna de las dos.
     //
     // El bus falso se publica en `/org/freedesktop/DBus`, que es adonde
     // pregunta el backend: si algún día el backend preguntara en otro lado,
@@ -705,6 +798,18 @@ mod tests {
             };
             escenario.calentar().await;
             escenario
+        }
+
+        /// La misma puerta, pero reconociendo como portal a `ejecutable`.
+        ///
+        /// Lo que hace falta para recorrer el camino que acepta: en la máquina
+        /// de las pruebas el pid legible es el del propio binario de pruebas, y
+        /// ése no es `/usr/lib/xdg-desktop-portal`.
+        fn reconociendo(self, ejecutable: &str) -> Self {
+            Self {
+                puerta: self.puerta.reconociendo(ejecutable),
+                ..self
+            }
         }
 
         /// Publica el backend en el bus, para poder llamarlo como lo llamaría
@@ -887,12 +992,10 @@ mod tests {
 
     /// Un pid que no existe, sin adivinar un número alto.
     ///
-    /// Lo que la unidad aislada produce no es un `ENOENT` sino un `EACCES`, y
-    /// sin namespaces no se puede provocar un `EACCES` de verdad sobre
-    /// `/proc/<pid>/exe`. Para la puerta es lo mismo: la lectura falla,
-    /// `ejecutable_de` devuelve `Err` y de ese `Err` sale el `None` con el que
-    /// `deja_pasar` tiene que decidir. Lo que cambia es el motivo, y la puerta
-    /// no lo mira.
+    /// Es la forma de que `/proc/<pid>/exe` no se pueda leer. Con la unidad en
+    /// un namespace de usuario el error era `EACCES` y no `ENOENT`, pero para
+    /// la puerta es lo mismo: la lectura falla y el pedido se rechaza. Lo que
+    /// cambia es el motivo, que queda en el registro.
     fn pid_inexistente() -> u32 {
         (1..)
             .map(|n| u32::MAX - n)
@@ -953,9 +1056,9 @@ mod tests {
     /// El ejecutable se busca por el pid que el bus le da al emisor, y cuando no
     /// se puede leer se dice por qué.
     ///
-    /// El `Err` importa: con la unidad aislada es lo que pasa con **todos** los
-    /// pedidos, y antes se lo tragaba con `.ok()`, así que el motivo —el que
-    /// sirve para entender por qué la puerta rechaza a alguien— desaparecía.
+    /// El `Err` importa: antes se lo tragaba con `.ok()`, y cuando la unidad
+    /// tuvo un namespace de usuario propio pasaba con **todos** los pedidos sin
+    /// que el motivo apareciera en ningún lado.
     #[tokio::test]
     async fn el_ejecutable_se_busca_por_el_pid_del_emisor() {
         let escenario = Escenario::nuevo(Some(":1.42"), std::process::id()).await;
@@ -986,35 +1089,45 @@ mod tests {
         );
     }
 
-    /// El caso del bug, con bus: el portal de verdad entra con su `/proc`
-    /// ilegible.
+    /// El caso del bug, con bus: el portal de verdad entra.
     ///
-    /// Es la situación de la unidad como está —`PrivateTmp`, `ProtectSystem`,
-    /// `PrivateDevices`, `ProtectHostname` y `ProtectClock` la encierran en un
-    /// namespace de usuario propio— y la que dejó al backend sin darle el
-    /// secreto a nadie: la puerta anterior era `es_el_portal(ejecutable)`, el
-    /// `None` del `.ok()` le llegaba como «no es el portal», y el pedido moría
-    /// ahí. La comparación del nombre dice que sí, el nombre lo tiene la misma
-    /// conexión que pregunta, y eso alcanza.
+    /// Con el nombre tomado por la misma conexión que pide, y su ejecutable
+    /// legible y siendo el esperado. Es lo que la puerta no dejaba pasar nunca
+    /// mientras la unidad tuvo un namespace de usuario propio.
     #[tokio::test]
-    async fn el_portal_de_verdad_entra_aunque_no_se_sepa_su_ejecutable() {
-        let escenario = Escenario::nuevo(Some(":1.42"), pid_inexistente()).await;
+    async fn el_portal_de_verdad_entra() {
+        let propio = std::fs::read_link("/proc/self/exe")
+            .expect("leer el ejecutable de uno mismo")
+            .to_string_lossy()
+            .into_owned();
+        let escenario = Escenario::nuevo(Some(":1.42"), std::process::id())
+            .await
+            .reconociendo(&propio);
 
         assert!(
             escenario.puerta_para(Some(":1.42")).await,
-            "el portal de verdad —el bus dice que :1.42 tiene {NOMBRE_DEL_PORTAL} y no se le puede \
-             leer el ejecutable— tiene que entrar: es lo que devuelve el error de /proc a «no se \
-             sé», y si vuelve a ser «no», el backend no le da el secreto a nadie y tampoco al portal"
+            "el bus dice que :1.42 tiene {NOMBRE_DEL_PORTAL} y su ejecutable es el esperado: \
+             tiene que entrar, o el backend no le da el secreto a nadie"
         );
     }
 
-    /// El refuerzo sigue siendo refuerzo: el nombre no tapa al ejecutable.
+    /// Sin ejecutable legible no entra, aunque tenga el nombre.
     ///
-    /// Cuando el ejecutable **se pudo** leer tiene que ser el del portal. No es
-    /// desconfianza del nombre —la confianza viene de que sea el broker el que
-    /// lo asigna, y no el pedido el que lo diga—, sino que un nombre lo puede
-    /// tomar después de morir quien lo tenía, y el ejecutable sigue diciendo si
-    /// quien pregunta es el portal o no.
+    /// Al revés de la primera versión de este arreglo, que dejaba pasar al dueño
+    /// del nombre cuando `/proc/<pid>/exe` no se podía leer. Ése es justo el caso
+    /// de quien tomó el nombre antes que el portal.
+    #[tokio::test]
+    async fn sin_ejecutable_legible_no_entra_ni_el_duenio_del_nombre() {
+        let escenario = Escenario::nuevo(Some(":1.42"), pid_inexistente()).await;
+
+        assert!(
+            !escenario.puerta_para(Some(":1.42")).await,
+            "no se puede leer el ejecutable de :1.42: tener {NOMBRE_DEL_PORTAL} solo no alcanza"
+        );
+    }
+
+    /// El nombre no tapa al ejecutable: cuando se lee y no es el del portal, no
+    /// entra.
     #[tokio::test]
     async fn el_nombre_no_tapa_un_ejecutable_que_no_es_el_del_portal() {
         // El pid es el de la propia prueba, así que el ejecutable se puede leer
@@ -1029,29 +1142,29 @@ mod tests {
         );
     }
 
-    /// Un impostor no entra, y lo que lo prueba es el caso que el arreglo abrió.
-    ///
-    /// El nombre es lo único que decide cuando el ejecutable no se puede leer, así
-    /// que la pregunta es si un `None` —el caso nuevo— se vuelve un «sí» para
-    /// cualquiera. No: sin el nombre del portal no hay caso, y el impostor queda
-    /// afuera con el ejecutable legible o no legible.
+    /// Un impostor sin el nombre del portal no entra, con el ejecutable legible o
+    /// no, y aunque su ejecutable sea el esperado.
     #[tokio::test]
     async fn un_impostor_no_entra_aunque_no_se_sepa_su_ejecutable() {
         // El impostor dice ser :1.99, y :1.99 no tiene el nombre del portal.
         let ilegible = Escenario::nuevo(Some(":1.42"), pid_inexistente()).await;
         assert!(
             !ilegible.puerta_para(Some(":1.99")).await,
-            "un pedido de :1.99 con :1.42 teniendo {NOMBRE_DEL_PORTAL} tiene que rechazarse: \
-             es el caso que un «no se sé el ejecutable» tratado como «dale» dejaría pasar"
+            "un pedido de :1.99 con :1.42 teniendo {NOMBRE_DEL_PORTAL} tiene que rechazarse"
         );
 
-        // Y con el ejecutable legible tampoco, que es el caso de siempre.
-        let legible = Escenario::nuevo(Some(":1.42"), std::process::id()).await;
+        // Con el ejecutable legible y siendo el que se espera, tampoco: el
+        // nombre lo tiene otro.
+        let propio = std::fs::read_link("/proc/self/exe")
+            .expect("leer el ejecutable de uno mismo")
+            .to_string_lossy()
+            .into_owned();
+        let legible = Escenario::nuevo(Some(":1.42"), std::process::id())
+            .await
+            .reconociendo(&propio);
         assert!(!legible.puerta_para(Some(":1.99")).await);
 
-        // Aunque el impostor sea quien tiene el nombre y el ejecutable no se
-        // pueda leer de nadie: sin nombre del portal del lado del emisor, no
-        // hay por dónde entrar.
+        // Y el que pide no es quien tiene el nombre.
         let otro = Escenario::nuevo(Some(":1.99"), pid_inexistente()).await;
         assert!(!otro.puerta_para(Some(":1.42")).await);
     }
@@ -1059,10 +1172,8 @@ mod tests {
     /// Sin emisor no hay a quién preguntarle, y sin nombre del portal no entra
     /// nadie: ni el propio emisor.
     ///
-    /// Cuando el nombre del portal no lo tiene nadie, `deja_pasar` no puede
-    /// encontrar un `emisor` al que se lo hayan tomado, así que el rechazo es
-    /// de todos, no sólo de los ajenos. Es lo que corresponde: sin portal no hay
-    /// pedidos que darle la vuelta.
+    /// Cuando el nombre del portal no lo tiene nadie, el rechazo es de todos, no
+    /// sólo de los ajenos: sin portal no hay pedidos que darle la vuelta.
     #[tokio::test]
     async fn sin_dueno_del_nombre_no_entra_nadie() {
         let escenario = Escenario::nuevo(None, pid_inexistente()).await;
@@ -1102,11 +1213,12 @@ mod tests {
              volvió {:?}",
             pedido.opciones
         );
+        // Sin nombrar cuántos bytes llegaron: el mensaje de una prueba también es
+        // un registro, y lo que habría llegado es un secreto.
         assert!(
             pedido.secreto.is_empty(),
-            "al descriptor de un pedido rechazado tiene que haberle llegado algo \
-             ({} bytes), y no el secreto de {APP_ID}",
-            pedido.secreto.len()
+            "al descriptor de un pedido rechazado no le puede llegar nada, y llegó algo: \
+             el backend le habría entregado el secreto de {APP_ID} a un proceso cualquiera"
         );
     }
 

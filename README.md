@@ -16,10 +16,16 @@ Para lo que sí hace falta una frontera —la clave del almacén cifrado de
 `org.freedesktop.DBus.Error.AccessDenied`.
 
 La identidad sale de `/proc/<pid>/exe`, del PID que el **demonio del bus**
-asoció a la conexión del remitente. No del nombre de la conexión, que se lo
-elige el llamador y por lo tanto no prueba nada. El PID tampoco lo manda el
-cliente: el demonio lo saca de `SO_PEERCRED` al autenticar, y ese vínculo queda
-fijado durante toda la vida de la conexión.
+asoció a la conexión del remitente. El PID no lo manda el cliente: el demonio lo
+saca de `SO_PEERCRED` al autenticar, y ese vínculo queda fijado durante toda la
+vida de la conexión.
+
+Además, la conexión que pide tiene que ser la dueña de
+`ar.net.vasak.os.AccountsSync` en el bus. Eso solo no prueba nada —un nombre
+lo toma cualquiera que llegue primero, y con el servicio `disabled` casi siempre
+está libre—, así que se exigen las dos cosas: el nombre y el ejecutable. El
+control del portal (`RetrieveSecret`) funciona igual, con
+`org.freedesktop.portal.Desktop` y `/usr/lib/xdg-desktop-portal`.
 
 Para leer `/proc/<pid>/exe` de otro proceso de la sesión, el demonio **no puede
 correr en un namespace de usuario propio**, y en una unidad de usuario de

@@ -690,53 +690,11 @@ mod tests {
     // estas pruebas se quedan esperando una respuesta que no llega y fallan
     // nombrando el caso, en vez de pasar en silencio.
 
-    const RUTA_BUS: &str = "/org/freedesktop/DBus";
     const IFACE_SECRET: &str = "org.freedesktop.impl.portal.Secret";
     const METODO: &str = "RetrieveSecret";
     const REQUERIMIENTO: &str = "/org/freedesktop/portal/desktop/request/s1";
     const APP_ID: &str = "org.example.Aplicacion";
-    const ESPERA: std::time::Duration = std::time::Duration::from_secs(10);
-    /// Cuánto se espera a que una conexión recién hecha conteste algo. Es el
-    /// tiempo de entre un mensaje y el siguiente, no el de una prueba: si una
-    /// pregunta de la prueba se pierde, el fallo lo tiene que decir la prueba.
-    const ESPERA_DE_ENTRADA: std::time::Duration = std::time::Duration::from_millis(500);
-
-    /// El bus mínimo que la puerta necesita: sólo las dos preguntas que hace.
-    ///
-    /// `preguntados` guarda por qué nombres se preguntó, porque el nombre es
-    /// la fuente de verdad de la puerta y una errata ahí no se ve: abriría la
-    /// puerta a quien tenga el nombre mal escrito y cerraría al de verdad.
-    struct BusFalso {
-        /// Quién contesta tener el nombre del portal. `None` es el
-        /// `NameHasNoOwner` de verdad, no una respuesta que no llega.
-        duenia: Option<String>,
-        /// El pid que el bus le atribuye a la conexión del emisor.
-        pid: u32,
-        preguntados: Arc<Mutex<Vec<String>>>,
-    }
-
-    #[interface(name = "org.freedesktop.DBus")]
-    impl BusFalso {
-        #[zbus(name = "GetNameOwner")]
-        async fn duenia_de(&self, nombre: &str) -> Result<String, zbus::fdo::Error> {
-            self.preguntados.lock().await.push(nombre.to_owned());
-            match &self.duenia {
-                Some(duenia) => Ok(duenia.clone()),
-                // El error con el que un bus de verdad contesta que nadie tiene
-                // el nombre. Es una respuesta, no una pregunta que salió mal, y
-                // es lo que `dueno_de` tiene que traducir a `None`.
-                None => Err(zbus::fdo::Error::NameHasNoOwner(nombre.to_owned())),
-            }
-        }
-
-        // En `PascalCase` como lo escribe el bus, y no como lo dejaría el
-        // `PascalCase` automático: produciría `GetConnectionUnixProcessId` y
-        // el bus de verdad no lo entiende.
-        #[zbus(name = "GetConnectionUnixProcessID")]
-        fn pid_de(&self, _emisor: &str) -> u32 {
-            self.pid
-        }
-    }
+    use crate::test_bus::{self, pid_inexistente, BusFalso, ESPERA};
 
     /// Lo que contestó el backend y qué llegó al descriptor.
     struct Pedido {
@@ -778,19 +736,9 @@ mod tests {
             let demonio = demonio.expect("no se pudo levantar el bus de la prueba");
             let portal = portal.expect("no se pudo levantar la otra punta");
 
-            let preguntados = Arc::new(Mutex::new(Vec::new()));
-            portal
-                .object_server()
-                .at(
-                    RUTA_BUS,
-                    BusFalso {
-                        duenia: duenia.map(str::to_owned),
-                        pid,
-                        preguntados: Arc::clone(&preguntados),
-                    },
-                )
-                .await
-                .expect("no se pudo publicar el bus falso");
+            let bus = BusFalso::nuevo(duenia, Some(pid));
+            let preguntados = bus.registro();
+            test_bus::publicar(&portal, bus).await;
 
             let estado = Arc::new(Mutex::new(KeyringState::new()));
             let escenario = Self {
@@ -838,30 +786,9 @@ mod tests {
                 .expect("no se pudo publicar el backend");
         }
 
-        /// Una ida y vuelta antes de que la prueba pregunte nada.
-        ///
-        /// Recién construida la conexión, el primer mensaje se pierde: la otra
-        /// punta todavía no está leyendo. Es una cosa de `p2p` y no del
-        /// backend, pero sin esto la primera pregunta de cada prueba se queda
-        /// esperando una respuesta que no va a llegar, y el fallo aparece como
-        /// una compuerta de tiempo y no como lo que es.
-        ///
-        /// El intento perdido se corta rápido a propósito: no está fallando,
-        /// está abriendo la conexión, y hacerlo esperar `ESPERA` agregaría
-        /// segundos a cada prueba sin decir nada.
+        /// Ver [`test_bus::calentar`].
         async fn calentar(&self) {
-            for _ in 0..5 {
-                if tokio::time::timeout(
-                    ESPERA_DE_ENTRADA,
-                    dueno_de(&self.demonio, NOMBRE_DEL_PORTAL),
-                )
-                .await
-                .is_ok()
-                {
-                    return;
-                }
-            }
-            panic!("el bus de la prueba no contestó ni una vez: la conexión no quedó viva");
+            test_bus::calentar(&self.demonio).await;
         }
 
         /// El pedido de secreto, tal como lo mandaría el portal, y el otro
@@ -991,19 +918,6 @@ mod tests {
                 secreto,
             }
         }
-    }
-
-    /// Un pid que no existe, sin adivinar un número alto.
-    ///
-    /// Es la forma de que `/proc/<pid>/exe` no se pueda leer. Con la unidad en
-    /// un namespace de usuario el error era `EACCES` y no `ENOENT`, pero para
-    /// la puerta es lo mismo: la lectura falla y el pedido se rechaza. Lo que
-    /// cambia es el motivo, que queda en el registro.
-    fn pid_inexistente() -> u32 {
-        (1..)
-            .map(|n| u32::MAX - n)
-            .find(|pid| !PathBuf::from(format!("/proc/{pid}")).exists())
-            .expect("algún pid tiene que estar libre")
     }
 
     /// El nombre que decide se le pregunta al bus, y se le pregunta al del

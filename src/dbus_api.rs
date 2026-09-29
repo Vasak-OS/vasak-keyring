@@ -11,6 +11,7 @@ use zbus::{interface, Connection};
 use zeroize::Zeroizing;
 
 use crate::crypto;
+use crate::portal_secret::dueno_de;
 use crate::session_crypto;
 
 fn dbus_err(msg: impl Into<String>) -> zbus::fdo::Error {
@@ -395,11 +396,26 @@ fn effectively_locked(collection_locked: bool) -> bool {
 
 /// El esquema que protege el almacén de cuentas de Vasak-OS.
 ///
-/// Los ítems con este esquema en `xdg:schema` solo pueden ser leídos por
-/// `/usr/bin/vasak-accounts-sync`, identificado por su ejecutable.
+/// Los ítems con este esquema en `xdg:schema` sólo se le entregan al
+/// sincronizador: la conexión que tenga tomado `ar.net.vasak.os.AccountsSync` en
+/// el bus **y** cuyo ejecutable sea `/usr/bin/vasak-accounts-sync`. Ver
+/// [`es_el_sincronizador`].
 const ESQUEMA_PROTEGIDO: &str = "ar.net.vasak.os.AccountsStore";
 const ATRIBUTO_ESQUEMA: &str = "xdg:schema";
 const EJECUTABLE_AUTORIZADO: &str = "/usr/bin/vasak-accounts-sync";
+
+/// El nombre con el que el sincronizador se presenta en el bus de sesión.
+///
+/// Una de las dos condiciones de [`es_el_sincronizador`], y **no alcanza sola**:
+/// el sincronizador lo toma al arrancar, pero un nombre lo puede tomar cualquiera
+/// que llegue primero, y el servicio viene `disabled`, así que casi siempre está
+/// libre. Por eso el ejecutable también se exige.
+///
+/// El sincronizador lo pide **después** de publicar el almacén
+/// (`sync/src/main.rs`, `StoreService::start` antes del `request_name`). Hoy no
+/// pide la clave en ese intervalo —las cuentas se abren con `accounts_listed`,
+/// que viene después—, pero si algún día la pidiera, este control se la negaría.
+const NOMBRE_DEL_SINCRONIZADOR: &str = "ar.net.vasak.os.AccountsSync";
 
 /// Obtiene el PID del proceso que envió el mensaje D-Bus.
 ///
@@ -438,9 +454,12 @@ async fn pid_del_emisor(conn: &Connection, cabecera: &zbus::message::Header<'_>)
 /// El sufijo se quita y no se recorta: la comparación de abajo sigue siendo
 /// exacta contra la ruta entera, así que quitarlo no abre la puerta a que un
 /// `/usr/bin/vasak-accounts-sync.malicioso` passe por el sincronizador.
-fn ejecutable_de(pid: u32) -> Option<String> {
+///
+/// El `Err` es el motivo, y no se traga: un `.ok()` acá es lo que dejó a la
+/// puerta rechazando al sincronizador sin que nada lo dijera, cuando la unidad
+/// tenía un namespace de usuario propio y la lectura daba `EACCES`.
+fn ejecutable_de(pid: u32) -> Result<String, std::io::Error> {
     std::fs::read_link(format!("/proc/{pid}/exe"))
-        .ok()
         .map(|r| r.to_string_lossy().into_owned())
         .map(|r| sin_adorno_de_borrado(&r).to_string())
 }
@@ -468,19 +487,29 @@ fn es_esquema_protegido(item: &ItemInfo) -> bool {
 
 /// Si a quien pregunta se le puede entregar este ítem.
 ///
-/// Es la decisión sola, sin bus ni async, a propósito: el «quién pregunta» se
-/// resuelve con `pid_del_emisor` —una ida y vuelta al bus que en una prueba
-/// real no se puede simular—, pero una vez que ese `bool` está, decidir si el
-/// ítem se entrega depende sólo de una regla de dos líneas, y esa regla tiene
-/// que poder probarse sin montar un bus. Por eso vive acá y no repartida en
-/// los dos métodos que la usan: los dos la llaman, ninguno la reimplementa.
+/// Es la decisión sola, sin bus ni async, a propósito. El «quién pregunta» ya
+/// está resuelto para cuando se la llama: es el `bool` que devuelve
+/// [`autorizado_para_esquema_protegido`].
+///
+/// Una regla de dos líneas tiene que poder probarse sin montar nada, y por eso
+/// vive acá y no repartida en los dos métodos que la usan: los dos la llaman,
+/// ninguno la reimplementa. Y separada de la puerta, porque la puerta se puede
+/// romper sin que se rompa esta, así que las pruebas de las dos cosas tienen que
+/// poder fallar por separado.
 fn acceso_permitido(item: &ItemInfo, autorizado: bool) -> bool {
     !es_esquema_protegido(item) || autorizado
 }
 
 /// Verifica si el proceso que llama está autorizado para acceder a un esquema protegido.
 ///
-/// Sólo `/usr/bin/vasak-accounts-sync` puede leer ítems con el esquema protegido.
+/// Sólo el sincronizador puede leer ítems con el esquema protegido, y hacen
+/// falta las dos cosas de [`es_el_sincronizador`]: que la conexión que llama sea
+/// la dueña de `ar.net.vasak.os.AccountsSync`, y que el ejecutable de su pid
+/// sea `esperado`. Cualquier cosa que no se pueda averiguar es un no.
+///
+/// `esperado` es siempre [`EJECUTABLE_AUTORIZADO`] fuera de las pruebas: sale de
+/// [`KeyringState::ejecutable_del_sincronizador`], que no se cambia desde ningún
+/// lado del demonio.
 ///
 /// **Lo que esto autentica es el binario, no a quien lo ejecuta.** Un proceso del
 /// mismo UID al que el sincronizador le pase su conexión D-Bus la usa sin
@@ -493,19 +522,110 @@ fn acceso_permitido(item: &ItemInfo, autorizado: bool) -> bool {
 async fn autorizado_para_esquema_protegido(
     conn: &Connection,
     cabecera: &zbus::message::Header<'_>,
+    esperado: &str,
 ) -> bool {
+    let emisor = match cabecera.sender() {
+        Some(emisor) => emisor.as_str().to_owned(),
+        None => {
+            eprintln!(
+                "vasak-keyring: se rechaza la lectura de un ítem del almacén que vino sin emisor \
+                 en la cabecera"
+            );
+            return false;
+        }
+    };
+
+    let duenia = match dueno_de(conn, NOMBRE_DEL_SINCRONIZADOR).await {
+        Ok(duenia) => duenia,
+        Err(e) => {
+            eprintln!(
+                "vasak-keyring: se rechaza la lectura de un ítem del almacén de {emisor}: no se \
+                 pudo preguntar al bus quién tiene {NOMBRE_DEL_SINCRONIZADOR}: {e}"
+            );
+            return false;
+        }
+    };
+
+    let ejecutable = match ejecutable_del_emisor(conn, cabecera).await {
+        Ok(ejecutable) => ejecutable,
+        Err(motivo) => {
+            // Sin ejecutable no hay puerta: el nombre solo no alcanza. Si esto
+            // aparece con el sincronizador de verdad, lo primero es mirar si la
+            // unidad volvió a tener un namespace de usuario propio.
+            eprintln!(
+                "vasak-keyring: se rechaza la lectura de un ítem del almacén de {emisor}: \
+                 {motivo}, y sin el ejecutable el nombre no alcanza"
+            );
+            return false;
+        }
+    };
+
+    if es_el_sincronizador(&emisor, duenia.as_deref(), Some(&ejecutable), esperado) {
+        return true;
+    }
+
+    if duenia.as_deref() == Some(emisor.as_str()) {
+        eprintln!(
+            "vasak-keyring: se rechaza la lectura de un ítem del almacén de {emisor}: tiene el \
+             nombre del sincronizador pero su ejecutable es {ejecutable} y no {esperado}"
+        );
+    } else {
+        match duenia.as_deref() {
+            Some(duenia) => eprintln!(
+                "vasak-keyring: se rechaza la lectura de un ítem del almacén de {emisor}: no es el \
+                 sincronizador, y {NOMBRE_DEL_SINCRONIZADOR} lo tiene {duenia}"
+            ),
+            None => eprintln!(
+                "vasak-keyring: se rechaza la lectura de un ítem del almacén de {emisor}: en el \
+                 bus nadie tiene {NOMBRE_DEL_SINCRONIZADOR}, así que el sincronizador no está \
+                 andando"
+            ),
+        }
+    }
+    false
+}
+
+/// El ejecutable de quien llama, o el motivo por el que no se pudo saber.
+///
+/// El pid se le pregunta al bus, que es el único que lo sabe, y de ahí sale el
+/// ejecutable. Cualquiera de los dos pasos que falle es un `Err` con el motivo
+/// —un pid que el bus no da, un `/proc/<pid>/exe` que no existe o no se deja
+/// leer—, y para la puerta todos son un no.
+async fn ejecutable_del_emisor(
+    conn: &Connection,
+    cabecera: &zbus::message::Header<'_>,
+) -> Result<String, String> {
     // `match` y no `let...else`: el inicializador de un `let...else` no
     // parsea cuando termina en `.await`, y esto vive dentro de un `async fn`.
-    // Se comprobó con rustc 1.98 antes de escribir esto, no de theorycraft.
     let pid = match pid_del_emisor(conn, cabecera).await {
         Some(pid) => pid,
-        None => return false,
+        None => return Err("el bus no dio su pid".to_owned()),
     };
-    let ejecutable = match ejecutable_de(pid) {
-        Some(ejecutable) => ejecutable,
-        None => return false,
-    };
-    es_el_autorizado(&ejecutable)
+
+    // En un hilo aparte: esto corre en el hilo del bus, y una lectura
+    // bloqueante ahí frena a todos los demás pedidos mientras tanto.
+    tokio::task::spawn_blocking(move || ejecutable_de(pid))
+        .await
+        .map_err(|e| format!("se cortó la lectura de /proc/{pid}/exe: {e}"))?
+        .map_err(|e| format!("no se pudo leer /proc/{pid}/exe: {e}"))
+}
+
+/// Si la conexión que llama es la del sincronizador.
+///
+/// Dos condiciones y hacen falta las dos:
+///
+/// 1. La conexión tiene que tener tomado `ar.net.vasak.os.AccountsSync`. La
+///    contesta el bus.
+/// 2. El ejecutable de su pid tiene que ser `esperado`. Un `None` —no se pudo
+///    leer— es un no: el nombre solo lo puede tener cualquiera que haya llegado
+///    primero, y el ejecutable es lo que no se puede fingir.
+fn es_el_sincronizador(
+    emisor: &str,
+    duenia: Option<&str>,
+    ejecutable: Option<&str>,
+    esperado: &str,
+) -> bool {
+    duenia == Some(emisor) && ejecutable.is_some_and(|ruta| es_el_autorizado(ruta, esperado))
 }
 
 /// Si esta ruta de ejecutable es la del sincronizador.
@@ -519,8 +639,8 @@ async fn autorizado_para_esquema_protegido(
 /// nombre. Separáda de `autorizado_para_esquema_protegido` para que se pueda
 /// probar sin un bus: la de acá es la regla, y una regla que no se prueba sola
 /// termina cediendo en el `if` de arriba.
-fn es_el_autorizado(ejecutable: &str) -> bool {
-    ejecutable == EJECUTABLE_AUTORIZADO
+fn es_el_autorizado(ejecutable: &str, esperado: &str) -> bool {
+    ejecutable == esperado
 }
 
 /// Writes every item to the encrypted database.
@@ -681,6 +801,11 @@ pub struct KeyringState {
     next_session: u64,
     next_collection: u64,
     next_item: u64,
+    /// El ejecutable que tiene que tener quien lee el almacén cifrado. Siempre
+    /// [`EJECUTABLE_AUTORIZADO`]: sólo las pruebas lo cambian, para poder
+    /// recorrer el camino que acepta con un binario que exista en la máquina que
+    /// las corre.
+    ejecutable_del_sincronizador: String,
 }
 
 impl KeyringState {
@@ -693,7 +818,13 @@ impl KeyringState {
             next_session: 0,
             next_collection: 0,
             next_item: 0,
+            ejecutable_del_sincronizador: EJECUTABLE_AUTORIZADO.to_owned(),
         }
+    }
+
+    /// Ver el campo del mismo nombre.
+    fn ejecutable_del_sincronizador(&self) -> String {
+        self.ejecutable_del_sincronizador.clone()
     }
 
     /// Reserves the next free item id.
@@ -815,11 +946,25 @@ impl ItemInterface {
         #[zbus(header)] cabecera: zbus::message::Header<'_>,
         session: OwnedObjectPath,
     ) -> Result<(SecretStruct,), SecretError> {
-        // La identidad del emisor se resuelve **antes** del lock del estado.
-        // `GetConnectionUnixProcessID` es una ida y vuelta al bus, y hacerla con
-        // el lock tomado deja a todos los demás llamantes esperando a que un
-        // proceso ajeno conteste.
-        let autorizado = autorizado_para_esquema_protegido(&self.conn, &cabecera).await;
+        // La identidad del emisor se resuelve **antes** del lock del estado, y
+        // sólo si el ítem es del almacén. Son dos idas y vueltas al bus y una
+        // lectura de `/proc`: hacerlas con el lock tomado deja a todos los demás
+        // esperando a que un proceso ajeno conteste, y hacerlas para cualquier
+        // ítem le cobra eso —y una línea de «se rechaza» en el diario— a cada
+        // contraseña que lee el navegador.
+        //
+        // Entre las dos tomas del lock el ítem puede cambiar. Si pasa a ser
+        // protegido, `autorizado` quedó en `false` y se niega: falla cerrado.
+        let (protegido, esperado) = {
+            let state = self.state.lock().await;
+            let protegido = state
+                .items
+                .get(&self.path)
+                .is_some_and(es_esquema_protegido);
+            (protegido, state.ejecutable_del_sincronizador())
+        };
+        let autorizado =
+            protegido && autorizado_para_esquema_protegido(&self.conn, &cabecera, &esperado).await;
 
         let state = self.state.lock().await;
         // Never release a secret from a locked collection.
@@ -1959,10 +2104,22 @@ impl ServiceInterface {
         // Keyed by object path, not string: the spec declares `a{o(oayays)}`
         // and libsecret refuses the `a{s(oayays)}` a String key produces.
     ) -> Result<HashMap<OwnedObjectPath, SecretStruct>, zbus::fdo::Error> {
-        // Una sola vez por llamada, y antes del lock: el chequeo no depende del
-        // ítem —depende de quién pregunta—, así que preguntarlo adentro del
-        // `for` era una ida y vuelta al bus por cada ítem protegido de la lista.
-        let autorizado = autorizado_para_esquema_protegido(&self.conn, &cabecera).await;
+        // Una sola vez por llamada, antes del lock, y sólo si la lista tiene
+        // algún ítem del almacén: el chequeo no depende del ítem —depende de
+        // quién pregunta—, y para una lista de contraseñas comunes no hace falta.
+        // Ver `get_secret`.
+        let (alguno_protegido, esperado) = {
+            let state = self.state.lock().await;
+            let alguno = items.iter().any(|ip| {
+                state
+                    .items
+                    .get(ip.as_str())
+                    .is_some_and(es_esquema_protegido)
+            });
+            (alguno, state.ejecutable_del_sincronizador())
+        };
+        let autorizado = alguno_protegido
+            && autorizado_para_esquema_protegido(&self.conn, &cabecera, &esperado).await;
 
         let state = self.state.lock().await;
         let mut result = HashMap::new();
@@ -2466,6 +2623,7 @@ async fn buscar_secreto(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_bus::{self, pid_inexistente, BusFalso};
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
@@ -3312,7 +3470,7 @@ mod tests {
 
         for ejecutable in parecidos {
             assert!(
-                !es_el_autorizado(ejecutable),
+                !es_el_autorizado(ejecutable, EJECUTABLE_AUTORIZADO),
                 "`{ejecutable}` no es el sincronizador y no puede pasar por él"
             );
         }
@@ -3323,7 +3481,7 @@ mod tests {
     #[test]
     fn el_ejecutable_del_sincronizador_es_autorizado() {
         assert!(
-            es_el_autorizado(EJECUTABLE_AUTORIZADO),
+            es_el_autorizado(EJECUTABLE_AUTORIZADO, EJECUTABLE_AUTORIZADO),
             "el sincronizador de cuentas tiene que poder leer el almacen"
         );
     }
@@ -3356,7 +3514,9 @@ mod tests {
         // binario igual que alguien tenga instalado al lado.
         let aceptadas: Vec<&PathBuf> = rutas
             .iter()
-            .filter(|ruta| es_el_autorizado(ruta.to_str().unwrap_or_default()))
+            .filter(|ruta| {
+                es_el_autorizado(ruta.to_str().unwrap_or_default(), EJECUTABLE_AUTORIZADO)
+            })
             .collect();
 
         assert!(
@@ -3469,7 +3629,7 @@ mod tests {
         let con_adorno = format!("{EJECUTABLE_AUTORIZADO}{SUFIJO_DE_BORRADO}");
 
         assert!(
-            es_el_autorizado(sin_adorno_de_borrado(&con_adorno)),
+            es_el_autorizado(sin_adorno_de_borrado(&con_adorno), EJECUTABLE_AUTORIZADO),
             "una actualización del sistema no le puede cerrar el almacen al sincronizador \
              legítimo: `pacman` borra el archivo mientras el proceso sigue corriendo, y el \
              kernel cuelga el adorno a la ruta"
@@ -3478,9 +3638,12 @@ mod tests {
         // siendo exacta contra la ruta entera, que es lo que impide que un
         // `...-sync.malicioso` pase por el sincronizador.
         assert!(
-            !es_el_autorizado(sin_adorno_de_borrado(&format!(
-                "{EJECUTABLE_AUTORIZADO}.malicioso{SUFIJO_DE_BORRADO}"
-            ))),
+            !es_el_autorizado(
+                sin_adorno_de_borrado(&format!(
+                    "{EJECUTABLE_AUTORIZADO}.malicioso{SUFIJO_DE_BORRADO}"
+                )),
+                EJECUTABLE_AUTORIZADO
+            ),
             "quitar el adorno no puede convertir un nombre parecido en el sincronizador"
         );
     }
@@ -3555,6 +3718,556 @@ mod tests {
     #[test]
     fn no_base_means_no_path() {
         assert_eq!(keyring_path_under(None), None);
+    }
+
+    // ── La puerta del almacén, con el bus detrás ──────────────────
+    //
+    // Tenía el mismo problema que la del portal y por lo mismo: con la unidad en
+    // un namespace de usuario propio, `/proc/<pid>/exe` del sincronizador daba
+    // `EACCES`, el `.ok()` se lo tragaba, y la puerta —que era sólo el
+    // ejecutable— le negaba el almacén al propio sincronizador. No a un atacante:
+    // al cliente legítimo, siempre. Y el servicio viene `disabled`, así que no se
+    // notó. El arreglo de fondo está en la unidad; acá la puerta pasa a pedir
+    // también el nombre, y ninguna de las dos condiciones alcanza sola.
+    //
+    // Va en dos capas porque fallan distinto. La de las pruebas puras llama a
+    // `es_el_sincronizador` con las respuestas ya resueltas: comprueba la regla.
+    // La de abajo monta un bus falso detrás del cliente y deja que corra el
+    // código de verdad: comprueba que la regla se llegue a formular. Un `if` que
+    // devuelve `false` siempre compila, pasa todas las pruebas de la función que
+    // llama, y deja al sistema exactamente igual de roto que antes.
+
+    /// La conexión del sincronizador en el bus de la sesión.
+    const DEL_SINCRONIZADOR: &str = ":1.42";
+    /// Una conexión que no es la del sincronizador.
+    const DE_UN_IMPOSTOR: &str = ":1.99";
+
+    /// El ejecutable de este mismo proceso de pruebas, que es el único que una
+    /// prueba puede hacer pasar por el sincronizador: `/usr/bin/vasak-accounts-sync`
+    /// no está en la máquina que corre la prueba.
+    fn ejecutable_propio() -> String {
+        ejecutable_de(std::process::id()).expect("esta prueba puede leerse a sí misma")
+    }
+
+    /// Lo que el demonio contestó, en el tipo que el resto de las pruebas espera.
+    ///
+    /// Un error de método vuelve como un mensaje, y no como un `Err` de la
+    /// llamada: como la respuesta se lee de un `MessageStream` —porque el emisor
+    /// va escrito a mano y `call_method` no lo pone— no hay nadie a quien
+    /// `call_method` le devuelva el error. El nombre del error se arma como
+    /// `MethodError` porque es lo que produce `call_method` de verdad, y así
+    /// [`nombre_del_error`] sirve para las dos formas de hacer la llamada.
+    fn como_resultado(mensaje: zbus::Message) -> zbus::Result<zbus::Message> {
+        match mensaje.header().message_type() {
+            zbus::message::Type::MethodReturn => Ok(mensaje),
+            zbus::message::Type::Error => {
+                // El nombre del error está en la cabecera; el cuerpo es un solo
+                // string con la descripción.
+                let nombre = mensaje
+                    .header()
+                    .error_name()
+                    .expect("un error de D-Bus tiene nombre")
+                    .to_string();
+                let texto: String = mensaje
+                    .body()
+                    .deserialize()
+                    .expect("el cuerpo de un error es un string");
+                Err(zbus::Error::MethodError(
+                    zbus::names::ErrorName::try_from(nombre)
+                        .expect("el nombre del error del bus")
+                        .into(),
+                    Some(texto),
+                    mensaje,
+                ))
+            }
+            otro => panic!("un `GetSecret` no puede contestar con {otro:?}"),
+        }
+    }
+
+    /// Un `GetSecret` con el emisor que se le ponga en la cabecera. Ver
+    /// [`test_bus::armar`] para por qué el emisor va a mano.
+    fn peticion(emisor: Option<&str>) -> zbus::Message {
+        peticion_de(ITEM, emisor)
+    }
+
+    /// Lo mismo, para el ítem que se quiera.
+    fn peticion_de(item: &str, emisor: Option<&str>) -> zbus::Message {
+        let sesion = OwnedObjectPath::try_from(SESION).expect("la sesión de la prueba");
+        test_bus::armar(item, IFACE_ITEM, "GetSecret", emisor, &(&sesion,))
+    }
+
+    /// El llavero de la prueba con un bus falso detrás.
+    ///
+    /// `duenia` y `pid` son las dos respuestas del bus, y `None` en cualquiera de
+    /// las dos es una respuesta de verdad y no una ausencia: `duenia: None` es el
+    /// `NameHasNoOwner` que contesta un bus cuando nadie tomó el nombre, y
+    /// `pid: None` es el error que contesta cuando no conoce la conexión.
+    struct Almacen {
+        demonio: zbus::Connection,
+        cliente: zbus::Connection,
+        preguntados: Arc<Mutex<Vec<String>>>,
+        /// El ejecutable que el demonio de la prueba espera del sincronizador.
+        esperado: String,
+    }
+
+    impl Almacen {
+        /// Con el ejecutable de producción como el esperado: nada de lo que
+        /// corre en la prueba lo tiene, así que por acá no entra nadie.
+        async fn nuevo(duenia: Option<&str>, pid: Option<u32>) -> Self {
+            Self::con(duenia, pid, EJECUTABLE_AUTORIZADO).await
+        }
+
+        /// Con este mismo proceso haciendo de sincronizador: el pid es el
+        /// propio y su ejecutable es el esperado. Es la única forma de recorrer
+        /// el camino que acepta.
+        async fn con_el_sincronizador_propio(duenia: Option<&str>) -> Self {
+            Self::con(duenia, Some(std::process::id()), &ejecutable_propio()).await
+        }
+
+        async fn con(duenia: Option<&str>, pid: Option<u32>, esperado: &str) -> Self {
+            let (demonio, cliente, preguntados) =
+                llavero_con_item_protegido_y_bus(Some(BusFalso::nuevo(duenia, pid)), esperado)
+                    .await;
+            Almacen {
+                demonio,
+                cliente,
+                preguntados,
+                esperado: esperado.to_owned(),
+            }
+        }
+
+        /// Lo que contesta la puerta del almacén para un pedido de `emisor`.
+        ///
+        /// Se la llama directo y no por `GetSecret` porque mirar la puerta por sí
+        /// sola esconde los rechazos que vienen de otro lado: una sesión cerrada,
+        /// una colección bloqueada, un ítem que no existe.
+        async fn puerta(&self, emisor: Option<&str>) -> bool {
+            let peticion = peticion(emisor);
+            autorizado_para_esquema_protegido(&self.demonio, &peticion.header(), &self.esperado)
+                .await
+        }
+
+        /// Un `GetSecret` de punta a punta: entra por el bus, lo decide el
+        /// demonio, y lo que se mira es el mensaje que volvió.
+        async fn pedir_secreto(&self, emisor: Option<&str>) -> zbus::Result<zbus::Message> {
+            self.pedir_secreto_de(ITEM, emisor).await
+        }
+
+        /// Lo mismo, para el ítem que se quiera.
+        async fn pedir_secreto_de(
+            &self,
+            item: &str,
+            emisor: Option<&str>,
+        ) -> zbus::Result<zbus::Message> {
+            let peticion = peticion_de(item, emisor);
+            let serial = peticion.header().primary().serial_num();
+
+            let mut salientes = zbus::MessageStream::from(&self.cliente);
+            self.cliente
+                .send(&peticion)
+                .await
+                .expect("no se pudo mandar el GetSecret");
+            como_resultado(test_bus::primera_respuesta(&mut salientes, serial).await)
+        }
+
+        /// Por qué nombres se le preguntó al bus, en orden.
+        async fn preguntados(&self) -> Vec<String> {
+            self.preguntados.lock().await.clone()
+        }
+    }
+
+    // ── La regla, sin bus ──
+
+    /// Con el nombre y el binario real, entra: si no, el almacén cifrado se
+    /// queda sin quien lo abra.
+    #[test]
+    fn el_sincronizador_con_su_nombre_y_su_binario_entra() {
+        assert!(
+            es_el_sincronizador(
+                DEL_SINCRONIZADOR,
+                Some(DEL_SINCRONIZADOR),
+                Some(EJECUTABLE_AUTORIZADO),
+                EJECUTABLE_AUTORIZADO
+            ),
+            "la conexión del sincronizador, con el nombre y con el binario, tiene que poder leer \
+             el almacén: una puerta que rechaza esto no abre nada"
+        );
+    }
+
+    /// El nombre solo no alcanza: sin ejecutable legible no entra nadie, tampoco
+    /// quien tiene el nombre.
+    ///
+    /// Es la decisión que separa esta puerta de la que tuvo este PR en su primera
+    /// versión, donde un `None` acá dejaba pasar. El servicio viene `disabled`,
+    /// así que `ar.net.vasak.os.AccountsSync` casi siempre está libre y lo toma
+    /// cualquiera que llegue primero; el ejecutable no se finge.
+    #[test]
+    fn sin_ejecutable_no_entra_ni_quien_tiene_el_nombre() {
+        assert!(!es_el_sincronizador(
+            DEL_SINCRONIZADOR,
+            Some(DEL_SINCRONIZADOR),
+            None,
+            EJECUTABLE_AUTORIZADO
+        ));
+    }
+
+    /// Tener el nombre y ejecutar otra cosa no alcanza: es exactamente el caso
+    /// de quien tomó el nombre antes que el sincronizador.
+    #[test]
+    fn el_nombre_con_otro_ejecutable_no_entra() {
+        for otro in [
+            "/usr/bin/python3",
+            "/tmp/vasak-accounts-sync",
+            "/usr/bin/vasak-accounts-sync.malicioso",
+        ] {
+            assert!(
+                !es_el_sincronizador(
+                    DEL_SINCRONIZADOR,
+                    Some(DEL_SINCRONIZADOR),
+                    Some(otro),
+                    EJECUTABLE_AUTORIZADO
+                ),
+                "con el nombre del sincronizador y el ejecutable {otro} no se entra"
+            );
+        }
+    }
+
+    /// Y el binario bueno sin el nombre tampoco: la conexión que pide tiene que
+    /// ser la que tiene tomado el nombre.
+    #[test]
+    fn el_binario_bueno_sin_el_nombre_no_entra() {
+        assert!(!es_el_sincronizador(
+            DE_UN_IMPOSTOR,
+            Some(DEL_SINCRONIZADOR),
+            Some(EJECUTABLE_AUTORIZADO),
+            EJECUTABLE_AUTORIZADO
+        ));
+        assert!(!es_el_sincronizador(
+            DE_UN_IMPOSTOR,
+            None,
+            Some(EJECUTABLE_AUTORIZADO),
+            EJECUTABLE_AUTORIZADO
+        ));
+    }
+
+    // ── La puerta, con el bus falso ──
+
+    /// El caso del bug, con bus: el sincronizador entra.
+    ///
+    /// Con el nombre tomado por la misma conexión que pide, y su ejecutable
+    /// legible y siendo el esperado. Es lo que la puerta no dejaba pasar nunca
+    /// mientras la unidad tuvo un namespace de usuario propio.
+    #[tokio::test]
+    async fn el_sincronizador_entra() {
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        assert!(
+            almacen.puerta(Some(DEL_SINCRONIZADOR)).await,
+            "el bus dice que {DEL_SINCRONIZADOR} tiene {NOMBRE_DEL_SINCRONIZADOR} y su ejecutable \
+             es el esperado: tiene que entrar, o el almacén cifrado no lo abre nadie"
+        );
+    }
+
+    /// El nombre que decide se le pregunta al bus, y es el del sincronizador.
+    ///
+    /// Lo que se mira es el nombre que salió por el cable: una errata en la
+    /// constante no se ve en el resultado de la llamada, se ve en quién puede
+    /// leer, que es peor.
+    #[tokio::test]
+    async fn el_nombre_que_decide_es_el_del_sincronizador() {
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        assert!(!almacen.puerta(Some(DE_UN_IMPOSTOR)).await);
+
+        let preguntados = almacen.preguntados().await;
+        assert!(
+            !preguntados.is_empty() && preguntados.iter().all(|n| n == NOMBRE_DEL_SINCRONIZADOR),
+            "la puerta tiene que preguntar sólo por {NOMBRE_DEL_SINCRONIZADOR} y preguntó por \
+             {preguntados:?}: con otro nombre se le abre a quien lo tenga y se le cierra al \
+             sincronizador"
+        );
+    }
+
+    /// Sin ejecutable legible no entra, aunque tenga el nombre.
+    ///
+    /// Al revés de la primera versión de este arreglo, que dejaba pasar al dueño
+    /// del nombre cuando `/proc/<pid>/exe` no se podía leer.
+    #[tokio::test]
+    async fn sin_ejecutable_legible_no_entra_ni_el_duenio_del_nombre() {
+        let almacen = Almacen::nuevo(Some(DEL_SINCRONIZADOR), Some(pid_inexistente())).await;
+
+        assert!(
+            !almacen.puerta(Some(DEL_SINCRONIZADOR)).await,
+            "no se puede leer el ejecutable de {DEL_SINCRONIZADOR}: tener \
+             {NOMBRE_DEL_SINCRONIZADOR} solo no alcanza"
+        );
+    }
+
+    /// Un pid que el bus no da tampoco es un sí: sin pid no hay ejecutable, y
+    /// sin ejecutable no se entra. Es lo que CodeRabbit marcó en la primera
+    /// versión, donde cualquier error de la lectura dejaba decidir al nombre.
+    #[tokio::test]
+    async fn un_pid_que_el_bus_no_da_no_entra() {
+        let almacen = Almacen::nuevo(Some(DEL_SINCRONIZADOR), None).await;
+
+        assert!(
+            !almacen.puerta(Some(DEL_SINCRONIZADOR)).await,
+            "si el bus no da el pid de la conexión no se sabe qué ejecuta, y eso es un no"
+        );
+    }
+
+    /// El nombre no tapa al ejecutable: con el nombre, el ejecutable legible y
+    /// no siendo el del sincronizador, no entra.
+    #[tokio::test]
+    async fn el_nombre_bueno_con_otro_ejecutable_no_entra() {
+        // El pid es el de la propia prueba, así que el ejecutable se lee y es el
+        // binario de pruebas; el esperado es el de producción.
+        let almacen = Almacen::nuevo(Some(DEL_SINCRONIZADOR), Some(std::process::id())).await;
+
+        assert!(
+            !almacen.puerta(Some(DEL_SINCRONIZADOR)).await,
+            "con el nombre del sincronizador pero el ejecutable {} no se entra",
+            ejecutable_propio()
+        );
+    }
+
+    /// Un impostor sin el nombre no entra, aunque su ejecutable sea el esperado.
+    #[tokio::test]
+    async fn un_impostor_con_el_nombre_de_otro_no_entra() {
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        assert!(
+            !almacen.puerta(Some(DE_UN_IMPOSTOR)).await,
+            "el bus dice que {DEL_SINCRONIZADOR} tiene el nombre del sincronizador y el pedido \
+             viene de {DE_UN_IMPOSTOR}: no le abre el almacén"
+        );
+    }
+
+    /// Nadie tiene el nombre ⇒ nadie entra: el sincronizador no está andando.
+    #[tokio::test]
+    async fn sin_duena_del_nombre_no_entra_nadie() {
+        let almacen = Almacen::con_el_sincronizador_propio(None).await;
+
+        assert!(!almacen.puerta(Some(DEL_SINCRONIZADOR)).await);
+        assert!(!almacen.puerta(Some(DE_UN_IMPOSTOR)).await);
+    }
+
+    /// Que el `NameHasNoOwner` del bus sea una respuesta y no un fallo, también
+    /// para esta puerta: las dos pasan por [`crate::portal_secret::dueno_de`], y
+    /// una prueba que sólo mirara una dejaría a la otra descubrirlo en producción.
+    #[tokio::test]
+    async fn un_nombre_sin_duena_es_una_respuesta_y_no_un_fallo() {
+        let almacen = Almacen::nuevo(None, Some(pid_inexistente())).await;
+
+        let duenia = crate::portal_secret::dueno_de(&almacen.demonio, NOMBRE_DEL_SINCRONIZADOR)
+            .await
+            .expect("`NameHasNoOwner` es la respuesta del bus, no una pregunta que salió mal");
+
+        assert_eq!(duenia, None);
+    }
+
+    /// Una cabecera sin emisor no entra, y ni siquiera se le pregunta al bus.
+    #[tokio::test]
+    async fn una_cabecera_sin_emisor_no_entra() {
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        assert!(!almacen.puerta(None).await);
+        assert!(
+            almacen.preguntados().await.is_empty(),
+            "sin emisor con qué comparar, preguntarle al bus no dice nada"
+        );
+    }
+
+    // ── De punta a punta, por `GetSecret` ──
+
+    /// El sincronizador lee su clave del almacén cifrado con un `GetSecret`.
+    ///
+    /// La cadena entera: cabecera con emisor, ida y vuelta al bus por el nombre,
+    /// pid que el bus atribuye, `/proc/<pid>/exe`, `acceso_permitido`, y la
+    /// respuesta con la clave adentro.
+    ///
+    /// La sesión abierta no es un detalle del andamiaje: `get_secret` comprueba el
+    /// bloqueo **antes** del control de acceso, así que sin contraseña maestra el
+    /// `GetSecret` cortaría con `IsLocked` sin que la puerta se mirara nunca.
+    #[tokio::test]
+    async fn el_sincronizador_recibe_el_secreto_del_almacen_por_dbus() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        let respuesta = almacen
+            .pedir_secreto(Some(DEL_SINCRONIZADOR))
+            .await
+            .expect("el sincronizador tiene que poder leer su propia clave por `GetSecret`");
+        let (secreto,): (SecretStruct,) = respuesta
+            .body()
+            .deserialize()
+            .expect("la respuesta de `GetSecret` no se entiende");
+
+        assert!(
+            secreto.value == b"la clave del almacen",
+            "lo que llega tiene que ser la clave de verdad"
+        );
+        assert_eq!(secreto.session.as_str(), SESION);
+    }
+
+    /// Y por el mismo camino, quien tiene el nombre pero no el ejecutable no la
+    /// saca: es el caso de quien tomó el nombre antes que el sincronizador.
+    #[tokio::test]
+    async fn el_duenio_del_nombre_sin_el_ejecutable_no_recibe_el_secreto_por_dbus() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let almacen = Almacen::nuevo(Some(DEL_SINCRONIZADOR), Some(std::process::id())).await;
+
+        let error = almacen
+            .pedir_secreto(Some(DEL_SINCRONIZADOR))
+            .await
+            .expect_err("el almacén cifrado no se le entrega a quien sólo tiene el nombre");
+
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.DBus.Error.AccessDenied",
+            "y se dice con el nombre del estándar, no con un fallo genérico"
+        );
+    }
+
+    /// Y un impostor sin el nombre tampoco.
+    #[tokio::test]
+    async fn un_impostor_no_recibe_el_secreto_del_almacen_por_dbus() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        let error = almacen
+            .pedir_secreto(Some(DE_UN_IMPOSTOR))
+            .await
+            .expect_err("el almacén cifrado no se le entrega a una conexión sin el nombre");
+
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.DBus.Error.AccessDenied"
+        );
+
+        // Y la pregunta que viajó por el bus fue por el nombre del sincronizador.
+        let preguntados = almacen.preguntados().await;
+        assert!(
+            !preguntados.is_empty() && preguntados.iter().all(|n| n == NOMBRE_DEL_SINCRONIZADOR),
+            "en un `GetSecret` de verdad la puerta tiene que preguntar por \
+             {NOMBRE_DEL_SINCRONIZADOR}, y preguntó por {preguntados:?}"
+        );
+    }
+
+    /// Una contraseña común se entrega sin preguntar nada del sincronizador.
+    ///
+    /// La puerta es sólo para los ítems del almacén. Correrla en cada lectura le
+    /// cobraba a cada contraseña del navegador dos idas y vueltas al bus, una
+    /// lectura de `/proc` y una línea de «se rechaza la lectura de un ítem del
+    /// almacén» en el diario, para un pedido que igual se entregaba. Lo marcó
+    /// CodeRabbit.
+    #[tokio::test]
+    async fn una_contrasena_comun_no_pasa_por_la_puerta_del_almacen() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let almacen = Almacen::nuevo(Some(DEL_SINCRONIZADOR), Some(pid_inexistente())).await;
+
+        let respuesta = almacen
+            .pedir_secreto_de(ITEM_COMUN, Some(DE_UN_IMPOSTOR))
+            .await
+            .expect("una contraseña común se le entrega a cualquier proceso de la sesión");
+        let (secreto,): (SecretStruct,) = respuesta
+            .body()
+            .deserialize()
+            .expect("la respuesta de `GetSecret` no se entiende");
+        assert!(secreto.value == b"la contrasena del navegador");
+
+        assert!(
+            almacen.preguntados().await.is_empty(),
+            "para un ítem que no es del almacén no hay que preguntarle al bus quién tiene \
+             {NOMBRE_DEL_SINCRONIZADOR}"
+        );
+    }
+
+    /// Lo mismo por `GetSecrets`: una lista de contraseñas comunes no pregunta
+    /// por el sincronizador, y una que incluye la clave del almacén sí.
+    #[tokio::test]
+    async fn get_secrets_consulta_la_puerta_solo_si_hay_un_item_del_almacen() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let almacen = Almacen::nuevo(Some(DEL_SINCRONIZADOR), Some(pid_inexistente())).await;
+        let sesion = OwnedObjectPath::try_from(SESION).expect("la sesión de la prueba");
+
+        let pedir = |items: Vec<&str>| {
+            let items: Vec<OwnedObjectPath> = items
+                .into_iter()
+                .map(|i| OwnedObjectPath::try_from(i).expect("ruta del ítem"))
+                .collect();
+            test_bus::armar(
+                SERVICIO,
+                IFACE_SERVICIO,
+                "GetSecrets",
+                Some(DE_UN_IMPOSTOR),
+                &(items, &sesion),
+            )
+        };
+
+        let mut salientes = zbus::MessageStream::from(&almacen.cliente);
+        let comunes = pedir(vec![ITEM_COMUN]);
+        let serial = comunes.header().primary().serial_num();
+        almacen
+            .cliente
+            .send(&comunes)
+            .await
+            .expect("mandar GetSecrets");
+        let respuesta = test_bus::primera_respuesta(&mut salientes, serial).await;
+        let secretos: HashMap<OwnedObjectPath, SecretStruct> = respuesta
+            .body()
+            .deserialize()
+            .expect("la respuesta de GetSecrets");
+        assert_eq!(secretos.len(), 1, "la contraseña común se entrega");
+        assert!(
+            almacen.preguntados().await.is_empty(),
+            "sin ítems del almacén en la lista no hay que preguntar por {NOMBRE_DEL_SINCRONIZADOR}"
+        );
+
+        let con_el_almacen = pedir(vec![ITEM_COMUN, ITEM]);
+        let serial = con_el_almacen.header().primary().serial_num();
+        almacen
+            .cliente
+            .send(&con_el_almacen)
+            .await
+            .expect("mandar GetSecrets");
+        let respuesta = test_bus::primera_respuesta(&mut salientes, serial).await;
+        let secretos: HashMap<OwnedObjectPath, SecretStruct> = respuesta
+            .body()
+            .deserialize()
+            .expect("la respuesta de GetSecrets");
+        assert_eq!(
+            secretos.len(),
+            1,
+            "a un impostor se le entrega la común y se le omite la del almacén"
+        );
+        assert!(
+            !almacen.preguntados().await.is_empty(),
+            "con un ítem del almacén en la lista la puerta se consulta"
+        );
+    }
+
+    /// Un pedido sin emisor en la cabecera se rechaza, por el camino real.
+    #[tokio::test]
+    async fn sin_emisor_en_la_cabecera_no_recibe_el_secreto_por_dbus() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        let error = almacen
+            .pedir_secreto(None)
+            .await
+            .expect_err("un pedido sin emisor no puede leer el ítem");
+
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.DBus.Error.AccessDenied"
+        );
     }
 
     // ── El llavero entero, del otro lado de una conexión punto a punto ──────
@@ -3682,10 +4395,61 @@ mod tests {
     /// ítem y no una negación general —si el control tapara el servicio entero,
     /// las contraseñas de los navegadores se dejarían de guardar y ni una prueba
     /// que mire sólo el ítem protegido lo notaría—.
+    ///
+    /// El bus falso se publica aparte, con [`llavero_con_item_protegido_y_bus`], y
+    /// no con un parámetro acá: la puerta del almacén **siempre** pregunta al bus,
+    /// así que un llavero sin bus detrás sólo sirve para las pruebas que no la
+    /// usan, y para ésas se lee mejor que el bus no esté.
     async fn llavero_con_item_protegido() -> (zbus::Connection, zbus::Connection) {
+        construir_llavero_con_item_protegido(EJECUTABLE_AUTORIZADO).await
+    }
+
+    /// El mismo llavero, y además un bus falso del otro lado del cliente.
+    ///
+    /// Hace falta porque la puerta del almacén **siempre** le pregunta al bus quién
+    /// tiene `ar.net.vasak.os.AccountsSync`, y sobre una conexión punto a punto no
+    /// hay bus al que preguntarle: las dos puntas se ven y nada más. Sin el bus
+    /// falso, `GetSecret` sobre el ítem protegido cortaría en la pregunta, que es
+    /// un caso de rechazo pero no el que se quiere comprobar.
+    ///
+    /// Lo que devuelve de más es el registro de los nombres preguntados, porque
+    /// hay que poder afirmar que se preguntó **por el nombre del sincronizador** y
+    /// no por otro, y eso no se ve en el resultado de la llamada.
+    async fn llavero_con_item_protegido_y_bus(
+        bus: Option<BusFalso>,
+        esperado: &str,
+    ) -> (zbus::Connection, zbus::Connection, Arc<Mutex<Vec<String>>>) {
+        let (demonio, cliente) = construir_llavero_con_item_protegido(esperado).await;
+
+        let preguntados = match bus {
+            Some(bus) => {
+                let preguntados = bus.registro();
+                test_bus::publicar(&cliente, bus).await;
+                // Recién construida la conexión, el primer mensaje se pierde. La
+                // puerta pregunta por el nombre antes que nada, y sin el viaje de
+                // calentamiento esa pregunta sería la que se pierde: la prueba
+                // rechazaría por un motivo de `p2p` y no por el que quiere ver.
+                test_bus::calentar(&demonio).await;
+                preguntados
+            }
+            None => Arc::new(Mutex::new(Vec::new())),
+        };
+
+        (demonio, cliente, preguntados)
+    }
+
+    /// El estado del llavero, y nada del bus.
+    ///
+    /// Aparte porque es lo único que tienen en común [`llavero`] y las dos
+    /// variantes del llavero protegido: el que arma el estado no tiene por qué
+    /// saber si quien va a preguntar es el demonio, el cliente o un bus falso.
+    async fn construir_llavero_con_item_protegido(
+        esperado: &str,
+    ) -> (zbus::Connection, zbus::Connection) {
         let state = Arc::new(Mutex::new(KeyringState::new()));
         {
             let mut s = state.lock().await;
+            s.ejecutable_del_sincronizador = esperado.to_owned();
             s.collections.insert(
                 COLECCION_DEL_LOGIN.to_string(),
                 CollectionInfo {

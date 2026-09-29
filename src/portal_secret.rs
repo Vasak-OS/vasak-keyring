@@ -124,7 +124,7 @@ pub fn deja_pasar(emisor: &str, duenia: Option<&str>, ejecutable: Option<&str>) 
 ///
 /// `GetNameOwner` contesta con un error cuando el nombre no lo tiene nadie, y
 /// eso no es una pregunta que salió mal: es la respuesta.
-async fn dueno_de(conn: &zbus::Connection, nombre: &str) -> Result<Option<String>, zbus::Error> {
+pub(crate) async fn dueno_de(conn: &zbus::Connection, nombre: &str) -> Result<Option<String>, zbus::Error> {
     const SIN_DUENO: &str = "org.freedesktop.DBus.Error.NameHasNoOwner";
 
     match conn

@@ -58,6 +58,15 @@ impl Drop for SecretItem {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct KeyringDatabase {
+    /// Qué versión del demonio escribió la base, en lo que importa para
+    /// confiar en ella.
+    ///
+    /// Una base sin el campo la escribió un demonio de antes, y lee como `0`;
+    /// un demonio de antes que lee una base nueva lo ignora y, al guardar, lo
+    /// pierde, que es lo correcto: esa base vuelve a ser «de antes». Qué
+    /// significa cada valor lo dice `dbus_api` (`PORTAL_NAMESPACE_FORMAT`).
+    #[serde(default)]
+    pub format: u32,
     pub items: Vec<SecretItem>,
 }
 
@@ -142,6 +151,20 @@ pub fn decrypt_database(
 mod tests {
     use super::*;
 
+    /// Una base escrita por un demonio de antes no trae `format`, y se lee
+    /// como `0`: es lo que le dice al demonio que no puede confiar en la marca
+    /// de origen de los secretos del portal.
+    #[test]
+    fn una_base_sin_formato_se_lee_como_de_antes() {
+        let db: KeyringDatabase =
+            serde_json::from_str(r#"{"items":[]}"#).expect("la base de un demonio de antes");
+        assert_eq!(db.format, 0);
+
+        let db: KeyringDatabase =
+            serde_json::from_str(r#"{"format":1,"items":[]}"#).expect("la base de uno nuevo");
+        assert_eq!(db.format, 1);
+    }
+
     /// Un secreto guardado en claro no puede llegar a una cadena de formato.
     ///
     /// No se prueba que hoy nadie lo imprima —eso lo dice una búsqueda en el
@@ -185,6 +208,7 @@ mod tests {
     #[test]
     fn la_base_entera_tampoco_se_imprime() {
         let db = KeyringDatabase {
+            format: 0,
             items: vec![SecretItem {
                 label: "correo".into(),
                 attributes: HashMap::new(),

@@ -51,7 +51,7 @@ use tokio::sync::Mutex;
 use zbus::interface;
 use zbus::zvariant::{ObjectPath, OwnedValue};
 
-use crate::dbus_api::{secreto_maestro_de_app, KeyringState};
+use crate::dbus_api::{app_master_secret, KeyringState};
 
 /// El nombre con el que el portal encuentra este backend. Tiene que coincidir
 /// con el `.portal` que se instala al lado, o el portal no mira acá.
@@ -319,7 +319,7 @@ impl SecretBackend {
             return (RESPUESTA_FALLO, HashMap::new());
         }
 
-        let secreto = match secreto_maestro_de_app(&self.state, &self.conn, &app_id).await {
+        let secreto = match app_master_secret(&self.state, &app_id).await {
             Ok(secreto) => secreto,
             Err(e) => {
                 eprintln!("vasak-keyring: no se pudo dar el secreto de «{app_id}»: {e}");
@@ -767,7 +767,7 @@ mod tests {
         /// el portal.
         ///
         /// Va aparte y no en `nuevo` a propósito: lo que hay detrás de la puerta
-        /// es `secreto_maestro_de_app`, que escribe en el llavero de verdad de
+        /// es `app_master_secret`, que escribe en el llavero de verdad de
         /// quien corre la prueba. Las pruebas de la puerta no lo necesitan —
         /// con la cabecera que llegó ya se contesta — y así ninguna puede llegar
         /// a escribir aunque la máquina de quien las corra tenga una contraseña

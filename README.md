@@ -48,6 +48,41 @@ El control es **por ítem**: el resto de los secretos se sigue entregando
 normalmente, que es lo que necesitan el navegador, el cliente de correo y el
 resto del escritorio.
 
+### Los secretos del portal
+
+El secreto maestro que el backend del portal (`org.freedesktop.impl.portal.Secret`)
+le da a cada aplicación vive en la colección del login con
+`xdg:schema = "org.freedesktop.portal.Secret"`. Ese esquema es del demonio: el
+backend corre adentro y lee el estado directo, así que **desde el bus no lo toca
+nadie**, sin excepción —tampoco el sincronizador—. Un `CreateItem` con ese
+esquema (con `replace` o sin él), `SetSecret`, `GetSecret`, `Delete`, y leer
+`Label`, `Attributes`, `Created`, `Modified` o `Locked` responden
+`AccessDenied`; borrar una colección que tenga alguno, también. Y para el bus
+esos ítems no existen: no se publican como objetos, no aparecen en `Items` ni en
+`SearchItems`, y `GetSecrets` los omite. Antes (hasta 0.7.8) cualquier proceso
+podía plantar el secreto de una aplicación antes de que lo pidiera, cambiárselo
+o leerlo.
+
+La reserva compara sólo letras y dígitos, sin mayúsculas: `XDG:Schema`,
+`Org.Freedesktop.Portal.Secret`, un espacio o un carácter invisible en el medio
+siguen siendo el esquema del portal, y tampoco se puede crear nada con el
+atributo `vasak-keyring:origin`. La búsqueda del backend, en cambio, es exacta,
+así que la reserva siempre cubre todo lo que el backend puede encontrar.
+
+**Los secretos de antes de 0.7.9 no se entregan.** Mientras el esquema estuvo
+abierto, uno plantado no se distingue de uno legítimo. Desde 0.7.9 el demonio
+marca los que crea con `vasak-keyring:origin = portal-backend`, que ningún
+cliente del bus puede poner, y sólo entrega ésos. La marca sola no alcanza —un
+demonio de antes no la reservaba, así que también se pudo plantar—, y por eso la
+base lleva un campo `format`: la que escribe 0.7.9 o posterior dice `1`, y en
+una sin el campo (la de un demonio de antes, o una que un demonio de antes volvió
+a guardar después de un retroceso de versión) la marca se quita al cargar. Una
+aplicación que tenía un
+secreto de antes recibe uno nuevo la próxima vez que lo pide —y deja de abrir lo
+que hubiera cifrado con el anterior—, y el diario lo dice. El de antes queda en
+la base sin usarse. En VasakOS el portal Secret lo usan sólo las aplicaciones en
+sandbox, que el sistema no trae, así que en la práctica no hay nada que perder.
+
 ### Qué no garantiza
 
 El control autentica **el binario, no a la persona que lo ejecuta**. Por lo

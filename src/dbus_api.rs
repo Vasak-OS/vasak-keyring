@@ -763,11 +763,52 @@ pub const PORTAL_SCHEMA: &str = "org.freedesktop.portal.Secret";
 /// estaban en el llavero antes de esta versión. Hasta acá cualquier proceso
 /// podía crear un ítem con el esquema del portal, y uno plantado y uno legítimo
 /// son indistinguibles —el mismo nombre, los mismos atributos, 64 bytes que
-/// cualquiera sabe generar—. Desde esta versión ningún cliente del bus puede
-/// crear un ítem con el esquema **ni con esta marca**, así que un ítem que la
-/// tiene lo creó el demonio. Ver [`app_master_secret`].
+/// cualquiera sabe generar—.
+///
+/// La marca sola **no alcanza**: un demonio de antes no la reservaba, así que
+/// en una base escrita por él la pudo haber puesto cualquiera, marca incluida.
+/// Por eso vale sólo en una base con [`PORTAL_NAMESPACE_FORMAT`], que escribe
+/// únicamente un demonio que no deja crearla desde el bus; en una de antes se
+/// quita al cargar (ver [`trusted_attributes`]). Ver [`app_master_secret`].
 const PORTAL_ORIGIN_ATTRIBUTE: &str = "vasak-keyring:origin";
 const PORTAL_ORIGIN_VALUE: &str = "portal-backend";
+
+/// El formato de base desde el que el espacio del portal está cerrado.
+///
+/// Una base con `format` menor la escribió un demonio que dejaba crear ítems con
+/// el esquema del portal y con [`PORTAL_ORIGIN_ATTRIBUTE`] desde el bus. Cada
+/// guardado escribe éste; un demonio de antes que la vuelva a guardar pierde el
+/// campo —no lo conoce— y la base vuelve a ser de antes, que es justo lo que
+/// fue mientras ese demonio corría.
+pub const PORTAL_NAMESPACE_FORMAT: u32 = 1;
+
+/// Los atributos de un ítem leído de una base con formato `format`, con la
+/// marca de origen del portal quitada si la base es de antes de
+/// [`PORTAL_NAMESPACE_FORMAT`].
+///
+/// Quitada y no renombrada: el ítem sigue teniendo el esquema del portal, así
+/// que sigue fuera del bus, pero deja de ser uno que el backend entrega. La
+/// aplicación recibe uno nuevo, como con cualquier secreto de antes.
+fn trusted_attributes(
+    attributes: &HashMap<String, String>,
+    format: u32,
+) -> HashMap<String, String> {
+    if format >= PORTAL_NAMESPACE_FORMAT {
+        return attributes.clone();
+    }
+    let trusted: HashMap<String, String> = attributes
+        .iter()
+        .filter(|(key, _)| !same_skeleton(key, PORTAL_ORIGIN_ATTRIBUTE))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if trusted.len() != attributes.len() {
+        eprintln!(
+            "vasak-keyring: un ítem de una base de antes de 0.7.9 traía la marca de origen del \
+             portal, que entonces podía poner cualquiera: se le quita (Vasak-OS/vasak-keyring#33)"
+        );
+    }
+    trusted
+}
 
 /// Lo que queda de un texto para compararlo contra un nombre reservado: sólo
 /// letras y dígitos ASCII, en minúscula.
@@ -892,7 +933,10 @@ fn write_to(path: &std::path::Path, items: &[ItemInfo]) -> Result<(), String> {
             secret: i.secret.clone(),
         })
         .collect();
-    let db = crypto::KeyringDatabase { items: db_items };
+    let db = crypto::KeyringDatabase {
+        format: PORTAL_NAMESPACE_FORMAT,
+        items: db_items,
+    };
     let data = crypto::encrypt_database(&db, pwd.as_str())
         .map_err(|e| format!("no se pudo cifrar el llavero: {e}"))?;
 
@@ -1860,7 +1904,7 @@ async fn items_from_disk(
             for si in items {
                 loaded.push(ItemInfo {
                     label: si.label.clone(),
-                    attributes: si.attributes.clone(),
+                    attributes: trusted_attributes(&si.attributes, db.format),
                     secret: si.secret.clone(),
                     content_type: "text/plain".into(),
                     created: now(),
@@ -1940,7 +1984,10 @@ async fn adopt_password(
         },
         // Todavía no hay archivo: máquina nueva, y la contraseña que acaba de
         // llegar es la maestra de la base que se va a crear.
-        Ok(None) => crypto::KeyringDatabase { items: vec![] },
+        Ok(None) => crypto::KeyringDatabase {
+            format: PORTAL_NAMESPACE_FORMAT,
+            items: vec![],
+        },
         Err(e) => return Err(e.to_string()),
     };
 
@@ -2011,7 +2058,7 @@ async fn reload_collection(
         let ip = format!("{coll_path}/items/{}", state.take_item_id());
         let info = ItemInfo {
             label: si.label.clone(),
-            attributes: si.attributes.clone(),
+            attributes: trusted_attributes(&si.attributes, db.format),
             secret: si.secret.clone(),
             content_type: "text/plain".into(),
             created: now(),
@@ -2970,8 +3017,9 @@ fn legacy_portal_attributes(app_id: &str) -> HashMap<String, String> {
 /// no lo había pedido, y uno plantado no se distingue de uno legítimo: los dos
 /// tienen los mismos atributos y un secreto que cualquiera sabe generar. Por
 /// eso sólo se busca el que lleva [`PORTAL_ORIGIN_ATTRIBUTE`], que desde esta
-/// versión sólo puede ponerlo el demonio, y el de antes queda en la base sin
-/// usarse ni borrarse. La aplicación recibe uno nuevo y deja de abrir lo que
+/// versión sólo puede ponerlo el demonio —y que en una base de antes se quita
+/// al cargar, porque entonces la podía poner cualquiera—, y el de antes queda
+/// en la base sin usarse ni borrarse. La aplicación recibe uno nuevo y deja de abrir lo que
 /// había cifrado con el anterior: es el precio de no darle una clave que otro
 /// puede conocer. En VasakOS el precio es chico —el portal Secret lo usan las
 /// aplicaciones en sandbox, y el sistema no las trae— y queda en el diario.
@@ -3442,6 +3490,7 @@ mod tests {
     /// estar bloqueado.
     async fn base_con_una_entrada(ruta: &std::path::Path, password: &str) {
         let db = crypto::KeyringDatabase {
+            format: PORTAL_NAMESPACE_FORMAT,
             items: vec![crypto::SecretItem {
                 label: "la que estaba".into(),
                 attributes: HashMap::from([("app".to_string(), "de-prueba".to_string())]),
@@ -5768,6 +5817,118 @@ mod tests {
             .items
             .iter()
             .any(|si| si.attributes == portal_attributes(nueva) && si.secret == primero));
+        assert_eq!(
+            guardado.format, PORTAL_NAMESPACE_FORMAT,
+            "la base se guarda con el formato nuevo: si no, el próximo arranque le quitaría la marca"
+        );
+    }
+
+    /// La marca de origen vale sólo en una base que escribió un demonio que no
+    /// deja crearla desde el bus. En una de antes la pudo haber puesto
+    /// cualquiera —la marca no estaba reservada—, así que se quita al cargar.
+    #[test]
+    fn la_marca_de_origen_de_una_base_de_antes_no_vale() {
+        let marcado = portal_attributes(APP_DEL_PORTAL);
+        let disfrazado = HashMap::from([
+            ("xdg:schema".to_string(), PORTAL_SCHEMA.to_string()),
+            ("app_id".to_string(), APP_DEL_PORTAL.to_string()),
+            (
+                "Vasak-Keyring:Origin".to_string(),
+                PORTAL_ORIGIN_VALUE.to_string(),
+            ),
+        ]);
+
+        for atributos in [&marcado, &disfrazado] {
+            let de_antes = trusted_attributes(atributos, 0);
+            assert_eq!(
+                de_antes,
+                legacy_portal_attributes(APP_DEL_PORTAL),
+                "en una base de antes la marca se quita, y lo demás queda: {atributos:?}"
+            );
+            assert!(
+                is_portal_item(&ItemInfo {
+                    attributes: de_antes,
+                    ..entrada(b"x")
+                }),
+                "sin la marca sigue siendo del portal, y sigue fuera del bus"
+            );
+        }
+        assert_eq!(
+            trusted_attributes(&marcado, PORTAL_NAMESPACE_FORMAT),
+            marcado,
+            "en una base nueva la marca vale"
+        );
+        let comun = HashMap::from([("url".to_string(), "https://ejemplo".to_string())]);
+        assert_eq!(trusted_attributes(&comun, 0), comun);
+    }
+
+    /// Una base con este secreto, escrita con el formato que se diga.
+    async fn base_con_un_secreto_del_portal(
+        ruta: &std::path::Path,
+        password: &str,
+        format: u32,
+        secreto: &[u8],
+    ) {
+        let db = crypto::KeyringDatabase {
+            format,
+            items: vec![crypto::SecretItem {
+                label: format!("Secreto de {APP_DEL_PORTAL}"),
+                attributes: portal_attributes(APP_DEL_PORTAL),
+                secret: secreto.to_vec(),
+            }],
+        };
+        let datos = crypto::encrypt_database(&db, password).expect("no se pudo cifrar la base");
+        tokio::fs::write(ruta, datos)
+            .await
+            .expect("no se pudo escribir la base");
+    }
+
+    /// El caso que la marca sola no cubría: antes de esta versión alguien
+    /// planta el secreto de una aplicación **con la marca puesta**. Al cargar
+    /// esa base, por el arranque o por el desbloqueo, la marca se cae y el
+    /// portal no se lo da a la aplicación. En una base nueva, el mismo ítem sí.
+    #[tokio::test]
+    async fn un_secreto_plantado_con_la_marca_antes_de_esta_version_no_se_entrega() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let _escritura = EscrituraComoEstaba::nuevo();
+        la_base_es_la_de_las_pruebas();
+        let dir = DirDePrueba::nuevo("portal-de-antes");
+        let ruta = dir.ruta().join("keyring.db");
+        let plantado = b"una clave con la marca, elegida por otro";
+        let clave = master_password().expect("la sesión de la prueba está abierta");
+
+        for (format, se_entrega) in [(0, false), (PORTAL_NAMESPACE_FORMAT, true)] {
+            base_con_un_secreto_del_portal(&ruta, &clave, format, plantado).await;
+
+            // Por el arranque.
+            let carga = items_from_disk(&ruta, Some(&clave))
+                .await
+                .expect("la base se lee");
+            assert_eq!(carga.items.len(), 1);
+            assert_eq!(
+                carga.items[0].attributes == portal_attributes(APP_DEL_PORTAL),
+                se_entrega,
+                "arranque, formato {format}: {:?}",
+                carga.items[0].attributes
+            );
+
+            // Por el desbloqueo, que es el que carga la base de la sesión.
+            let db =
+                crypto::decrypt_database(&tokio::fs::read(&ruta).await.expect("la base"), &clave)
+                    .expect("la base se abre");
+            let estado = Arc::new(Mutex::new(KeyringState::new()));
+            reload_collection(&estado, COLECCION_DEL_LOGIN, &db).await;
+
+            let recibido = app_master_secret(&estado, APP_DEL_PORTAL)
+                .await
+                .expect("la aplicación recibe un secreto");
+            assert_eq!(
+                recibido == plantado,
+                se_entrega,
+                "desbloqueo, formato {format}: la marca de una base de antes no vale"
+            );
+        }
     }
 
     /// Un secreto de antes de esta versión —sin la marca— pudo haberlo plantado

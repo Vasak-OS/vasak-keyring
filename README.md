@@ -72,7 +72,12 @@ así que la reserva siempre cubre todo lo que el backend puede encontrar.
 **Los secretos de antes de 0.7.9 no se entregan.** Mientras el esquema estuvo
 abierto, uno plantado no se distingue de uno legítimo. Desde 0.7.9 el demonio
 marca los que crea con `vasak-keyring:origin = portal-backend`, que ningún
-cliente del bus puede poner, y sólo entrega ésos: una aplicación que tenía un
+cliente del bus puede poner, y sólo entrega ésos. La marca sola no alcanza —un
+demonio de antes no la reservaba, así que también se pudo plantar—, y por eso la
+base lleva un campo `format`: la que escribe 0.7.9 o posterior dice `1`, y en
+una sin el campo (la de un demonio de antes, o una que un demonio de antes volvió
+a guardar después de un retroceso de versión) la marca se quita al cargar. Una
+aplicación que tenía un
 secreto de antes recibe uno nuevo la próxima vez que lo pide —y deja de abrir lo
 que hubiera cifrado con el anterior—, y el diario lo dice. El de antes queda en
 la base sin usarse. En VasakOS el portal Secret lo usan sólo las aplicaciones en

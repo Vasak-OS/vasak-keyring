@@ -548,6 +548,15 @@ fn coincide(item: &ItemInfo, buscados: &HashMap<String, String>) -> bool {
         .all(|(k, v)| item.attributes.get(k) == Some(v))
 }
 
+/// Si una colección guarda algún ítem del almacén.
+fn coleccion_protegida(state: &KeyringState, ruta: &str) -> bool {
+    state.collections.get(ruta).is_some_and(|col| {
+        col.items
+            .iter()
+            .any(|ip| state.items.get(ip).is_some_and(es_esquema_protegido))
+    })
+}
+
 /// Si el ítem de esa ruta es del almacén. Uno que no existe no lo es: el que
 /// llama recibe el mismo «no encontrado» de siempre.
 async fn ruta_protegida(state: &Mutex<KeyringState>, ruta: &str) -> bool {
@@ -1443,24 +1452,28 @@ impl CollectionInterface {
         &mut self,
         #[zbus(header)] cabecera: zbus::message::Header<'_>,
     ) -> Result<OwnedObjectPath, zbus::fdo::Error> {
-        let protegida = {
-            let state = self.state.lock().await;
-            state.collections.get(&self.path).is_some_and(|col| {
-                col.items
-                    .iter()
-                    .any(|ip| state.items.get(ip).is_some_and(es_esquema_protegido))
-            })
-        };
-        if !puede_tocar_el_almacen(&self.conn, &cabecera, &self.state, protegida).await {
-            return Err(zbus::fdo::Error::AccessDenied(
+        let negado = || {
+            zbus::fdo::Error::AccessDenied(
                 "la colección guarda la clave del almacén de cuentas".into(),
-            ));
+            )
+        };
+        let protegida = coleccion_protegida(&*self.state.lock().await, &self.path);
+        let autorizado =
+            puede_tocar_el_almacen(&self.conn, &cabecera, &self.state, protegida).await;
+        if !autorizado {
+            return Err(negado());
         }
 
         let orphaned_aliases: Vec<String>;
         let removed_items: Vec<String>;
         {
             let mut state = self.state.lock().await;
+            // Se vuelve a mirar con el candado que borra: mientras la puerta iba
+            // al bus, el sincronizador pudo haber guardado su clave acá. Si la
+            // colección pasó a tenerla y la puerta no se consultó, falla cerrado.
+            if !protegida && coleccion_protegida(&state, &self.path) {
+                return Err(negado());
+            }
             removed_items = match state.collections.remove(&self.path) {
                 Some(col) => col.items,
                 None => Vec::new(),
@@ -4479,6 +4492,49 @@ mod tests {
             !almacen.preguntados().await.is_empty(),
             "con un ítem del almacén en la lista la puerta se consulta"
         );
+    }
+
+    /// La regla que `Collection.Delete` vuelve a mirar con el candado tomado:
+    /// una colección es del almacén si tiene **algún** ítem con su esquema, y
+    /// deja de serlo cuando ya no tiene ninguno.
+    #[test]
+    fn una_coleccion_es_del_almacen_si_guarda_algun_item_suyo() {
+        let item = |protegido: bool| ItemInfo {
+            label: "x".into(),
+            attributes: if protegido {
+                HashMap::from([(ATRIBUTO_ESQUEMA.to_string(), ESQUEMA_PROTEGIDO.to_string())])
+            } else {
+                HashMap::new()
+            },
+            secret: Vec::new(),
+            content_type: "text/plain".into(),
+            created: 0,
+            modified: 0,
+        };
+        let mut state = KeyringState::new();
+        state.collections.insert(
+            "/c".into(),
+            CollectionInfo {
+                label: "c".into(),
+                locked: false,
+                items: vec!["/c/items/0".into()],
+                created: 0,
+                modified: 0,
+            },
+        );
+        state.items.insert("/c/items/0".into(), item(false));
+        assert!(!coleccion_protegida(&state, "/c"));
+        assert!(!coleccion_protegida(&state, "/no-existe"));
+
+        // El sincronizador guarda su clave mientras la puerta iba al bus.
+        state.items.insert("/c/items/1".into(), item(true));
+        state
+            .collections
+            .get_mut("/c")
+            .expect("la colección")
+            .items
+            .push("/c/items/1".into());
+        assert!(coleccion_protegida(&state, "/c"));
     }
 
     /// Las pruebas no escriben nunca en el llavero de quien las corre.

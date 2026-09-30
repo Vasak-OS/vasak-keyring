@@ -579,8 +579,13 @@ async fn ruta_protegida(state: &Mutex<KeyringState>, ruta: &str) -> bool {
 /// ninguno la reimplementa. Y separada de la puerta, porque la puerta se puede
 /// romper sin que se rompa esta, así que las pruebas de las dos cosas tienen que
 /// poder fallar por separado.
-fn acceso_permitido(item: &ItemInfo, autorizado: bool) -> bool {
-    !es_esquema_protegido(item) || autorizado
+///
+/// Un secreto del portal no se le entrega a nadie, autorizado o no: el
+/// `autorizado` es el del almacén de cuentas, y el portal no tiene a nadie
+/// autorizado en el bus (Vasak-OS/vasak-keyring#33). Va acá y no sólo en los
+/// métodos porque es la segunda mirada, la que se hace con el candado tomado.
+fn access_allowed(item: &ItemInfo, autorizado: bool) -> bool {
+    !is_portal_item(item) && (!es_esquema_protegido(item) || autorizado)
 }
 
 /// Verifica si el proceso que llama está autorizado para acceder a un esquema protegido.
@@ -724,6 +729,129 @@ fn es_el_sincronizador(
 /// termina cediendo en el `if` de arriba.
 fn es_el_autorizado(ejecutable: &str, esperado: &str) -> bool {
     ejecutable == esperado
+}
+
+// ── El espacio de nombres del portal ───────────────────────
+//
+// Los secretos maestros que el backend del portal le da a cada aplicación son
+// del demonio, no de quien habla por el Secret Service. Antes cualquier proceso
+// de la sesión podía plantar el de una aplicación antes de que lo pidiera
+// (`CreateItem`), reemplazarlo (`CreateItem` con `replace`, `SetSecret`),
+// leerlo (`GetSecret`) o borrarlo, y la aplicación terminaba cifrando con una
+// clave que el otro conocía (Vasak-OS/vasak-keyring#33).
+//
+// La regla es «nadie desde el bus», sin excepción y sin preguntarle nada a
+// nadie: el backend del portal corre adentro del demonio y lee el estado
+// directo, así que no hay ningún cliente legítimo del Secret Service para estos
+// ítems. No es la puerta del almacén de cuentas, que deja pasar a uno: acá no
+// pasa ni el sincronizador.
+//
+// Y no sólo se niegan: **no existen** para el bus. No se publican como
+// objetos, no aparecen en `Items` ni en `SearchItems`, y `GetSecrets` los
+// omite. Negarlos con `AccessDenied` en un listado dejaría saber qué
+// aplicaciones usan el portal, y cada método nuevo tendría que acordarse de la
+// negación. Los métodos de `Item` igual los niegan, como segunda capa, por si
+// algún camino futuro llega a publicar uno.
+
+/// El esquema con el que el backend del portal guarda el secreto maestro de
+/// cada aplicación, por convención de freedesktop.
+pub const PORTAL_SCHEMA: &str = "org.freedesktop.portal.Secret";
+
+/// El atributo con el que el demonio marca los secretos maestros que crea.
+///
+/// Sirve para una sola cosa: distinguir los que creó el demonio de los que ya
+/// estaban en el llavero antes de esta versión. Hasta acá cualquier proceso
+/// podía crear un ítem con el esquema del portal, y uno plantado y uno legítimo
+/// son indistinguibles —el mismo nombre, los mismos atributos, 64 bytes que
+/// cualquiera sabe generar—. Desde esta versión ningún cliente del bus puede
+/// crear un ítem con el esquema **ni con esta marca**, así que un ítem que la
+/// tiene lo creó el demonio. Ver [`app_master_secret`].
+const PORTAL_ORIGIN_ATTRIBUTE: &str = "vasak-keyring:origin";
+const PORTAL_ORIGIN_VALUE: &str = "portal-backend";
+
+/// Lo que queda de un texto para compararlo contra un nombre reservado: sólo
+/// letras y dígitos ASCII, en minúscula.
+///
+/// Es a propósito más ancho que la búsqueda del portal, que compara exacto. La
+/// búsqueda sólo encuentra lo que tiene los atributos exactos, así que un
+/// parecido —`Org.Freedesktop.Portal.Secret`, un espacio al final, un espacio
+/// de ancho cero, `xdg_schema` por `xdg:schema`— hoy no se le daría a ninguna
+/// aplicación. Pero que la reserva sea más ancha que la búsqueda es lo que hace
+/// que la búsqueda se pueda aflojar mañana sin abrir el agujero de nuevo, y que
+/// nadie pueda dejar en el llavero algo que en un listado se lea como un
+/// secreto del portal.
+fn skeleton(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+}
+
+/// Si dos textos son el mismo nombre para la reserva. Ver [`skeleton`].
+fn same_skeleton(a: &str, b: &str) -> bool {
+    skeleton(a).eq(skeleton(b))
+}
+
+/// Si una lista de atributos es de un secreto del portal.
+///
+/// Lo es si **algún** par lleva el esquema del portal —con la clave y el valor
+/// comparados por [`skeleton`]— o si lleva la marca de origen, con cualquier
+/// valor. Se recorren todos los pares y no se busca la clave exacta: un mapa
+/// con `xdg:schema` y `XDG:Schema` a la vez tiene dos claves distintas, y la
+/// que importa puede ser cualquiera de las dos.
+fn is_portal_attributes(attributes: &HashMap<String, String>) -> bool {
+    attributes.iter().any(|(key, value)| {
+        same_skeleton(key, PORTAL_ORIGIN_ATTRIBUTE)
+            || (same_skeleton(key, ATRIBUTO_ESQUEMA) && same_skeleton(value, PORTAL_SCHEMA))
+    })
+}
+
+/// Si un ítem es un secreto del portal.
+fn is_portal_item(item: &ItemInfo) -> bool {
+    is_portal_attributes(&item.attributes)
+}
+
+/// Si el ítem de esa ruta es un secreto del portal. Uno que no existe no lo es.
+async fn is_portal_path(state: &Mutex<KeyringState>, path: &str) -> bool {
+    state
+        .lock()
+        .await
+        .items
+        .get(path)
+        .is_some_and(is_portal_item)
+}
+
+/// Si una colección guarda algún secreto del portal.
+fn holds_portal_items(state: &KeyringState, collection: &str) -> bool {
+    state.collections.get(collection).is_some_and(|col| {
+        col.items
+            .iter()
+            .any(|ip| state.items.get(ip).is_some_and(is_portal_item))
+    })
+}
+
+/// De estas rutas, las que se publican en el bus: todas menos las del portal.
+///
+/// Es el único lugar que lo decide, y lo usan los caminos que publican ítems
+/// —el arranque y el desbloqueo—, para que ninguno publique un secreto del
+/// portal por su cuenta.
+fn published_paths(state: &KeyringState, paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|ip| {
+            state
+                .items
+                .get(ip.as_str())
+                .is_some_and(|item| !is_portal_item(item))
+        })
+        .cloned()
+        .collect()
+}
+
+/// El negativo de un método de `Item` sobre un secreto del portal.
+fn portal_denied() -> zbus::fdo::Error {
+    zbus::fdo::Error::AccessDenied(
+        "el ítem es un secreto del portal: sólo lo usa el propio llavero".into(),
+    )
 }
 
 /// Writes every item to the encrypted database.
@@ -965,7 +1093,7 @@ impl ItemInterface {
         &self,
         #[zbus(header)] cabecera: Option<zbus::message::Header<'_>>,
     ) -> Result<String, zbus::fdo::Error> {
-        self.describir(cabecera.as_ref()).await?;
+        self.check_describe(cabecera.as_ref()).await?;
         self.state
             .lock()
             .await
@@ -983,7 +1111,7 @@ impl ItemInterface {
         &self,
         #[zbus(header)] cabecera: Option<zbus::message::Header<'_>>,
     ) -> Result<HashMap<String, String>, zbus::fdo::Error> {
-        self.describir(cabecera.as_ref()).await?;
+        self.check_describe(cabecera.as_ref()).await?;
         self.state
             .lock()
             .await
@@ -996,6 +1124,9 @@ impl ItemInterface {
     #[zbus(property)]
     async fn locked(&self) -> Result<bool, zbus::fdo::Error> {
         let state = self.state.lock().await;
+        if state.items.get(&self.path).is_some_and(is_portal_item) {
+            return Err(portal_denied());
+        }
         for col in state.collections.values() {
             if col.items.contains(&self.path) {
                 return Ok(effectively_locked(col.locked));
@@ -1006,24 +1137,28 @@ impl ItemInterface {
 
     #[zbus(property)]
     async fn created(&self) -> Result<u64, zbus::fdo::Error> {
-        self.state
-            .lock()
-            .await
+        let state = self.state.lock().await;
+        let item = state
             .items
             .get(&self.path)
-            .map(|i| i.created)
-            .ok_or_else(|| dbus_err("item not found"))
+            .ok_or_else(|| dbus_err("item not found"))?;
+        if is_portal_item(item) {
+            return Err(portal_denied());
+        }
+        Ok(item.created)
     }
 
     #[zbus(property)]
     async fn modified(&self) -> Result<u64, zbus::fdo::Error> {
-        self.state
-            .lock()
-            .await
+        let state = self.state.lock().await;
+        let item = state
             .items
             .get(&self.path)
-            .map(|i| i.modified)
-            .ok_or_else(|| dbus_err("item not found"))
+            .ok_or_else(|| dbus_err("item not found"))?;
+        if is_portal_item(item) {
+            return Err(portal_denied());
+        }
+        Ok(item.modified)
     }
 
     /// Returns the secret as a single struct argument.
@@ -1051,13 +1186,19 @@ impl ItemInterface {
         //
         // Entre las dos tomas del lock el ítem puede cambiar. Si pasa a ser
         // protegido, `autorizado` quedó en `false` y se niega: falla cerrado.
+        //
+        // Un secreto del portal se niega antes que nada y sin ir al bus: no hay
+        // nadie a quien preguntar por él (#33).
         let (protegido, esperado) = {
             let state = self.state.lock().await;
-            let protegido = state
-                .items
-                .get(&self.path)
-                .is_some_and(es_esquema_protegido);
-            (protegido, state.ejecutable_del_sincronizador())
+            let item = state.items.get(&self.path);
+            if item.is_some_and(is_portal_item) {
+                return Err(SecretError::AccessDenied);
+            }
+            (
+                item.is_some_and(es_esquema_protegido),
+                state.ejecutable_del_sincronizador(),
+            )
         };
         let autorizado =
             protegido && autorizado_para_esquema_protegido(&self.conn, &cabecera, &esperado).await;
@@ -1076,7 +1217,7 @@ impl ItemInterface {
             .get(&self.path)
             .ok_or_else(|| dbus_err("item not found"))?;
 
-        if !acceso_permitido(item, autorizado) {
+        if !access_allowed(item, autorizado) {
             return Err(SecretError::AccessDenied);
         }
 
@@ -1103,6 +1244,12 @@ impl ItemInterface {
         // Reemplazar el secreto del ítem del almacén es elegir la clave con la
         // que se abre la base. Se mira el ítem que **está**, no lo que llega, y
         // antes que si se puede escribir.
+        //
+        // Y el secreto de una aplicación, que no lo cambia nadie desde el bus:
+        // era la forma de dejarla cifrando con una clave ajena (#33).
+        if is_portal_path(&self.state, &self.path).await {
+            return Err(SecretError::AccessDenied);
+        }
         let protegido = ruta_protegida(&self.state, &self.path).await;
         if !puede_tocar_el_almacen(&self.conn, &cabecera, &self.state, protegido).await {
             return Err(SecretError::AccessDenied);
@@ -1147,6 +1294,10 @@ impl ItemInterface {
     ) -> Result<OwnedObjectPath, zbus::fdo::Error> {
         // Borrar la clave del almacén deja la base sin quien la abra, y el
         // sincronizador crearía una nueva: es la misma sustitución por otro lado.
+        // Con el secreto de una aplicación pasa igual, y ése no lo borra nadie.
+        if is_portal_path(&self.state, &self.path).await {
+            return Err(portal_denied());
+        }
         let protegido = ruta_protegida(&self.state, &self.path).await;
         if !puede_tocar_el_almacen(&self.conn, &cabecera, &self.state, protegido).await {
             return Err(zbus::fdo::Error::AccessDenied(
@@ -1182,10 +1333,14 @@ impl ItemInterface {
     /// La cabecera es `Option` porque así la da zbus en una propiedad: un
     /// `Get` desde adentro del propio demonio no trae mensaje. Sin cabecera no
     /// se sabe quién pide, y para un ítem del almacén eso es un no.
-    async fn describir(
+    async fn check_describe(
         &self,
         cabecera: Option<&zbus::message::Header<'_>>,
     ) -> Result<(), zbus::fdo::Error> {
+        // Un secreto del portal no se le describe a nadie, ni con cabecera.
+        if is_portal_path(&self.state, &self.path).await {
+            return Err(portal_denied());
+        }
         if !ruta_protegida(&self.state, &self.path).await {
             return Ok(());
         }
@@ -1278,6 +1433,8 @@ impl CollectionInterface {
             .ok_or_else(|| dbus_err("collection not found"))
     }
 
+    /// Los ítems de la colección, sin los secretos del portal: para el bus no
+    /// existen (#33).
     #[zbus(property)]
     async fn items(&self) -> Vec<OwnedObjectPath> {
         let state = self.state.lock().await;
@@ -1285,7 +1442,7 @@ impl CollectionInterface {
             .collections
             .get(&self.path)
             .map(|c| {
-                c.items
+                published_paths(&state, &c.items)
                     .iter()
                     .filter_map(|ip| owned_path_try(ip).ok())
                     .collect()
@@ -1316,6 +1473,11 @@ impl CollectionInterface {
                         .iter()
                         .filter_map(|ip| {
                             let item = state.items.get(ip)?;
+                            // Los del portal, para nadie: ni se cuentan para
+                            // decidir si hay que preguntarle al bus.
+                            if is_portal_item(item) {
+                                return None;
+                            }
                             coincide(item, &attributes)
                                 .then(|| (ip.clone(), es_esquema_protegido(item)))
                         })
@@ -1359,6 +1521,22 @@ impl CollectionInterface {
             .and_then(value_to_attrmap)
             .unwrap_or_default();
 
+        // El esquema del portal —o la marca con la que el demonio firma sus
+        // secretos— no lo crea nadie desde el bus, con `replace` o sin él: sin
+        // `replace` se plantaba el secreto de una aplicación antes de que lo
+        // pidiera, y con `replace` se le cambiaba el que tenía (#33). Va antes
+        // que todo y sin preguntarle nada al bus: no hay a quién.
+        if is_portal_attributes(&attributes) {
+            eprintln!(
+                "vasak-keyring: se rechaza un CreateItem de {} con el esquema del portal",
+                cabecera
+                    .sender()
+                    .map(|s| s.as_str().to_owned())
+                    .unwrap_or_else(|| "un emisor desconocido".into())
+            );
+            return Err(SecretError::AccessDenied);
+        }
+
         // Quién pide, antes que si se puede escribir: a quien no puede tocar el
         // almacén no le importa si el llavero está abierto.
         let protegido = atributos_protegidos(&attributes);
@@ -1386,10 +1564,12 @@ impl CollectionInterface {
                 col.items
                     .iter()
                     .filter(|ip| {
-                        state
-                            .items
-                            .get(*ip)
-                            .is_some_and(|item| item.attributes == attributes)
+                        // Un secreto del portal nunca se reemplaza, aunque los
+                        // atributos coincidan: la puerta de arriba ya lo impide,
+                        // y esto es la segunda mirada, con el candado tomado.
+                        state.items.get(*ip).is_some_and(|item| {
+                            item.attributes == attributes && !is_portal_item(item)
+                        })
                     })
                     .cloned()
                     .collect()
@@ -1457,7 +1637,24 @@ impl CollectionInterface {
                 "la colección guarda la clave del almacén de cuentas".into(),
             )
         };
-        let protegida = coleccion_protegida(&*self.state.lock().await, &self.path);
+        // Una colección con secretos del portal no la borra nadie: se llevaría
+        // el de cada aplicación, que al volver a pedirlo recibiría uno nuevo y
+        // perdería todo lo que había cifrado (#33).
+        let negado_portal = || {
+            zbus::fdo::Error::AccessDenied(
+                "la colección guarda secretos del portal, que sólo usa el llavero".into(),
+            )
+        };
+        let (protegida, del_portal) = {
+            let state = self.state.lock().await;
+            (
+                coleccion_protegida(&state, &self.path),
+                holds_portal_items(&state, &self.path),
+            )
+        };
+        if del_portal {
+            return Err(negado_portal());
+        }
         let autorizado =
             puede_tocar_el_almacen(&self.conn, &cabecera, &self.state, protegida).await;
         if !autorizado {
@@ -1473,6 +1670,11 @@ impl CollectionInterface {
             // colección pasó a tenerla y la puerta no se consultó, falla cerrado.
             if !protegida && coleccion_protegida(&state, &self.path) {
                 return Err(negado());
+            }
+            // Lo mismo con el portal: mientras la puerta iba al bus, una
+            // aplicación pudo haber pedido su secreto por primera vez.
+            if holds_portal_items(&state, &self.path) {
+                return Err(negado_portal());
             }
             removed_items = match state.collections.remove(&self.path) {
                 Some(col) => col.items,
@@ -1980,8 +2182,9 @@ impl ServiceInterface {
                 .insert("default".to_string(), path.to_string());
         }
 
-        // Register item interfaces
-        for ip in &item_paths {
+        // Register item interfaces. Los secretos del portal no: para el bus no
+        // existen (#33).
+        for ip in &published_paths(&state, &item_paths) {
             let iface = ItemInterface {
                 state: self.state.clone(),
                 conn: self.conn.clone(),
@@ -2149,6 +2352,9 @@ impl ServiceInterface {
                 .flat_map(|col| {
                     col.items.iter().filter_map(|ip| {
                         let item = state.items.get(ip)?;
+                        if is_portal_item(item) {
+                            return None;
+                        }
                         coincide(item, &attributes).then(|| {
                             (
                                 ip.clone(),
@@ -2359,7 +2565,7 @@ impl ServiceInterface {
                     // es el mismo trato que reciben las colecciones bloqueadas
                     // acá arriba, y el contrato de `GetSecrets` es devolver la
                     // parte que sí se puede leer.
-                    if !acceso_permitido(item, autorizado) {
+                    if !access_allowed(item, autorizado) {
                         continue;
                     }
                     // Encrypted sessions used to be skipped outright here, so a
@@ -2640,6 +2846,9 @@ impl PamUnlockInterface {
         // puede escribir. Sacarlos en funciones separadas fue lo que abrió la
         // ventana; ver `reload_collection`.
         let (item_paths, stale_paths) = reload_collection(&self.state, &coll_path, &db).await;
+        // Lo que se publica y se avisa es lo que el bus puede ver: los secretos
+        // del portal quedan en memoria para el backend y fuera del bus (#33).
+        let item_paths = published_paths(&*self.state.lock().await, &item_paths);
 
         for ip in &stale_paths {
             let _ = self
@@ -2696,14 +2905,11 @@ impl PamUnlockInterface {
 
 // ── Secreto maestro por aplicación (portal Secret) ─────────
 
-/// Atributo con el que se marcan estos secretos, por convención de freedesktop.
-pub const ESQUEMA_PORTAL: &str = "org.freedesktop.portal.Secret";
-
 /// Cuántos bytes tiene el secreto maestro que se le da a una aplicación.
 ///
 /// Es una clave, no una contraseña: no la escribe nadie, así que conviene que
 /// sea larga. 64 bytes es lo que usan las otras implementaciones del portal.
-const LARGO_SECRETO_PORTAL: usize = 64;
+const PORTAL_SECRET_LEN: usize = 64;
 
 /// Serializa la creación de secretos maestros.
 ///
@@ -2717,26 +2923,60 @@ const LARGO_SECRETO_PORTAL: usize = 64;
 /// Un único candado global y no uno por aplicación: un secreto maestro se crea
 /// una vez en la vida de cada programa, así que serializarlos todos no cuesta
 /// nada y no hay que mantener un mapa de candados.
-fn candado_de_creacion() -> &'static Mutex<()> {
-    static CANDADO: OnceLock<Mutex<()>> = OnceLock::new();
-    CANDADO.get_or_init(|| Mutex::new(()))
+fn creation_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Los atributos con los que el demonio guarda el secreto de `app_id`: el
+/// esquema del portal, la aplicación, y la marca de que lo creó el demonio.
+fn portal_attributes(app_id: &str) -> HashMap<String, String> {
+    HashMap::from([
+        (ATRIBUTO_ESQUEMA.to_string(), PORTAL_SCHEMA.to_string()),
+        ("app_id".to_string(), app_id.to_string()),
+        (
+            PORTAL_ORIGIN_ATTRIBUTE.to_string(),
+            PORTAL_ORIGIN_VALUE.to_string(),
+        ),
+    ])
+}
+
+/// Los atributos con los que se guardaba el secreto de `app_id` hasta 0.7.8,
+/// sin la marca. Un ítem así no se le da a la aplicación: ver
+/// [`app_master_secret`].
+fn legacy_portal_attributes(app_id: &str) -> HashMap<String, String> {
+    HashMap::from([
+        (ATRIBUTO_ESQUEMA.to_string(), PORTAL_SCHEMA.to_string()),
+        ("app_id".to_string(), app_id.to_string()),
+    ])
 }
 
 /// El secreto maestro de una aplicación, creándolo la primera vez.
 ///
 /// La especificación del portal pide que sea **único por aplicación y estable
 /// mientras esté instalada**, así que no se deriva de nada: se genera al azar la
-/// primera vez y queda guardado en el llavero como cualquier otro secreto. Si se
-/// derivara de la contraseña maestra, cambiar la contraseña de la cuenta
-/// cambiaría el secreto de todas las aplicaciones a la vez, y lo que cada una
-/// hubiera cifrado con él dejaría de abrirse.
+/// primera vez y queda guardado en el llavero. Si se derivara de la contraseña
+/// maestra, cambiar la contraseña de la cuenta cambiaría el secreto de todas las
+/// aplicaciones a la vez, y lo que cada una hubiera cifrado con él dejaría de
+/// abrirse.
 ///
-/// Queda visible en el Secret Service como una entrada más, a propósito: es un
-/// secreto que el escritorio guarda en nombre de la persona, y tiene que poder
-/// verlo y borrarlo como cualquier otro.
-pub async fn secreto_maestro_de_app(
+/// **No se publica en el Secret Service.** Hasta 0.7.8 quedaba como una
+/// entrada más, y eso era el agujero: cualquier proceso de la sesión podía
+/// leerlo, cambiarlo, borrarlo o plantarlo antes (#33). Ahora es del demonio;
+/// ver «El espacio de nombres del portal».
+///
+/// **Y un secreto de antes de esta versión no se entrega.** Mientras el esquema
+/// estuvo abierto, cualquiera pudo haber creado el de una aplicación que todavía
+/// no lo había pedido, y uno plantado no se distingue de uno legítimo: los dos
+/// tienen los mismos atributos y un secreto que cualquiera sabe generar. Por
+/// eso sólo se busca el que lleva [`PORTAL_ORIGIN_ATTRIBUTE`], que desde esta
+/// versión sólo puede ponerlo el demonio, y el de antes queda en la base sin
+/// usarse ni borrarse. La aplicación recibe uno nuevo y deja de abrir lo que
+/// había cifrado con el anterior: es el precio de no darle una clave que otro
+/// puede conocer. En VasakOS el precio es chico —el portal Secret lo usan las
+/// aplicaciones en sandbox, y el sistema no las trae— y queda en el diario.
+pub async fn app_master_secret(
     state: &Arc<Mutex<KeyringState>>,
-    conn: &Connection,
     app_id: &str,
 ) -> Result<Vec<u8>, String> {
     if app_id.is_empty() {
@@ -2750,93 +2990,88 @@ pub async fn secreto_maestro_de_app(
     // descifrar escribiría una base vacía por encima de la que la persona tenía.
     ensure_unlocked()?;
 
-    let atributos: HashMap<String, String> = HashMap::from([
-        ("xdg:schema".to_string(), ESQUEMA_PORTAL.to_string()),
-        ("app_id".to_string(), app_id.to_string()),
-    ]);
+    let attributes = portal_attributes(app_id);
 
     // Todo el «buscar, y si no está crear» va bajo un mismo candado: si dos
     // pedidos simultáneos pasaran los dos por la búsqueda, crearían dos secretos
-    // distintos para la misma aplicación. Ver `candado_de_creacion`.
-    let _guardia = candado_de_creacion().lock().await;
+    // distintos para la misma aplicación. Ver `creation_lock`.
+    let _guard = creation_lock().lock().await;
 
-    if let Some(existente) = buscar_secreto(state, &atributos).await {
-        return Ok(existente);
+    if let Some(existing) = find_secret(state, &attributes).await {
+        return Ok(existing);
+    }
+
+    if find_secret(state, &legacy_portal_attributes(app_id))
+        .await
+        .is_some()
+    {
+        eprintln!(
+            "vasak-keyring: «{app_id}» tenía un secreto del portal de antes de 0.7.9, cuando \
+             cualquier proceso podía crearlo o cambiarlo. No se le entrega: recibe uno nuevo, \
+             y lo que haya cifrado con el anterior deja de abrirse (Vasak-OS/vasak-keyring#33)"
+        );
     }
 
     use rand::RngCore;
-    let mut secreto = vec![0u8; LARGO_SECRETO_PORTAL];
-    rand::thread_rng().fill_bytes(&mut secreto);
+    let mut secret = vec![0u8; PORTAL_SECRET_LEN];
+    rand::thread_rng().fill_bytes(&mut secret);
 
-    let coleccion = "/org/freedesktop/secrets/collection/login";
-    let ruta = {
-        let mut estado = state.lock().await;
-        let ruta = format!("{coleccion}/items/{}", estado.take_item_id());
+    let collection = "/org/freedesktop/secrets/collection/login";
+    let path = {
+        let mut state = state.lock().await;
+        let path = format!("{collection}/items/{}", state.take_item_id());
 
-        estado.items.insert(
-            ruta.clone(),
+        state.items.insert(
+            path.clone(),
             ItemInfo {
                 label: format!("Secreto de {app_id}"),
-                attributes: atributos,
-                secret: secreto.clone(),
+                attributes,
+                secret: secret.clone(),
                 content_type: "application/octet-stream".into(),
                 created: now(),
                 modified: now(),
             },
         );
-        if let Some(col) = estado.collections.get_mut(coleccion) {
-            col.items.push(ruta.clone());
+        if let Some(col) = state.collections.get_mut(collection) {
+            col.items.push(path.clone());
             col.modified = now();
         }
-        ruta
+        path
     };
 
-    // Se guarda **antes** de publicarlo y antes de devolverlo. Si el disco falla,
-    // la aplicación no debe recibir un secreto que en el próximo arranque no va a
-    // existir: cifraría sus datos con una clave que se pierde.
+    // Se guarda **antes** de devolverlo. Si el disco falla, la aplicación no debe
+    // recibir un secreto que en el próximo arranque no va a existir: cifraría sus
+    // datos con una clave que se pierde.
     let items: Vec<ItemInfo> = {
-        let estado = state.lock().await;
-        estado.items.values().cloned().collect()
+        let state = state.lock().await;
+        state.items.values().cloned().collect()
     };
     if let Err(e) = save_db(&items) {
         // Y si falló, el secreto se deshace. Dejándolo en memoria, el próximo
         // pedido lo encontraría y lo devolvería sin volver a intentar escribir:
         // un error transitorio de disco alcanzaría para que la aplicación cifre
         // con una clave que desaparece al reiniciar.
-        let mut estado = state.lock().await;
-        estado.items.remove(&ruta);
-        if let Some(col) = estado.collections.get_mut(coleccion) {
-            col.items.retain(|p| p != &ruta);
+        let mut state = state.lock().await;
+        state.items.remove(&path);
+        if let Some(col) = state.collections.get_mut(collection) {
+            col.items.retain(|p| p != &path);
         }
         return Err(e);
     }
 
-    // Recién ahora se publica en el bus, con el secreto ya en disco.
-    let iface = ItemInterface {
-        state: state.clone(),
-        conn: conn.clone(),
-        path: ruta.clone(),
-    };
-    if let Err(e) = conn.object_server().at(ruta.clone(), iface).await {
-        // No es fatal: el secreto existe y está guardado. Lo único que se pierde
-        // es que aparezca como entrada del Secret Service hasta el próximo
-        // arranque, donde se registra al cargar la base.
-        eprintln!("vasak-keyring: no se pudo publicar {ruta}: {e}");
-    }
-
-    Ok(secreto)
+    Ok(secret)
 }
 
-/// Busca un secreto ya guardado por sus atributos.
-async fn buscar_secreto(
+/// Busca un secreto ya guardado por sus atributos, exactos.
+async fn find_secret(
     state: &Arc<Mutex<KeyringState>>,
-    atributos: &HashMap<String, String>,
+    attributes: &HashMap<String, String>,
 ) -> Option<Vec<u8>> {
-    let estado = state.lock().await;
-    estado
+    let state = state.lock().await;
+    state
         .items
         .values()
-        .find(|item| &item.attributes == atributos)
+        .find(|item| &item.attributes == attributes)
         .map(|item| item.secret.clone())
 }
 
@@ -3456,7 +3691,7 @@ mod tests {
         let item = entrada_protegida(b"la clave del almacen");
 
         assert!(
-            !acceso_permitido(&item, false),
+            !access_allowed(&item, false),
             "un proceso que no es el sincronizador no puede leer el item protegido: \
              el llavero lo entregaba a cualquiera"
         );
@@ -3471,7 +3706,7 @@ mod tests {
         let item = entrada("la contraseña del navegador".as_bytes());
 
         assert!(
-            acceso_permitido(&item, false),
+            access_allowed(&item, false),
             "el control es sobre el item protegido, no sobre el llavero entero"
         );
     }
@@ -3484,7 +3719,7 @@ mod tests {
         let item = entrada_protegida(b"la clave del almacen");
 
         assert!(
-            acceso_permitido(&item, true),
+            access_allowed(&item, true),
             "el sincronizador de cuentas es el que puede leer el almacen"
         );
     }
@@ -3509,7 +3744,7 @@ mod tests {
                 ..entrada(b"secreto")
             };
             assert!(
-                acceso_permitido(&item, false),
+                access_allowed(&item, false),
                 "`{esquema}` no es el esquema protegido y no puede quedar bloqueado"
             );
         }
@@ -3526,7 +3761,7 @@ mod tests {
         };
 
         assert!(
-            acceso_permitido(&item, false),
+            access_allowed(&item, false),
             "sin el atributo no hay nada que proteger"
         );
     }
@@ -3571,7 +3806,7 @@ mod tests {
     /// El mismo bug, pero por el camino que de verdad lo exercise un atacante:
     /// una llamada `GetSecret` de verdad, por el bus, contra el demonio de verdad.
     ///
-    /// La prueba de `acceso_permitido` comprobaría una función; ésta comprueba el
+    /// La prueba de `access_allowed` comprobaría una función; ésta comprueba el
     /// método. La diferencia importa porque lo que estaba roto no era la regla,
     /// era que `GetSecret` no la llamaba —y una función correcta que nadie invoca
     /// deja el agujero abierto con la suite en verde—.
@@ -4325,7 +4560,7 @@ mod tests {
     /// El sincronizador lee su clave del almacén cifrado con un `GetSecret`.
     ///
     /// La cadena entera: cabecera con emisor, ida y vuelta al bus por el nombre,
-    /// pid que el bus atribuye, `/proc/<pid>/exe`, `acceso_permitido`, y la
+    /// pid que el bus atribuye, `/proc/<pid>/exe`, `access_allowed`, y la
     /// respuesta con la clave adentro.
     ///
     /// La sesión abierta no es un detalle del andamiaje: `get_secret` comprueba el

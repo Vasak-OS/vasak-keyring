@@ -106,8 +106,8 @@ pub fn encrypt(session_key: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>
     let mut iv = [0u8; AES_BLOCK_BYTES];
     rand::rngs::OsRng.fill_bytes(&mut iv);
 
-    let ciphertext = Encryptor::new(&key.into(), &iv.into())
-        .encrypt_padded_vec_mut::<Pkcs7>(plaintext);
+    let ciphertext =
+        Encryptor::new(&key.into(), &iv.into()).encrypt_padded_vec_mut::<Pkcs7>(plaintext);
 
     Ok((iv.to_vec(), ciphertext))
 }
@@ -118,7 +118,10 @@ pub fn decrypt(session_key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u
     let key = key_array(session_key)?;
 
     if iv.len() != AES_BLOCK_BYTES {
-        return Err(format!("expected a {AES_BLOCK_BYTES}-byte IV, got {}", iv.len()));
+        return Err(format!(
+            "expected a {AES_BLOCK_BYTES}-byte IV, got {}",
+            iv.len()
+        ));
     }
 
     let mut iv_array = [0u8; AES_BLOCK_BYTES];
@@ -314,7 +317,13 @@ mod tests {
 
     #[test]
     fn a_mis_sized_key_or_iv_is_rejected() {
-        assert!(encrypt(&[0u8; 32], b"x").is_err(), "AES-256 key must be rejected");
-        assert!(decrypt(&[0u8; AES_KEY_BYTES], &[0u8; 12], &[0u8; 16]).is_err(), "GCM-sized IV");
+        assert!(
+            encrypt(&[0u8; 32], b"x").is_err(),
+            "AES-256 key must be rejected"
+        );
+        assert!(
+            decrypt(&[0u8; AES_KEY_BYTES], &[0u8; 12], &[0u8; 16]).is_err(),
+            "GCM-sized IV"
+        );
     }
 }

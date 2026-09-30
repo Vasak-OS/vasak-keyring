@@ -4263,6 +4263,8 @@ mod tests {
         preguntados: Arc<Mutex<Vec<String>>>,
         /// El ejecutable que el demonio de la prueba espera del sincronizador.
         esperado: String,
+        /// El estado del demonio, para mirar lo que quedó sin pasar por el bus.
+        estado: Arc<Mutex<KeyringState>>,
     }
 
     impl Almacen {
@@ -4280,7 +4282,7 @@ mod tests {
         }
 
         async fn con(duenia: Option<&str>, pid: Option<u32>, esperado: &str) -> Self {
-            let (demonio, cliente, preguntados) =
+            let (demonio, cliente, preguntados, estado) =
                 llavero_con_item_protegido_y_bus(Some(BusFalso::nuevo(duenia, pid)), esperado)
                     .await;
             Almacen {
@@ -4288,6 +4290,7 @@ mod tests {
                 cliente,
                 preguntados,
                 esperado: esperado.to_owned(),
+                estado,
             }
         }
 
@@ -5183,6 +5186,643 @@ mod tests {
         );
     }
 
+    // ── El espacio de nombres del portal (#33) ──
+    //
+    // El secreto maestro de una aplicación no lo toca nadie desde el bus: ni un
+    // proceso cualquiera ni el sincronizador, que es el único que pasa la puerta
+    // del almacén. Por eso cada caso se prueba con los dos, y por eso se mira
+    // que no se le haya preguntado nada al bus: no hay a quién.
+    //
+    // El ítem del portal está publicado en la prueba aunque el demonio no lo
+    // publique: así lo que se prueba es la segunda capa, la de cada método.
+    //
+    // Las escrituras rechazadas corren con la sesión **abierta**, para que una
+    // puerta rota escriba de verdad y la prueba lo vea. Adónde escribiría lo
+    // vigila `las_pruebas_no_apuntan_al_llavero_real`, y cada prueba lo vuelve a
+    // mirar antes de empezar: una puerta rota no puede reescribir el llavero de
+    // quien corre las pruebas.
+
+    /// Los dos que llaman: el que no pasa ninguna puerta y el que pasa la del
+    /// almacén de cuentas. Para el portal, los dos son nadie.
+    const QUIENES: [&str; 2] = [DE_UN_IMPOSTOR, DEL_SINCRONIZADOR];
+
+    /// Antes de una prueba que puede escribir: la base es la de las pruebas.
+    fn la_base_es_la_de_las_pruebas() {
+        let ruta = keyring_path().expect("en las pruebas siempre hay ruta");
+        assert!(
+            ruta.starts_with(std::env::temp_dir()),
+            "la prueba no arranca: la base iría a {}",
+            ruta.display()
+        );
+    }
+
+    /// Las propiedades de un `CreateItem` con estos atributos.
+    fn propiedades_con(atributos: HashMap<String, String>) -> HashMap<String, Value<'static>> {
+        HashMap::from([
+            (
+                "org.freedesktop.Secret.Item.Label".to_string(),
+                Value::from("Secreto de org.example.Cifradora"),
+            ),
+            (
+                "org.freedesktop.Secret.Item.Attributes".to_string(),
+                Value::from(atributos),
+            ),
+        ])
+    }
+
+    /// El secreto del ítem del portal como quedó en el demonio, sin el bus.
+    async fn secreto_del_portal(almacen: &Almacen) -> Option<Vec<u8>> {
+        almacen
+            .estado
+            .lock()
+            .await
+            .items
+            .get(ITEM_DEL_PORTAL)
+            .map(|item| item.secret.clone())
+    }
+
+    /// Cuántos ítems tiene el demonio, sin el bus.
+    async fn cuantos_items(almacen: &Almacen) -> usize {
+        almacen.estado.lock().await.items.len()
+    }
+
+    /// Los atributos que se parecen al esquema del portal, o que llevan la
+    /// marca del demonio. Ninguno lo puede crear nadie.
+    fn parecidos_al_portal() -> Vec<HashMap<String, String>> {
+        let con = |clave: &str, valor: &str| {
+            HashMap::from([
+                (clave.to_string(), valor.to_string()),
+                ("app_id".to_string(), APP_DEL_PORTAL.to_string()),
+            ])
+        };
+        vec![
+            // Lo que el demonio guarda hoy, y lo que guardaba hasta 0.7.8.
+            portal_attributes(APP_DEL_PORTAL),
+            legacy_portal_attributes(APP_DEL_PORTAL),
+            // El valor, disfrazado.
+            con("xdg:schema", "Org.Freedesktop.Portal.Secret"),
+            con("xdg:schema", "ORG.FREEDESKTOP.PORTAL.SECRET"),
+            con("xdg:schema", " org.freedesktop.portal.Secret "),
+            con("xdg:schema", "org.freedesktop.portal.Secret\n"),
+            con("xdg:schema", "org.freedesktop.portal.\u{200b}Secret"),
+            con("xdg:schema", "org_freedesktop_portal_Secret"),
+            // La clave, disfrazada.
+            con("XDG:Schema", PORTAL_SCHEMA),
+            con(" xdg:schema", PORTAL_SCHEMA),
+            con("xdg_schema", PORTAL_SCHEMA),
+            con("xdg:\u{feff}schema", PORTAL_SCHEMA),
+            // La marca del demonio, sola y con cualquier valor.
+            HashMap::from([(PORTAL_ORIGIN_ATTRIBUTE.to_string(), "otra".to_string())]),
+            HashMap::from([("Vasak-Keyring:Origin".to_string(), String::new())]),
+            // El esquema bueno escondido detrás de otra clave `xdg:schema`.
+            HashMap::from([
+                ("xdg:schema".to_string(), "com.otro.Programa".to_string()),
+                ("XDG:SCHEMA".to_string(), PORTAL_SCHEMA.to_string()),
+            ]),
+        ]
+    }
+
+    /// La regla sola: todo lo de arriba es del portal.
+    #[test]
+    fn los_parecidos_al_esquema_del_portal_quedan_reservados() {
+        for atributos in parecidos_al_portal() {
+            assert!(
+                is_portal_attributes(&atributos),
+                "{atributos:?} se lee como un secreto del portal y tiene que quedar reservado"
+            );
+        }
+    }
+
+    /// Y lo que no: la reserva no puede tapar a las aplicaciones que guardan lo
+    /// suyo con un esquema propio, ni al resto del llavero.
+    #[test]
+    fn lo_que_no_es_del_portal_no_queda_reservado() {
+        let ajenos = [
+            HashMap::new(),
+            HashMap::from([("app_id".to_string(), APP_DEL_PORTAL.to_string())]),
+            HashMap::from([(
+                "xdg:schema".to_string(),
+                "org.freedesktop.Secret.Generic".to_string(),
+            )]),
+            HashMap::from([(
+                "xdg:schema".to_string(),
+                "org.freedesktop.portal.Secret2".to_string(),
+            )]),
+            HashMap::from([(
+                "xdg:schema".to_string(),
+                "org.gnome.portal.Secret".to_string(),
+            )]),
+            HashMap::from([("xdg:schema".to_string(), ESQUEMA_PROTEGIDO.to_string())]),
+            // El nombre del esquema en otra clave no es el esquema.
+            HashMap::from([("comentario".to_string(), PORTAL_SCHEMA.to_string())]),
+            HashMap::from([("origin".to_string(), "portal-backend".to_string())]),
+        ];
+        for atributos in ajenos {
+            assert!(
+                !is_portal_attributes(&atributos),
+                "{atributos:?} no es del portal y no puede quedar reservado"
+            );
+        }
+    }
+
+    /// La reserva es más ancha que la búsqueda, y tiene que seguir siéndolo:
+    /// todo lo que el backend del portal puede encontrar —lo de hoy y lo de
+    /// antes— queda del lado reservado. Si esto se rompe, hay un ítem que el
+    /// portal le daría a una aplicación y que el bus puede crear.
+    #[test]
+    fn la_reserva_cubre_todo_lo_que_busca_el_portal() {
+        for app in [APP_DEL_PORTAL, "", "x", "org.example.Otra"] {
+            assert!(is_portal_attributes(&portal_attributes(app)), "{app}");
+            assert!(
+                is_portal_attributes(&legacy_portal_attributes(app)),
+                "{app}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nadie_crea_un_item_con_el_esquema_del_portal() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        la_base_es_la_de_las_pruebas();
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+        let antes = cuantos_items(&almacen).await;
+
+        for emisor in QUIENES {
+            for atributos in parecidos_al_portal() {
+                for replace in [false, true] {
+                    let error = almacen
+                        .llamar_como(
+                            emisor,
+                            COLECCION_DEL_LOGIN,
+                            IFACE_COLECCION,
+                            "CreateItem",
+                            &(
+                                propiedades_con(atributos.clone()),
+                                secreto("elegido por quien llama"),
+                                replace,
+                            ),
+                        )
+                        .await
+                        .expect_err("nadie crea un ítem con el esquema del portal");
+                    assert_eq!(
+                        nombre_del_error(&error),
+                        "org.freedesktop.DBus.Error.AccessDenied",
+                        "{emisor}, replace={replace}, {atributos:?}"
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            cuantos_items(&almacen).await,
+            antes,
+            "no se creó nada: ni plantado ni reemplazado"
+        );
+        assert_eq!(
+            secreto_del_portal(&almacen).await.as_deref(),
+            Some(SECRETO_DEL_PORTAL),
+            "el secreto de la aplicación sigue siendo el suyo"
+        );
+        assert!(
+            almacen.preguntados().await.is_empty(),
+            "para el portal no hay nadie autorizado, así que no hay nada que preguntarle al bus"
+        );
+    }
+
+    #[tokio::test]
+    async fn nadie_cambia_el_secreto_de_una_aplicacion() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        la_base_es_la_de_las_pruebas();
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        for emisor in QUIENES {
+            let error = almacen
+                .llamar_como(
+                    emisor,
+                    ITEM_DEL_PORTAL,
+                    IFACE_ITEM,
+                    "SetSecret",
+                    &(secreto("elegido por quien llama"),),
+                )
+                .await
+                .expect_err("nadie cambia el secreto de una aplicación");
+            assert_eq!(
+                nombre_del_error(&error),
+                "org.freedesktop.DBus.Error.AccessDenied",
+                "{emisor}"
+            );
+        }
+        assert_eq!(
+            secreto_del_portal(&almacen).await.as_deref(),
+            Some(SECRETO_DEL_PORTAL)
+        );
+        assert!(almacen.preguntados().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn nadie_lee_el_secreto_de_una_aplicacion() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+        let sesion = OwnedObjectPath::try_from(SESION).expect("la sesión de la prueba");
+        let pedidos = vec![
+            OwnedObjectPath::try_from(ITEM_DEL_PORTAL).expect("ruta"),
+            OwnedObjectPath::try_from(ITEM_COMUN).expect("ruta"),
+        ];
+
+        for emisor in QUIENES {
+            let error = almacen
+                .pedir_secreto_de(ITEM_DEL_PORTAL, Some(emisor))
+                .await
+                .expect_err("nadie lee el secreto de una aplicación");
+            assert_eq!(
+                nombre_del_error(&error),
+                "org.freedesktop.DBus.Error.AccessDenied",
+                "GetSecret de {emisor}"
+            );
+
+            let respuesta = almacen
+                .llamar_como(
+                    emisor,
+                    SERVICIO,
+                    IFACE_SERVICIO,
+                    "GetSecrets",
+                    &(&pedidos, &sesion),
+                )
+                .await
+                .expect("GetSecrets devuelve la parte que se puede leer");
+            let mapa: HashMap<OwnedObjectPath, SecretStruct> =
+                respuesta.body().deserialize().expect("GetSecrets");
+            let rutas: Vec<&str> = mapa.keys().map(|r| r.as_str()).collect();
+            assert_eq!(
+                rutas,
+                vec![ITEM_COMUN],
+                "GetSecrets de {emisor}: la común sí, la del portal no"
+            );
+        }
+        assert!(almacen.preguntados().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn nadie_borra_el_secreto_de_una_aplicacion() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        la_base_es_la_de_las_pruebas();
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        for emisor in QUIENES {
+            let error = almacen
+                .llamar_como(emisor, ITEM_DEL_PORTAL, IFACE_ITEM, "Delete", &())
+                .await
+                .expect_err("nadie borra el secreto de una aplicación");
+            assert_eq!(
+                nombre_del_error(&error),
+                "org.freedesktop.DBus.Error.AccessDenied",
+                "Item.Delete de {emisor}"
+            );
+
+            // Borrar la colección se lo llevaría con todo lo demás. Al
+            // sincronizador la puerta del almacén lo deja pasar: lo que lo frena
+            // es el portal.
+            let error = almacen
+                .llamar_como(emisor, COLECCION_DEL_LOGIN, IFACE_COLECCION, "Delete", &())
+                .await
+                .expect_err("nadie borra la colección que guarda el secreto de una aplicación");
+            assert_eq!(
+                nombre_del_error(&error),
+                "org.freedesktop.DBus.Error.AccessDenied",
+                "Collection.Delete de {emisor}"
+            );
+        }
+
+        assert_eq!(
+            secreto_del_portal(&almacen).await.as_deref(),
+            Some(SECRETO_DEL_PORTAL)
+        );
+        assert!(
+            almacen
+                .estado
+                .lock()
+                .await
+                .collections
+                .contains_key(COLECCION_DEL_LOGIN),
+            "la colección sigue ahí"
+        );
+        assert!(
+            almacen.preguntados().await.is_empty(),
+            "la colección se niega por el portal antes de preguntar por el almacén"
+        );
+    }
+
+    #[tokio::test]
+    async fn nadie_describe_el_secreto_de_una_aplicacion() {
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+        let propiedades = ["Label", "Attributes", "Created", "Modified", "Locked"];
+
+        for emisor in QUIENES {
+            for propiedad in propiedades {
+                let error = almacen
+                    .llamar_como(
+                        emisor,
+                        ITEM_DEL_PORTAL,
+                        IFACE_PROPIEDADES,
+                        "Get",
+                        &(IFACE_ITEM, propiedad),
+                    )
+                    .await
+                    .expect_err("nadie describe el secreto de una aplicación");
+                assert_eq!(
+                    nombre_del_error(&error),
+                    "org.freedesktop.DBus.Error.AccessDenied",
+                    "{propiedad} de {emisor}"
+                );
+            }
+
+            let respuesta = almacen
+                .llamar_como(
+                    emisor,
+                    ITEM_DEL_PORTAL,
+                    IFACE_PROPIEDADES,
+                    "GetAll",
+                    &(IFACE_ITEM,),
+                )
+                .await
+                .expect("GetAll");
+            let todas: HashMap<String, OwnedValue> =
+                respuesta.body().deserialize().expect("GetAll");
+            for propiedad in propiedades {
+                assert!(
+                    !todas.contains_key(propiedad),
+                    "GetAll de {emisor} trajo {propiedad}"
+                );
+            }
+
+            // Y cambiarle el nombre o los atributos tampoco: no hay setter.
+            // Cambiar los atributos era la otra forma de meter un ítem cualquiera
+            // en el espacio del portal.
+            for (propiedad, valor) in [
+                ("Label", Value::from("otro nombre")),
+                (
+                    "Attributes",
+                    Value::from(HashMap::from([(
+                        "xdg:schema".to_string(),
+                        "otro".to_string(),
+                    )])),
+                ),
+            ] {
+                for ruta in [ITEM_DEL_PORTAL, ITEM_COMUN] {
+                    almacen
+                        .llamar_como(
+                            emisor,
+                            ruta,
+                            IFACE_PROPIEDADES,
+                            "Set",
+                            &(IFACE_ITEM, propiedad, &valor),
+                        )
+                        .await
+                        .expect_err("las propiedades de un ítem no se escriben");
+                }
+            }
+        }
+        let estado = almacen.estado.lock().await;
+        let del_portal = estado.items.get(ITEM_DEL_PORTAL).expect("sigue ahí");
+        assert_eq!(del_portal.attributes, portal_attributes(APP_DEL_PORTAL));
+        assert!(
+            estado
+                .items
+                .get(ITEM_COMUN)
+                .is_some_and(|item| !is_portal_item(item)),
+            "ninguno pasó a ser del portal"
+        );
+    }
+
+    #[tokio::test]
+    async fn los_secretos_del_portal_no_aparecen_en_ningun_listado() {
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+        let busquedas = [
+            HashMap::new(),
+            portal_attributes(APP_DEL_PORTAL),
+            HashMap::from([("app_id".to_string(), APP_DEL_PORTAL.to_string())]),
+            HashMap::from([("xdg:schema".to_string(), PORTAL_SCHEMA.to_string())]),
+        ];
+
+        for emisor in QUIENES {
+            for buscados in &busquedas {
+                let respuesta = almacen
+                    .llamar_como(
+                        emisor,
+                        COLECCION_DEL_LOGIN,
+                        IFACE_COLECCION,
+                        "SearchItems",
+                        &(buscados,),
+                    )
+                    .await
+                    .expect("Collection.SearchItems");
+                let rutas: Vec<OwnedObjectPath> = respuesta.body().deserialize().expect("rutas");
+                assert!(
+                    !rutas.iter().any(|r| r.as_str() == ITEM_DEL_PORTAL),
+                    "Collection.SearchItems de {emisor} con {buscados:?}: {rutas:?}"
+                );
+
+                let respuesta = almacen
+                    .llamar_como(
+                        emisor,
+                        SERVICIO,
+                        IFACE_SERVICIO,
+                        "SearchItems",
+                        &(buscados,),
+                    )
+                    .await
+                    .expect("Service.SearchItems");
+                let (abiertos, cerrados): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) =
+                    respuesta.body().deserialize().expect("rutas");
+                assert!(
+                    !abiertos
+                        .iter()
+                        .chain(cerrados.iter())
+                        .any(|r| r.as_str() == ITEM_DEL_PORTAL),
+                    "Service.SearchItems de {emisor} con {buscados:?}"
+                );
+            }
+
+            let respuesta = almacen
+                .llamar_como(
+                    emisor,
+                    COLECCION_DEL_LOGIN,
+                    IFACE_PROPIEDADES,
+                    "Get",
+                    &(IFACE_COLECCION, "Items"),
+                )
+                .await
+                .expect("Items de la colección");
+            let valor: OwnedValue = respuesta.body().deserialize().expect("Items");
+            let rutas: Vec<OwnedObjectPath> =
+                valor.try_into().expect("Items es una lista de rutas");
+            let rutas: Vec<&str> = rutas.iter().map(|r| r.as_str()).collect();
+            assert!(rutas.contains(&ITEM_COMUN), "{emisor}: {rutas:?}");
+            assert!(
+                !rutas.contains(&ITEM_DEL_PORTAL),
+                "Items de {emisor}: {rutas:?}"
+            );
+        }
+    }
+
+    /// Los caminos que publican ítems —el arranque y el desbloqueo— pasan por
+    /// `published_paths`, y ésa deja afuera los del portal.
+    #[test]
+    fn los_secretos_del_portal_no_se_publican_al_cargar() {
+        let mut state = KeyringState::new();
+        state.items.insert(
+            "/c/items/0".into(),
+            ItemInfo {
+                attributes: portal_attributes(APP_DEL_PORTAL),
+                ..entrada(b"del portal")
+            },
+        );
+        state.items.insert(
+            "/c/items/1".into(),
+            ItemInfo {
+                attributes: legacy_portal_attributes(APP_DEL_PORTAL),
+                ..entrada(b"del portal, de antes")
+            },
+        );
+        state
+            .items
+            .insert("/c/items/2".into(), entrada(b"la del navegador"));
+        state
+            .items
+            .insert("/c/items/3".into(), entrada_protegida(b"la del almacen"));
+        let rutas: Vec<String> = (0..4).map(|n| format!("/c/items/{n}")).collect();
+
+        assert_eq!(
+            published_paths(&state, &rutas),
+            vec!["/c/items/2".to_string(), "/c/items/3".to_string()]
+        );
+    }
+
+    /// Lo que no puede romperse: el portal le sigue dando a cada aplicación su
+    /// secreto, estable, y el que crea queda en la base y fuera del bus.
+    #[tokio::test]
+    async fn el_portal_sigue_dando_el_secreto_de_cada_aplicacion() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let _escritura = EscrituraComoEstaba::nuevo();
+        unblock_writes();
+        la_base_es_la_de_las_pruebas();
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        let el_que_tenia = app_master_secret(&almacen.estado, APP_DEL_PORTAL)
+            .await
+            .expect("el portal da el secreto que la aplicación ya tenía");
+        assert_eq!(el_que_tenia, SECRETO_DEL_PORTAL);
+
+        let nueva = "org.example.Nueva";
+        let primero = app_master_secret(&almacen.estado, nueva)
+            .await
+            .expect("el portal crea el secreto de una aplicación nueva");
+        assert_eq!(primero.len(), PORTAL_SECRET_LEN);
+        let segundo = app_master_secret(&almacen.estado, nueva)
+            .await
+            .expect("y lo vuelve a dar");
+        assert_eq!(primero, segundo, "el secreto es estable");
+
+        let ruta = {
+            let estado = almacen.estado.lock().await;
+            let (ruta, item) = estado
+                .items
+                .iter()
+                .find(|(_, item)| item.attributes == portal_attributes(nueva))
+                .expect("el secreto nuevo está en memoria, con la marca del demonio");
+            assert_eq!(item.secret, primero);
+            assert!(
+                estado
+                    .collections
+                    .get(COLECCION_DEL_LOGIN)
+                    .is_some_and(|c| c.items.contains(ruta)),
+                "va en la colección del login"
+            );
+            ruta.clone()
+        };
+        assert!(
+            almacen
+                .demonio
+                .object_server()
+                .interface::<_, ItemInterface>(ruta.as_str())
+                .await
+                .is_err(),
+            "el secreto nuevo no se publica en el bus"
+        );
+
+        // Y quedó en la base —la de las pruebas—, con la marca: sin ella, el
+        // próximo arranque lo tomaría por uno de antes y lo cambiaría.
+        let guardado = crypto::decrypt_database(
+            &std::fs::read(keyring_path().expect("ruta")).expect("la base de las pruebas"),
+            "la-de-la-prueba",
+        )
+        .expect("la base se abre con la contraseña de la prueba");
+        assert!(guardado
+            .items
+            .iter()
+            .any(|si| si.attributes == portal_attributes(nueva) && si.secret == primero));
+    }
+
+    /// Un secreto de antes de esta versión —sin la marca— pudo haberlo plantado
+    /// cualquiera, y no se le da a la aplicación: recibe uno nuevo. El de antes
+    /// queda donde estaba, sin usarse ni borrarse.
+    #[tokio::test]
+    async fn un_secreto_de_antes_de_esta_version_no_se_le_da_a_la_aplicacion() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let _escritura = EscrituraComoEstaba::nuevo();
+        unblock_writes();
+        la_base_es_la_de_las_pruebas();
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+        let vieja = "org.example.Vieja";
+        let plantado = b"una clave que eligio otro proceso".to_vec();
+        let ruta_vieja = "/org/freedesktop/secrets/collection/login/items/90";
+        {
+            let mut estado = almacen.estado.lock().await;
+            estado.items.insert(
+                ruta_vieja.to_string(),
+                ItemInfo {
+                    label: format!("Secreto de {vieja}"),
+                    attributes: legacy_portal_attributes(vieja),
+                    secret: plantado.clone(),
+                    content_type: "text/plain".into(),
+                    created: 1700,
+                    modified: 1700,
+                },
+            );
+        }
+
+        let recibido = app_master_secret(&almacen.estado, vieja)
+            .await
+            .expect("la aplicación recibe un secreto");
+        assert_ne!(
+            recibido, plantado,
+            "el secreto de antes pudo haberlo plantado cualquiera: no se entrega"
+        );
+        assert_eq!(recibido.len(), PORTAL_SECRET_LEN);
+        assert_eq!(
+            app_master_secret(&almacen.estado, vieja).await.as_ref(),
+            Ok(&recibido),
+            "y el nuevo es el que queda"
+        );
+        assert_eq!(
+            almacen
+                .estado
+                .lock()
+                .await
+                .items
+                .get(ruta_vieja)
+                .map(|item| item.secret.clone()),
+            Some(plantado),
+            "el de antes no se toca"
+        );
+    }
+
     // ── El llavero entero, del otro lado de una conexión punto a punto ──────
     //
     // Sin `dbus-daemon`: dos puntas de un `UnixStream::pair()`, una con el
@@ -5203,6 +5843,10 @@ mod tests {
     /// El ítem de la colección que no depende del control de acceso, en el
     /// llavero de la prueba protegida.
     const ITEM_COMUN: &str = "/org/freedesktop/secrets/collection/login/items/1";
+    /// El secreto maestro de una aplicación, del backend del portal.
+    const ITEM_DEL_PORTAL: &str = "/org/freedesktop/secrets/collection/login/items/2";
+    const APP_DEL_PORTAL: &str = "org.example.Cifradora";
+    const SECRETO_DEL_PORTAL: &[u8] = b"el secreto maestro de la aplicacion";
     const SESION: &str = "/org/freedesktop/secrets/session/s0";
     const ESPERA: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -5314,7 +5958,9 @@ mod tests {
     /// así que un llavero sin bus detrás sólo sirve para las pruebas que no la
     /// usan, y para ésas se lee mejor que el bus no esté.
     async fn llavero_con_item_protegido() -> (zbus::Connection, zbus::Connection) {
-        construir_llavero_con_item_protegido(EJECUTABLE_AUTORIZADO).await
+        let (demonio, cliente, _) =
+            construir_llavero_con_item_protegido(EJECUTABLE_AUTORIZADO).await;
+        (demonio, cliente)
     }
 
     /// El mismo llavero, y además un bus falso del otro lado del cliente.
@@ -5331,8 +5977,13 @@ mod tests {
     async fn llavero_con_item_protegido_y_bus(
         bus: Option<BusFalso>,
         esperado: &str,
-    ) -> (zbus::Connection, zbus::Connection, Arc<Mutex<Vec<String>>>) {
-        let (demonio, cliente) = construir_llavero_con_item_protegido(esperado).await;
+    ) -> (
+        zbus::Connection,
+        zbus::Connection,
+        Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<KeyringState>>,
+    ) {
+        let (demonio, cliente, estado) = construir_llavero_con_item_protegido(esperado).await;
 
         let preguntados = match bus {
             Some(bus) => {
@@ -5348,7 +5999,7 @@ mod tests {
             None => Arc::new(Mutex::new(Vec::new())),
         };
 
-        (demonio, cliente, preguntados)
+        (demonio, cliente, preguntados, estado)
     }
 
     /// El estado del llavero, y nada del bus.
@@ -5358,17 +6009,24 @@ mod tests {
     /// saber si quien va a preguntar es el demonio, el cliente o un bus falso.
     async fn construir_llavero_con_item_protegido(
         esperado: &str,
-    ) -> (zbus::Connection, zbus::Connection) {
+    ) -> (zbus::Connection, zbus::Connection, Arc<Mutex<KeyringState>>) {
         let state = Arc::new(Mutex::new(KeyringState::new()));
         {
             let mut s = state.lock().await;
             s.ejecutable_del_sincronizador = esperado.to_owned();
+            // Las tres rutas de abajo ya están tomadas: un ítem nuevo —el que
+            // crea el portal en una prueba— no puede pisar ninguna.
+            s.next_item = 3;
             s.collections.insert(
                 COLECCION_DEL_LOGIN.to_string(),
                 CollectionInfo {
                     label: "Default collection".into(),
                     locked: false,
-                    items: vec![ITEM.to_string(), ITEM_COMUN.to_string()],
+                    items: vec![
+                        ITEM.to_string(),
+                        ITEM_COMUN.to_string(),
+                        ITEM_DEL_PORTAL.to_string(),
+                    ],
                     created: 1700,
                     modified: 1700,
                 },
@@ -5396,6 +6054,18 @@ mod tests {
                     attributes: HashMap::new(),
                     secret: b"la contrasena del navegador".to_vec(),
                     content_type: "text/plain".into(),
+                    created: 1700,
+                    modified: 1700,
+                },
+            );
+            // El secreto de una aplicación, como lo deja el backend del portal.
+            s.items.insert(
+                ITEM_DEL_PORTAL.to_string(),
+                ItemInfo {
+                    label: format!("Secreto de {APP_DEL_PORTAL}"),
+                    attributes: portal_attributes(APP_DEL_PORTAL),
+                    secret: SECRETO_DEL_PORTAL.to_vec(),
+                    content_type: "application/octet-stream".into(),
                     created: 1700,
                     modified: 1700,
                 },
@@ -5444,7 +6114,10 @@ mod tests {
             )
             .await
             .expect("no se pudo publicar la colección");
-        for ruta in [ITEM, ITEM_COMUN] {
+        // El del portal también se publica, aunque el demonio no lo haga: así
+        // se prueba la segunda capa, la de cada método, por si algún camino
+        // futuro llegara a publicarlo.
+        for ruta in [ITEM, ITEM_COMUN, ITEM_DEL_PORTAL] {
             demonio
                 .object_server()
                 .at(
@@ -5459,7 +6132,7 @@ mod tests {
                 .expect("no se pudo publicar el ítem");
         }
 
-        (demonio, cliente)
+        (demonio, cliente, state)
     }
 
     /// Una llamada al demonio por nombre de método.

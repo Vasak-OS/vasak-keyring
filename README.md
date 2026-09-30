@@ -11,9 +11,13 @@ protege contra un programa que corre en la misma sesión.
 
 Para lo que sí hace falta una frontera —la clave del almacén cifrado de
 `vasak-accounts`— hay un control por ítem. Los ítems marcados con
-`xdg:schema = "ar.net.vasak.os.AccountsStore"` sólo se entregan a
-`/usr/bin/vasak-accounts-sync`. A los demás les responde
-`org.freedesktop.DBus.Error.AccessDenied`.
+`xdg:schema = "ar.net.vasak.os.AccountsStore"` sólo los toca
+`/usr/bin/vasak-accounts-sync`: leer su secreto, reemplazarlo (`SetSecret`, o
+`CreateItem` con `replace`), crear otro con ese esquema, borrarlo o borrar la
+colección que lo tiene, y hasta describirlo (`Attributes`, `Label`). A los demás
+les responde `org.freedesktop.DBus.Error.AccessDenied`, y `SearchItems` no se
+los muestra. Proteger sólo la lectura no alcanzaba: con las escrituras, un
+proceso cualquiera **elegía** la clave con la que se abre la base.
 
 La identidad sale de `/proc/<pid>/exe`, del PID que el **demonio del bus**
 asoció a la conexión del remitente. El PID no lo manda el cliente: el demonio lo

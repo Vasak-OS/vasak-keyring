@@ -189,7 +189,25 @@ fn extract_bytes(value: &Value<'_>) -> Result<Vec<u8>, zbus::fdo::Error> {
 /// the filter below closes the other half: a relative `HOME` would otherwise
 /// come back as a relative base.
 fn keyring_path() -> Option<std::path::PathBuf> {
-    keyring_path_under(dirs::data_dir())
+    // En las pruebas, nunca el llavero de quien las corre.
+    //
+    // Pasó: una prueba de las puertas del almacén, con la puerta saboteada
+    // para comprobar que la prueba fallaba, dejó pasar un `CreateItem` con la
+    // sesión abierta, y `save_db` reescribió `~/.local/share/vasak-keyring/
+    // keyring.db` de verdad con los ítems de la prueba. Lo salvó que el
+    // demonio real tenía el llavero en memoria y lo volvió a escribir.
+    // Que una prueba no escriba en disco no puede depender de que la puerta
+    // que prueba funcione.
+    #[cfg(test)]
+    {
+        keyring_path_under(Some(
+            std::env::temp_dir().join(format!("vasak-keyring-pruebas-{}", std::process::id())),
+        ))
+    }
+    #[cfg(not(test))]
+    {
+        keyring_path_under(dirs::data_dir())
+    }
 }
 
 /// The same decision without reading the environment.
@@ -480,9 +498,65 @@ const SUFIJO_DE_BORRADO: &str = " (deleted)";
 
 /// Verifica si un ítem tiene un esquema protegido.
 fn es_esquema_protegido(item: &ItemInfo) -> bool {
-    item.attributes
+    atributos_protegidos(&item.attributes)
+}
+
+/// Si una lista de atributos lleva el esquema protegido.
+///
+/// Aparte de [`es_esquema_protegido`] porque `CreateItem` la necesita sobre los
+/// atributos que **llegan**, antes de que haya un ítem.
+fn atributos_protegidos(atributos: &HashMap<String, String>) -> bool {
+    atributos
         .get(ATRIBUTO_ESQUEMA)
         .is_some_and(|s| s == ESQUEMA_PROTEGIDO)
+}
+
+/// Si quien llama puede tocar lo que pide.
+///
+/// `protegido` es si el pedido toca algún ítem del almacén —leerlo,
+/// describirlo, reemplazarlo, borrarlo o crear uno con su esquema—. Si no toca
+/// ninguno, sí, y sin preguntarle nada al bus: la puerta cuesta dos idas y
+/// vueltas y una lectura de `/proc`, y cada contraseña del navegador no tiene
+/// por qué pagarlas.
+///
+/// Es la misma puerta que protege `GetSecret` desde Vasak-OS/vasak-keyring#24.
+/// Leer la clave era la mitad: con `CreateItem`, `SetSecret` o los borrados, un
+/// proceso cualquiera **elegía** la clave con la que se abre la base, y con
+/// `SearchItems` y `Attributes` encontraba el ítem para hacerlo
+/// (Vasak-OS/vasak-keyring#29 y #30).
+///
+/// El estado se toma un momento para copiar el ejecutable esperado y se suelta
+/// antes de ir al bus.
+async fn puede_tocar_el_almacen(
+    conn: &Connection,
+    cabecera: &zbus::message::Header<'_>,
+    state: &Mutex<KeyringState>,
+    protegido: bool,
+) -> bool {
+    if !protegido {
+        return true;
+    }
+    let esperado = state.lock().await.ejecutable_del_sincronizador();
+    autorizado_para_esquema_protegido(conn, cabecera, &esperado).await
+}
+
+/// Si un ítem coincide con lo que se busca: tiene cada atributo pedido con ese
+/// valor. Un mapa vacío coincide con todos, como pide la especificación.
+fn coincide(item: &ItemInfo, buscados: &HashMap<String, String>) -> bool {
+    buscados
+        .iter()
+        .all(|(k, v)| item.attributes.get(k) == Some(v))
+}
+
+/// Si el ítem de esa ruta es del almacén. Uno que no existe no lo es: el que
+/// llama recibe el mismo «no encontrado» de siempre.
+async fn ruta_protegida(state: &Mutex<KeyringState>, ruta: &str) -> bool {
+    state
+        .lock()
+        .await
+        .items
+        .get(ruta)
+        .is_some_and(es_esquema_protegido)
 }
 
 /// Si a quien pregunta se le puede entregar este ítem.
@@ -528,7 +602,7 @@ async fn autorizado_para_esquema_protegido(
         Some(emisor) => emisor.as_str().to_owned(),
         None => {
             eprintln!(
-                "vasak-keyring: se rechaza la lectura de un ítem del almacén que vino sin emisor \
+                "vasak-keyring: se rechaza el acceso a un ítem del almacén que vino sin emisor \
                  en la cabecera"
             );
             return false;
@@ -539,7 +613,7 @@ async fn autorizado_para_esquema_protegido(
         Ok(duenia) => duenia,
         Err(e) => {
             eprintln!(
-                "vasak-keyring: se rechaza la lectura de un ítem del almacén de {emisor}: no se \
+                "vasak-keyring: se rechaza el acceso a un ítem del almacén de {emisor}: no se \
                  pudo preguntar al bus quién tiene {NOMBRE_DEL_SINCRONIZADOR}: {e}"
             );
             return false;
@@ -553,7 +627,7 @@ async fn autorizado_para_esquema_protegido(
             // aparece con el sincronizador de verdad, lo primero es mirar si la
             // unidad volvió a tener un namespace de usuario propio.
             eprintln!(
-                "vasak-keyring: se rechaza la lectura de un ítem del almacén de {emisor}: \
+                "vasak-keyring: se rechaza el acceso a un ítem del almacén de {emisor}: \
                  {motivo}, y sin el ejecutable el nombre no alcanza"
             );
             return false;
@@ -566,17 +640,17 @@ async fn autorizado_para_esquema_protegido(
 
     if duenia.as_deref() == Some(emisor.as_str()) {
         eprintln!(
-            "vasak-keyring: se rechaza la lectura de un ítem del almacén de {emisor}: tiene el \
+            "vasak-keyring: se rechaza el acceso a un ítem del almacén de {emisor}: tiene el \
              nombre del sincronizador pero su ejecutable es {ejecutable} y no {esperado}"
         );
     } else {
         match duenia.as_deref() {
             Some(duenia) => eprintln!(
-                "vasak-keyring: se rechaza la lectura de un ítem del almacén de {emisor}: no es el \
+                "vasak-keyring: se rechaza el acceso a un ítem del almacén de {emisor}: no es el \
                  sincronizador, y {NOMBRE_DEL_SINCRONIZADOR} lo tiene {duenia}"
             ),
             None => eprintln!(
-                "vasak-keyring: se rechaza la lectura de un ítem del almacén de {emisor}: en el \
+                "vasak-keyring: se rechaza el acceso a un ítem del almacén de {emisor}: en el \
                  bus nadie tiene {NOMBRE_DEL_SINCRONIZADOR}, así que el sincronizador no está \
                  andando"
             ),
@@ -875,8 +949,14 @@ struct ItemInterface {
 
 #[interface(name = "org.freedesktop.Secret.Item")]
 impl ItemInterface {
+    /// El nombre del ítem. El del almacén lo dice (`Almacén local de VasakOS
+    /// (<cuenta>)`), así que se describe sólo al sincronizador.
     #[zbus(property)]
-    async fn label(&self) -> Result<String, zbus::fdo::Error> {
+    async fn label(
+        &self,
+        #[zbus(header)] cabecera: Option<zbus::message::Header<'_>>,
+    ) -> Result<String, zbus::fdo::Error> {
+        self.describir(cabecera.as_ref()).await?;
         self.state
             .lock()
             .await
@@ -886,8 +966,15 @@ impl ItemInterface {
             .ok_or_else(|| dbus_err("item not found"))
     }
 
+    /// Los atributos. Los del almacén son el mapa que hace falta para reemplazar
+    /// su clave con `CreateItem` (Vasak-OS/vasak-keyring#30): se describen sólo
+    /// al sincronizador.
     #[zbus(property)]
-    async fn attributes(&self) -> Result<HashMap<String, String>, zbus::fdo::Error> {
+    async fn attributes(
+        &self,
+        #[zbus(header)] cabecera: Option<zbus::message::Header<'_>>,
+    ) -> Result<HashMap<String, String>, zbus::fdo::Error> {
+        self.describir(cabecera.as_ref()).await?;
         self.state
             .lock()
             .await
@@ -999,7 +1086,18 @@ impl ItemInterface {
         },))
     }
 
-    async fn set_secret(&mut self, secret: SecretStruct) -> Result<(), SecretError> {
+    async fn set_secret(
+        &mut self,
+        #[zbus(header)] cabecera: zbus::message::Header<'_>,
+        secret: SecretStruct,
+    ) -> Result<(), SecretError> {
+        // Reemplazar el secreto del ítem del almacén es elegir la clave con la
+        // que se abre la base. Se mira el ítem que **está**, no lo que llega, y
+        // antes que si se puede escribir.
+        let protegido = ruta_protegida(&self.state, &self.path).await;
+        if !puede_tocar_el_almacen(&self.conn, &cabecera, &self.state, protegido).await {
+            return Err(SecretError::AccessDenied);
+        }
         escritura_bloqueada()?;
 
         let col_path = {
@@ -1034,7 +1132,19 @@ impl ItemInterface {
         Ok(())
     }
 
-    async fn delete(&mut self) -> Result<OwnedObjectPath, zbus::fdo::Error> {
+    async fn delete(
+        &mut self,
+        #[zbus(header)] cabecera: zbus::message::Header<'_>,
+    ) -> Result<OwnedObjectPath, zbus::fdo::Error> {
+        // Borrar la clave del almacén deja la base sin quien la abra, y el
+        // sincronizador crearía una nueva: es la misma sustitución por otro lado.
+        let protegido = ruta_protegida(&self.state, &self.path).await;
+        if !puede_tocar_el_almacen(&self.conn, &cabecera, &self.state, protegido).await {
+            return Err(zbus::fdo::Error::AccessDenied(
+                "el ítem es del almacén de cuentas".into(),
+            ));
+        }
+
         let col_path = {
             let mut state = self.state.lock().await;
             state.items.remove(&self.path);
@@ -1058,6 +1168,31 @@ impl ItemInterface {
 }
 
 impl ItemInterface {
+    /// Si a quien pide se le puede describir este ítem (nombre y atributos).
+    ///
+    /// La cabecera es `Option` porque así la da zbus en una propiedad: un
+    /// `Get` desde adentro del propio demonio no trae mensaje. Sin cabecera no
+    /// se sabe quién pide, y para un ítem del almacén eso es un no.
+    async fn describir(
+        &self,
+        cabecera: Option<&zbus::message::Header<'_>>,
+    ) -> Result<(), zbus::fdo::Error> {
+        if !ruta_protegida(&self.state, &self.path).await {
+            return Ok(());
+        }
+        let autorizado = match cabecera {
+            Some(cabecera) => puede_tocar_el_almacen(&self.conn, cabecera, &self.state, true).await,
+            None => false,
+        };
+        if autorizado {
+            Ok(())
+        } else {
+            Err(zbus::fdo::Error::AccessDenied(
+                "el ítem es del almacén de cuentas".into(),
+            ))
+        }
+    }
+
     /// Persist the full in-memory item set to the encrypted DB. Used after
     /// mutations (set_secret/delete) so changes survive a daemon restart;
     /// no-ops if the keyring is locked (no master password in memory).
@@ -1152,36 +1287,59 @@ impl CollectionInterface {
     // Per the Secret Service spec, Collection.SearchItems returns a single
     // array of matching items (unlike Service.SearchItems, which splits them
     // into unlocked/locked).
+    ///
+    /// Los ítems del almacén aparecen sólo para el sincronizador. Para los
+    /// demás no existen: con `{}` esto devolvía todos los ítems de la colección,
+    /// y era el primer paso para reemplazar la clave del almacén
+    /// (Vasak-OS/vasak-keyring#30).
     async fn search_items(
         &self,
+        #[zbus(header)] cabecera: zbus::message::Header<'_>,
         attributes: HashMap<String, String>,
     ) -> Result<Vec<OwnedObjectPath>, zbus::fdo::Error> {
-        let state = self.state.lock().await;
-        let mut results = Vec::new();
-
-        if let Some(col) = state.collections.get(&self.path) {
-            for ip in &col.items {
-                if let Some(item) = state.items.get(ip) {
-                    if attributes
+        let encontrados: Vec<(String, bool)> = {
+            let state = self.state.lock().await;
+            state
+                .collections
+                .get(&self.path)
+                .map(|col| {
+                    col.items
                         .iter()
-                        .all(|(k, v)| item.attributes.get(k) == Some(v))
-                    {
-                        results.push(owned_path_try(ip).unwrap_or_else(|_| owned_path("/")));
-                    }
-                }
-            }
-        }
-        Ok(results)
+                        .filter_map(|ip| {
+                            let item = state.items.get(ip)?;
+                            coincide(item, &attributes)
+                                .then(|| (ip.clone(), es_esquema_protegido(item)))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        let alguno_protegido = encontrados.iter().any(|(_, protegido)| *protegido);
+        let autorizado =
+            puede_tocar_el_almacen(&self.conn, &cabecera, &self.state, alguno_protegido).await;
+
+        Ok(encontrados
+            .into_iter()
+            .filter(|(_, protegido)| autorizado || !protegido)
+            .map(|(ip, _)| owned_path_try(&ip).unwrap_or_else(|_| owned_path("/")))
+            .collect())
     }
 
+    ///
+    /// Un ítem con el esquema del almacén lo crea sólo el sincronizador. El
+    /// esquema es un espacio de nombres del demonio, no de quien llama: con
+    /// `replace`, un proceso cualquiera borraba la clave del almacén y ponía una
+    /// que eligió él, y sin `replace` plantaba otra que el sincronizador podía
+    /// encontrar primero (Vasak-OS/vasak-keyring#29). Se rechaza el pedido
+    /// entero, no sólo el `replace`.
     async fn create_item(
         &mut self,
+        #[zbus(header)] cabecera: zbus::message::Header<'_>,
         properties: HashMap<String, Value<'_>>,
         secret: SecretStruct,
         replace: bool,
     ) -> Result<(OwnedObjectPath, OwnedObjectPath), SecretError> {
-        escritura_bloqueada()?;
-
         let label = properties
             .get("org.freedesktop.Secret.Item.Label")
             .and_then(value_to_string)
@@ -1191,6 +1349,14 @@ impl CollectionInterface {
             .get("org.freedesktop.Secret.Item.Attributes")
             .and_then(value_to_attrmap)
             .unwrap_or_default();
+
+        // Quién pide, antes que si se puede escribir: a quien no puede tocar el
+        // almacén no le importa si el llavero está abierto.
+        let protegido = atributos_protegidos(&attributes);
+        if !puede_tocar_el_almacen(&self.conn, &cabecera, &self.state, protegido).await {
+            return Err(SecretError::AccessDenied);
+        }
+        escritura_bloqueada()?;
 
         let mut state = self.state.lock().await;
 
@@ -1269,7 +1435,28 @@ impl CollectionInterface {
         Ok((owned, owned_path("/")))
     }
 
-    async fn delete(&mut self) -> Result<OwnedObjectPath, zbus::fdo::Error> {
+    ///
+    /// Una colección que guarda la clave del almacén la borra sólo el
+    /// sincronizador: borrarla se lleva la clave con todo lo demás, y es la
+    /// misma sustitución que `Item.Delete` por un camino más ancho.
+    async fn delete(
+        &mut self,
+        #[zbus(header)] cabecera: zbus::message::Header<'_>,
+    ) -> Result<OwnedObjectPath, zbus::fdo::Error> {
+        let protegida = {
+            let state = self.state.lock().await;
+            state.collections.get(&self.path).is_some_and(|col| {
+                col.items
+                    .iter()
+                    .any(|ip| state.items.get(ip).is_some_and(es_esquema_protegido))
+            })
+        };
+        if !puede_tocar_el_almacen(&self.conn, &cabecera, &self.state, protegida).await {
+            return Err(zbus::fdo::Error::AccessDenied(
+                "la colección guarda la clave del almacén de cuentas".into(),
+            ));
+        }
+
         let orphaned_aliases: Vec<String>;
         let removed_items: Vec<String>;
         {
@@ -1933,29 +2120,49 @@ impl ServiceInterface {
         Ok((owned, owned_path("/")))
     }
 
+    /// Los ítems del almacén aparecen sólo para el sincronizador; ver
+    /// `Collection.SearchItems`.
     async fn search_items(
         &self,
+        #[zbus(header)] cabecera: zbus::message::Header<'_>,
         attributes: HashMap<String, String>,
     ) -> Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>), zbus::fdo::Error> {
-        let state = self.state.lock().await;
+        // (ruta, bloqueado, protegido)
+        let encontrados: Vec<(String, bool, bool)> = {
+            let state = self.state.lock().await;
+            state
+                .collections
+                .values()
+                .flat_map(|col| {
+                    col.items.iter().filter_map(|ip| {
+                        let item = state.items.get(ip)?;
+                        coincide(item, &attributes).then(|| {
+                            (
+                                ip.clone(),
+                                effectively_locked(col.locked),
+                                es_esquema_protegido(item),
+                            )
+                        })
+                    })
+                })
+                .collect()
+        };
+
+        let alguno_protegido = encontrados.iter().any(|(_, _, protegido)| *protegido);
+        let autorizado =
+            puede_tocar_el_almacen(&self.conn, &cabecera, &self.state, alguno_protegido).await;
+
         let mut unlocked = Vec::new();
         let mut locked = Vec::new();
-
-        for col in state.collections.values() {
-            for ip in &col.items {
-                if let Some(item) = state.items.get(ip) {
-                    if attributes
-                        .iter()
-                        .all(|(k, v)| item.attributes.get(k) == Some(v))
-                    {
-                        let o = owned_path_try(ip).unwrap_or_else(|_| owned_path("/"));
-                        if effectively_locked(col.locked) {
-                            locked.push(o)
-                        } else {
-                            unlocked.push(o)
-                        }
-                    }
-                }
+        for (ip, bloqueado, protegido) in encontrados {
+            if protegido && !autorizado {
+                continue;
+            }
+            let o = owned_path_try(&ip).unwrap_or_else(|_| owned_path("/"));
+            if bloqueado {
+                locked.push(o)
+            } else {
+                unlocked.push(o)
             }
         }
         Ok((unlocked, locked))
@@ -3870,6 +4077,28 @@ mod tests {
             como_resultado(test_bus::primera_respuesta(&mut salientes, serial).await)
         }
 
+        /// Cualquier método, con el emisor que se le ponga en la cabecera.
+        async fn llamar_como<B>(
+            &self,
+            emisor: &str,
+            ruta: &str,
+            iface: &str,
+            metodo: &str,
+            cuerpo: &B,
+        ) -> zbus::Result<zbus::Message>
+        where
+            B: serde::Serialize + zbus::zvariant::DynamicType,
+        {
+            let peticion = test_bus::armar(ruta, iface, metodo, Some(emisor), cuerpo);
+            let serial = peticion.header().primary().serial_num();
+            let mut salientes = zbus::MessageStream::from(&self.cliente);
+            self.cliente
+                .send(&peticion)
+                .await
+                .unwrap_or_else(|e| panic!("no se pudo mandar {metodo}: {e}"));
+            como_resultado(test_bus::primera_respuesta(&mut salientes, serial).await)
+        }
+
         /// Por qué nombres se le preguntó al bus, en orden.
         async fn preguntados(&self) -> Vec<String> {
             self.preguntados.lock().await.clone()
@@ -4252,6 +4481,399 @@ mod tests {
         );
     }
 
+    /// Las pruebas no escriben nunca en el llavero de quien las corre.
+    ///
+    /// Una prueba de escritura que deja pasar lo que no debe —una puerta rota,
+    /// o saboteada a propósito para ver que la prueba falla— llega a `save_db`.
+    /// Si eso apunta al llavero real, la prueba lo reescribe con sus ítems y su
+    /// contraseña. Pasó una vez; ver `keyring_path`.
+    #[test]
+    fn las_pruebas_no_apuntan_al_llavero_real() {
+        let ruta = keyring_path().expect("en las pruebas siempre hay ruta");
+        assert!(
+            ruta.starts_with(std::env::temp_dir()),
+            "en las pruebas la base tiene que ir a un directorio temporal, y va a {}",
+            ruta.display()
+        );
+        if let Some(real) = keyring_path_under(dirs::data_dir()) {
+            assert_ne!(
+                ruta, real,
+                "la ruta de las pruebas no puede ser la del llavero real"
+            );
+        }
+    }
+
+    // ── Lo que rodea a la clave: escribirla, borrarla, encontrarla ──
+    //
+    // `GetSecret` estaba cerrado desde #24, pero lo demás no: con `CreateItem`
+    // y `replace`, `SetSecret` o los borrados, un proceso cualquiera **elegía**
+    // la clave con la que se abre la base (#29), y con `SearchItems` y
+    // `Attributes` encontraba el ítem para hacerlo (#30).
+    //
+    // Las escrituras que la puerta deja pasar se prueban con la sesión
+    // **cerrada**: el autorizado recibe `IsLocked` —pasó la puerta y no escribió
+    // nada— y el que no, `AccessDenied`. Con la sesión abierta, una escritura
+    // que pasa iría a la base de quien corre la prueba.
+
+    /// Las propiedades de un ítem que alguien pide crear, con el esquema del
+    /// almacén o sin él.
+    fn propiedades(protegido: bool) -> HashMap<String, Value<'static>> {
+        let mut atributos = HashMap::from([("account_id".to_string(), "abc".to_string())]);
+        if protegido {
+            atributos.insert(ATRIBUTO_ESQUEMA.to_string(), ESQUEMA_PROTEGIDO.to_string());
+        }
+        HashMap::from([
+            (
+                "org.freedesktop.Secret.Item.Label".to_string(),
+                Value::from("elegida por quien llama"),
+            ),
+            (
+                "org.freedesktop.Secret.Item.Attributes".to_string(),
+                Value::from(atributos),
+            ),
+        ])
+    }
+
+    /// Un secreto en claro, en la sesión de la prueba.
+    fn secreto(valor: &str) -> SecretStruct {
+        SecretStruct {
+            session: OwnedObjectPath::try_from(SESION).expect("la sesión de la prueba"),
+            parameters: Vec::new(),
+            value: valor.as_bytes().to_vec(),
+            content_type: "text/plain".into(),
+        }
+    }
+
+    /// Lo que devuelve `GetSecret` del ítem del almacén al sincronizador: la
+    /// forma de ver, después de un intento, que la clave sigue siendo la de
+    /// antes.
+    async fn clave_del_almacen(almacen: &Almacen) -> Vec<u8> {
+        let respuesta = almacen
+            .pedir_secreto(Some(DEL_SINCRONIZADOR))
+            .await
+            .expect("el sincronizador lee su clave");
+        let (secreto,): (SecretStruct,) = respuesta.body().deserialize().expect("GetSecret");
+        secreto.value
+    }
+
+    #[tokio::test]
+    async fn un_impostor_no_reemplaza_la_clave_con_create_item() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        let error = almacen
+            .llamar_como(
+                DE_UN_IMPOSTOR,
+                COLECCION_DEL_LOGIN,
+                IFACE_COLECCION,
+                "CreateItem",
+                &(propiedades(true), secreto(&"a".repeat(64)), true),
+            )
+            .await
+            .expect_err("un proceso cualquiera no crea ítems con el esquema del almacén");
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.DBus.Error.AccessDenied"
+        );
+
+        assert!(
+            clave_del_almacen(&almacen).await == b"la clave del almacen",
+            "la clave tiene que seguir siendo la de antes"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_impostor_tampoco_planta_una_clave_sin_replace() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _cerrada = sesion_cerrada();
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        let error = almacen
+            .llamar_como(
+                DE_UN_IMPOSTOR,
+                COLECCION_DEL_LOGIN,
+                IFACE_COLECCION,
+                "CreateItem",
+                &(propiedades(true), secreto(&"a".repeat(64)), false),
+            )
+            .await
+            .expect_err("sin replace tampoco: el sincronizador podría encontrar ése primero");
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.DBus.Error.AccessDenied"
+        );
+    }
+
+    #[tokio::test]
+    async fn el_sincronizador_si_crea_su_clave() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _cerrada = sesion_cerrada();
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        let error = almacen
+            .llamar_como(
+                DEL_SINCRONIZADOR,
+                COLECCION_DEL_LOGIN,
+                IFACE_COLECCION,
+                "CreateItem",
+                &(propiedades(true), secreto(&"a".repeat(64)), true),
+            )
+            .await
+            .expect_err("con la sesión cerrada no se escribe");
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.Secret.Error.IsLocked",
+            "el sincronizador pasa la puerta: lo único que lo frena es que el llavero está cerrado"
+        );
+    }
+
+    #[tokio::test]
+    async fn crear_un_item_comun_no_pasa_por_la_puerta() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _cerrada = sesion_cerrada();
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        let error = almacen
+            .llamar_como(
+                DE_UN_IMPOSTOR,
+                COLECCION_DEL_LOGIN,
+                IFACE_COLECCION,
+                "CreateItem",
+                &(propiedades(false), secreto("la del navegador"), true),
+            )
+            .await
+            .expect_err("con la sesión cerrada no se escribe");
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.Secret.Error.IsLocked"
+        );
+        assert!(
+            almacen.preguntados().await.is_empty(),
+            "un ítem sin el esquema del almacén no le pregunta nada al bus"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_impostor_no_cambia_la_clave_con_set_secret() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        let error = almacen
+            .llamar_como(
+                DE_UN_IMPOSTOR,
+                ITEM,
+                IFACE_ITEM,
+                "SetSecret",
+                &(secreto(&"a".repeat(64)),),
+            )
+            .await
+            .expect_err("un proceso cualquiera no cambia la clave del almacén");
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.DBus.Error.AccessDenied"
+        );
+        assert!(clave_del_almacen(&almacen).await == b"la clave del almacen");
+    }
+
+    #[tokio::test]
+    async fn el_sincronizador_si_pasa_la_puerta_de_set_secret() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _cerrada = sesion_cerrada();
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        let error = almacen
+            .llamar_como(
+                DEL_SINCRONIZADOR,
+                ITEM,
+                IFACE_ITEM,
+                "SetSecret",
+                &(secreto(&"a".repeat(64)),),
+            )
+            .await
+            .expect_err("con la sesión cerrada no se escribe");
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.Secret.Error.IsLocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_impostor_no_borra_la_clave() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        let error = almacen
+            .llamar_como(DE_UN_IMPOSTOR, ITEM, IFACE_ITEM, "Delete", &())
+            .await
+            .expect_err("un proceso cualquiera no borra la clave del almacén");
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.DBus.Error.AccessDenied"
+        );
+        assert!(clave_del_almacen(&almacen).await == b"la clave del almacen");
+    }
+
+    #[tokio::test]
+    async fn un_impostor_no_borra_la_coleccion_que_guarda_la_clave() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        let error = almacen
+            .llamar_como(
+                DE_UN_IMPOSTOR,
+                COLECCION_DEL_LOGIN,
+                IFACE_COLECCION,
+                "Delete",
+                &(),
+            )
+            .await
+            .expect_err("borrar la colección se llevaría la clave");
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.DBus.Error.AccessDenied"
+        );
+        assert!(clave_del_almacen(&almacen).await == b"la clave del almacen");
+    }
+
+    /// `SearchItems` de la colección y del servicio, con `{}`: el impostor ve
+    /// la contraseña común y no el ítem del almacén; el sincronizador, los dos.
+    #[tokio::test]
+    async fn search_items_no_le_muestra_el_almacen_a_un_impostor() {
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+        let todos: HashMap<String, String> = HashMap::new();
+
+        for (emisor, espera_el_almacen) in [(DE_UN_IMPOSTOR, false), (DEL_SINCRONIZADOR, true)] {
+            let respuesta = almacen
+                .llamar_como(
+                    emisor,
+                    COLECCION_DEL_LOGIN,
+                    IFACE_COLECCION,
+                    "SearchItems",
+                    &(&todos,),
+                )
+                .await
+                .expect("Collection.SearchItems");
+            let rutas: Vec<OwnedObjectPath> = respuesta.body().deserialize().expect("rutas");
+            let rutas: Vec<&str> = rutas.iter().map(|r| r.as_str()).collect();
+            assert!(
+                rutas.contains(&ITEM_COMUN),
+                "{emisor} ve la contraseña común"
+            );
+            assert_eq!(
+                rutas.contains(&ITEM),
+                espera_el_almacen,
+                "Collection.SearchItems de {emisor}: {rutas:?}"
+            );
+
+            let respuesta = almacen
+                .llamar_como(emisor, SERVICIO, IFACE_SERVICIO, "SearchItems", &(&todos,))
+                .await
+                .expect("Service.SearchItems");
+            let (abiertos, cerrados): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) =
+                respuesta.body().deserialize().expect("rutas");
+            let rutas: Vec<&str> = abiertos
+                .iter()
+                .chain(cerrados.iter())
+                .map(|r| r.as_str())
+                .collect();
+            assert!(rutas.contains(&ITEM_COMUN));
+            assert_eq!(
+                rutas.contains(&ITEM),
+                espera_el_almacen,
+                "Service.SearchItems de {emisor}: {rutas:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn buscar_contrasenas_comunes_no_pasa_por_la_puerta() {
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+        // Nada del almacén tiene un `account_id` que no exista.
+        let ninguno = HashMap::from([("url".to_string(), "https://ejemplo".to_string())]);
+
+        almacen
+            .llamar_como(
+                DE_UN_IMPOSTOR,
+                SERVICIO,
+                IFACE_SERVICIO,
+                "SearchItems",
+                &(&ninguno,),
+            )
+            .await
+            .expect("Service.SearchItems");
+        assert!(almacen.preguntados().await.is_empty());
+    }
+
+    /// `Attributes` y `Label` del ítem del almacén, por `Properties.Get`: al
+    /// impostor, no; al sincronizador, sí; y los de una contraseña común, a
+    /// cualquiera. `GetAll` pasa por los mismos getters.
+    #[tokio::test]
+    async fn las_propiedades_del_almacen_se_describen_solo_al_sincronizador() {
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        for propiedad in ["Attributes", "Label"] {
+            let error = almacen
+                .llamar_como(
+                    DE_UN_IMPOSTOR,
+                    ITEM,
+                    IFACE_PROPIEDADES,
+                    "Get",
+                    &(IFACE_ITEM, propiedad),
+                )
+                .await
+                .expect_err("al impostor no se le describe el ítem del almacén");
+            assert_eq!(
+                nombre_del_error(&error),
+                "org.freedesktop.DBus.Error.AccessDenied",
+                "{propiedad}"
+            );
+
+            almacen
+                .llamar_como(
+                    DEL_SINCRONIZADOR,
+                    ITEM,
+                    IFACE_PROPIEDADES,
+                    "Get",
+                    &(IFACE_ITEM, propiedad),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("al sincronizador sí ({propiedad}): {e}"));
+
+            almacen
+                .llamar_como(
+                    DE_UN_IMPOSTOR,
+                    ITEM_COMUN,
+                    IFACE_PROPIEDADES,
+                    "Get",
+                    &(IFACE_ITEM, propiedad),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("una contraseña común a cualquiera ({propiedad}): {e}"));
+        }
+
+        // `GetAll` no falla entero: zbus deja afuera las propiedades cuyo getter
+        // da error. Lo que importa es que al impostor no le lleguen esas dos.
+        for (emisor, las_ve) in [(DE_UN_IMPOSTOR, false), (DEL_SINCRONIZADOR, true)] {
+            let respuesta = almacen
+                .llamar_como(emisor, ITEM, IFACE_PROPIEDADES, "GetAll", &(IFACE_ITEM,))
+                .await
+                .expect("GetAll");
+            let todas: HashMap<String, OwnedValue> =
+                respuesta.body().deserialize().expect("GetAll");
+            for propiedad in ["Attributes", "Label"] {
+                assert_eq!(
+                    todas.contains_key(propiedad),
+                    las_ve,
+                    "GetAll de {emisor}: {propiedad}"
+                );
+            }
+        }
+    }
+
     /// Un pedido sin emisor en la cabecera se rechaza, por el camino real.
     #[tokio::test]
     async fn sin_emisor_en_la_cabecera_no_recibe_el_secreto_por_dbus() {
@@ -4518,6 +5140,19 @@ mod tests {
             )
             .await
             .expect("no se pudo publicar el servicio");
+        demonio
+            .object_server()
+            .at(
+                COLECCION_DEL_LOGIN,
+                CollectionInterface {
+                    state: Arc::clone(&state),
+                    conn: demonio.clone(),
+                    path: COLECCION_DEL_LOGIN.to_string(),
+                    alias: "default".to_string(),
+                },
+            )
+            .await
+            .expect("no se pudo publicar la colección");
         for ruta in [ITEM, ITEM_COMUN] {
             demonio
                 .object_server()

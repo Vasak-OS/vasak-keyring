@@ -5757,11 +5757,13 @@ mod tests {
 
         // Y quedó en la base —la de las pruebas—, con la marca: sin ella, el
         // próximo arranque lo tomaría por uno de antes y lo cambiaría.
+        // Con la contraseña que tiene la sesión, la misma con la que guardó.
+        let clave = master_password().expect("la sesión de la prueba está abierta");
         let guardado = crypto::decrypt_database(
             &std::fs::read(keyring_path().expect("ruta")).expect("la base de las pruebas"),
-            "la-de-la-prueba",
+            &clave,
         )
-        .expect("la base se abre con la contraseña de la prueba");
+        .expect("la base se abre con la contraseña de la sesión");
         assert!(guardado
             .items
             .iter()

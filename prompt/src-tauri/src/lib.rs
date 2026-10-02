@@ -67,7 +67,10 @@ async fn unlock(password: String) -> Result<bool, String> {
             other => format!("{other}"),
         })?;
 
-    reply.body().deserialize::<bool>().map_err(|error| format!("{error}"))
+    reply
+        .body()
+        .deserialize::<bool>()
+        .map_err(|error| format!("{error}"))
 }
 
 /// Ends the process with the answer in the exit code.
@@ -188,7 +191,11 @@ pub fn run_ssh_askpass() {
         .plugin(tauri_plugin_config_manager::init())
         .plugin(tauri_plugin_vicons::init())
         .manage(state)
-        .invoke_handler(tauri::generate_handler![ssh_request, ssh_answer, ssh_cancel])
+        .invoke_handler(tauri::generate_handler![
+            ssh_request,
+            ssh_answer,
+            ssh_cancel
+        ])
         .setup(|app| {
             let window = WebviewWindowBuilder::new(
                 app,
@@ -263,7 +270,11 @@ pub fn run_pinentry_dialog() {
     let state = GpgRequest {
         modo: {
             let modo = leer("VASAK_PINENTRY_MODO");
-            if modo.is_empty() { "frase".to_string() } else { modo }
+            if modo.is_empty() {
+                "frase".to_string()
+            } else {
+                modo
+            }
         },
         descripcion: leer("VASAK_PINENTRY_DESC"),
         etiqueta: leer("VASAK_PINENTRY_ETIQUETA"),
@@ -275,7 +286,11 @@ pub fn run_pinentry_dialog() {
         .plugin(tauri_plugin_config_manager::init())
         .plugin(tauri_plugin_vicons::init())
         .manage(state)
-        .invoke_handler(tauri::generate_handler![gpg_request, gpg_answer, gpg_cancel])
+        .invoke_handler(tauri::generate_handler![
+            gpg_request,
+            gpg_answer,
+            gpg_cancel
+        ])
         .setup(|app| {
             let window = WebviewWindowBuilder::new(
                 app,

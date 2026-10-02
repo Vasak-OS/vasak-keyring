@@ -30,7 +30,6 @@ UMask=0077
 # `KeyringMode=inherit`, el valor por omisión, deja el llavero del kernel de la
 # sesión abierto a todos por igual.
 KeyringMode=private
-CapabilityBoundingSet=
 
 # Lo que **no** está, y por qué: `PrivateTmp`, `PrivateDevices`,
 # `ProtectSystem`, `ProtectHostname`, `ProtectClock`, `ProtectControlGroups` y
@@ -46,6 +45,15 @@ CapabilityBoundingSet=
 # `ProtectProc=invisible` tampoco está: en una unidad de usuario no tiene
 # efecto —se siguen viendo todos los procesos—, y si lo tuviera ocultaría
 # justo los `/proc/<pid>` que las puertas necesitan leer.
+#
+# `CapabilityBoundingSet=` y `AmbientCapabilities=` tampoco: vaciar el conjunto
+# límite es `prctl(PR_CAPBSET_DROP)` y tocar las ambientales también pide
+# capacidades, y el gestor de systemd del usuario no tiene `CAP_SETPCAP`. En
+# una unidad de usuario no restringen nada: el arranque se cae con
+# `status=218/CAPABILITIES` («Failed to drop capabilities: Operation not
+# permitted») y con él `org.freedesktop.secrets`. Tampoco agregaban nada: el
+# proceso es de la sesión, sin setuid, nace con `CapEff` y `CapPrm` en cero y
+# `NoNewPrivileges=yes` le impide ganar alguna después.
 #
 # Lo que sigue no crea namespaces y no toca esa lectura. Hay una prueba en
 # `src/portal_secret.rs` que falla si alguna de las de arriba vuelve.

@@ -74,7 +74,11 @@ fn conversar() {
                 respuesta_a_getpin(frase.as_ref().map(|f| f.as_str()))
             }
             Accion::Confirmar { una_sola_opcion } => {
-                let modo = if una_sola_opcion { "aviso" } else { "confirmar" };
+                let modo = if una_sola_opcion {
+                    "aviso"
+                } else {
+                    "confirmar"
+                };
                 respuesta_a_confirm(preguntar(modo, &pedido).is_some())
                     .into_iter()
                     .map(Zeroizing::new)

@@ -173,8 +173,8 @@ pub fn interpretar(linea: &str, pedido: &mut Pedido) -> Accion {
         // pinentry gráfico no las necesita, y contestar error a una que no
         // entendemos hace que el agente se dé por vencido con todo el diálogo.
         "OPTION" | "NOP" | "HELP" | "SETOK" | "SETNOTOK" | "SETCANCEL" | "SETQUALITYBAR"
-        | "SETQUALITYBAR_TT" | "SETTIMEOUT" | "SETREPEAT" | "SETREPEATERROR"
-        | "SETGENPIN" | "SETGENPIN_TT" | "CLEARPASSPHRASE" => ok(),
+        | "SETQUALITYBAR_TT" | "SETTIMEOUT" | "SETREPEAT" | "SETREPEATERROR" | "SETGENPIN"
+        | "SETGENPIN_TT" | "CLEARPASSPHRASE" => ok(),
         "BYE" => Accion::Terminar,
         "" => ok(),
         _ => Accion::Responder(vec![ORDEN_DESCONOCIDA.into()]),
@@ -369,11 +369,15 @@ mod tests {
         assert_eq!(interpretar_solo("GETPIN"), Accion::PedirFrase);
         assert_eq!(
             interpretar_solo("CONFIRM"),
-            Accion::Confirmar { una_sola_opcion: false }
+            Accion::Confirmar {
+                una_sola_opcion: false
+            }
         );
         assert_eq!(
             interpretar_solo("CONFIRM --one-button"),
-            Accion::Confirmar { una_sola_opcion: true }
+            Accion::Confirmar {
+                una_sola_opcion: true
+            }
         );
         assert_eq!(interpretar_solo("MESSAGE"), Accion::Mostrar);
     }
@@ -394,14 +398,23 @@ mod tests {
             vec!["D dos%0Alineas".to_string(), "OK".to_string()]
         );
         // Y lo que va y vuelve es lo mismo.
-        for frase in ["simple", "100% seguro", "con\nsalto", "con\r\nlos dos", "ñandú €"] {
+        for frase in [
+            "simple",
+            "100% seguro",
+            "con\nsalto",
+            "con\r\nlos dos",
+            "ñandú €",
+        ] {
             assert_eq!(decodificar(&codificar(frase)), frase);
         }
     }
 
     #[test]
     fn cancelar_no_es_una_frase_vacia() {
-        assert_eq!(texto(&respuesta_a_getpin(None)), vec![CANCELADO.to_string()]);
+        assert_eq!(
+            texto(&respuesta_a_getpin(None)),
+            vec![CANCELADO.to_string()]
+        );
         // Una frase vacía sí es una respuesta, y es distinta de cancelar.
         assert_eq!(
             texto(&respuesta_a_getpin(Some(""))),

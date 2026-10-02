@@ -85,7 +85,7 @@ const NOMBRE_DEL_PORTAL: &str = "org.freedesktop.portal.Desktop";
 /// `/proc/<pid>/exe` de la sesión da `EACCES`. Así estuvo desde el 3/09: la
 /// lectura se tragaba el error con `.ok()` y el backend rechazaba al portal de
 /// verdad sin dejar rastro. Esas opciones salieron de `vasak-keyring.service`, y
-/// `la_unidad_deja_leer_quien_pide` falla si vuelven.
+/// `unit_lets_requester_be_identified` falla si vuelven.
 const EJECUTABLE_DEL_PORTAL: &str = "/usr/lib/xdg-desktop-portal";
 
 /// Si el ejecutable es el del portal.
@@ -397,6 +397,25 @@ mod tests {
         assert!(portal.contains("UseIn=Vasak;"), "UseIn tiene que ser Vasak");
     }
 
+    /// Las claves que la unidad pone, sin comentarios ni secciones.
+    ///
+    /// Trae su propio control: si el lector no viera nada, las pruebas que
+    /// buscan opciones prohibidas pasarían siempre.
+    fn unit_keys() -> Vec<&'static str> {
+        let unit = include_str!("../vasak-keyring.service");
+        let keys: Vec<&str> = unit
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#') && !line.starts_with(';'))
+            .filter_map(|line| line.split_once('=').map(|(key, _)| key.trim()))
+            .collect();
+        assert!(
+            keys.contains(&"RestrictAddressFamilies"),
+            "la unidad se leyó mal: no aparece RestrictAddressFamilies, y está"
+        );
+        keys
+    }
+
     /// Que la unidad no se encierre en un namespace de usuario propio.
     ///
     /// Es lo que rompió las dos puertas del demonio desde el 3/09: en una unidad
@@ -410,8 +429,8 @@ mod tests {
     /// `ProtectProc` va en la lista por otro motivo: en una unidad de usuario no
     /// hace nada, y si algún día hiciera, escondería justo esos `/proc/<pid>`.
     #[test]
-    fn la_unidad_deja_leer_quien_pide() {
-        const ENCIERRAN: &[&str] = &[
+    fn unit_lets_requester_be_identified() {
+        const CONFINING: &[&str] = &[
             "PrivateTmp",
             "PrivateDevices",
             "PrivateUsers",
@@ -426,29 +445,44 @@ mod tests {
             "ProtectKernelTunables",
             "ProtectProc",
         ];
-        let unidad = include_str!("../vasak-keyring.service");
-        let claves: Vec<&str> = unidad
-            .lines()
-            .map(str::trim)
-            .filter(|linea| !linea.starts_with('#') && !linea.starts_with(';'))
-            .filter_map(|linea| linea.split_once('=').map(|(clave, _)| clave.trim()))
-            .collect();
-
-        // El control: si el lector no viera nada, lo de abajo pasaría siempre.
-        assert!(
-            claves.contains(&"RestrictAddressFamilies"),
-            "la unidad se leyó mal: no aparece RestrictAddressFamilies, y está"
-        );
-
-        let puestas: Vec<&&str> = ENCIERRAN
+        let keys = unit_keys();
+        let present: Vec<&&str> = CONFINING
             .iter()
-            .filter(|opcion| claves.contains(opcion))
+            .filter(|option| keys.contains(option))
             .collect();
         assert!(
-            puestas.is_empty(),
-            "vasak-keyring.service tiene {puestas:?}: en una unidad de usuario le crean un \
+            present.is_empty(),
+            "vasak-keyring.service tiene {present:?}: en una unidad de usuario le crean un \
              namespace de usuario propio, /proc/<pid>/exe deja de leerse y las puertas del \
              portal y del almacén no dejan pasar a nadie"
+        );
+    }
+
+    /// Que la unidad no toque las capacidades del proceso.
+    ///
+    /// Es lo que dejó al llavero sin arrancar en la 0.7.9: vaciar el conjunto
+    /// límite es `prctl(PR_CAPBSET_DROP)`, y tanto eso como poner capacidades
+    /// ambientales piden `CAP_SETPCAP`, que el gestor de systemd del usuario no
+    /// tiene. La unidad se cae con `status=218/CAPABILITIES` antes de ejecutar
+    /// el binario, y con ella `org.freedesktop.secrets`. Ninguna prueba del
+    /// demonio lo ve, y `systemd-analyze --user verify` tampoco. Comprobado con
+    /// `systemd-run --user -p CapabilityBoundingSet= /usr/bin/true` (218) y lo
+    /// mismo con `AmbientCapabilities=CAP_NET_RAW` (218).
+    ///
+    /// No se pierde nada sin ellas: el proceso nace con `CapEff` y `CapPrm` en
+    /// cero y `NoNewPrivileges=yes` le impide ganar alguna.
+    #[test]
+    fn unit_does_not_touch_capabilities() {
+        const NEED_SETPCAP: &[&str] = &["CapabilityBoundingSet", "AmbientCapabilities"];
+        let keys = unit_keys();
+        let present: Vec<&&str> = NEED_SETPCAP
+            .iter()
+            .filter(|option| keys.contains(option))
+            .collect();
+        assert!(
+            present.is_empty(),
+            "vasak-keyring.service tiene {present:?}: el gestor de systemd del usuario no \
+             tiene CAP_SETPCAP, así que la unidad no arranca (status=218/CAPABILITIES)"
         );
     }
 
@@ -608,7 +642,7 @@ mod tests {
     /// versión, donde un `None` acá dejaba pasar. Un nombre lo toma cualquiera que
     /// llegue primero; el ejecutable no se finge. Si esto falla con el portal de
     /// verdad, el arreglo no es aflojar la puerta: es que la unidad dejó otra vez
-    /// de poder leer `/proc/<pid>/exe` (ver `la_unidad_deja_leer_quien_pide`).
+    /// de poder leer `/proc/<pid>/exe` (ver `unit_lets_requester_be_identified`).
     #[test]
     fn sin_ejecutable_no_pasa_ni_quien_tiene_el_nombre() {
         let portal = ":1.42";

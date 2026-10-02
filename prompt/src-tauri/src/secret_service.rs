@@ -80,7 +80,10 @@ impl Keyring {
     }
 
     /// The stored passphrase for a key, if there is one.
-    pub async fn passphrase_for(&self, key_path: &str) -> Result<Option<Zeroizing<String>>, String> {
+    pub async fn passphrase_for(
+        &self,
+        key_path: &str,
+    ) -> Result<Option<Zeroizing<String>>, String> {
         let reply = self
             .connection
             .call_method(
@@ -196,7 +199,13 @@ impl Keyring {
             .map_err(|e| format!("no se pudo escuchar el diálogo: {e}"))?;
 
         self.connection
-            .call_method(Some(SERVICE), prompt.as_ref(), Some(PROMPT_IFACE), "Prompt", &(""))
+            .call_method(
+                Some(SERVICE),
+                prompt.as_ref(),
+                Some(PROMPT_IFACE),
+                "Prompt",
+                &(""),
+            )
             .await
             .map_err(|e| format!("no se pudo abrir el diálogo: {e}"))?;
 
@@ -215,7 +224,12 @@ impl Keyring {
     }
 
     /// Files a passphrase so it is not asked for again.
-    pub async fn remember(&self, key_path: &str, passphrase: &str, label: &str) -> Result<(), String> {
+    pub async fn remember(
+        &self,
+        key_path: &str,
+        passphrase: &str,
+        label: &str,
+    ) -> Result<(), String> {
         // Un llavero cerrado acepta el pedido y no guarda nada, así que se abre
         // antes de prometer que la frase queda recordada.
         self.unlock().await?;

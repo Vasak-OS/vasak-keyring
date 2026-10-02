@@ -40,9 +40,15 @@ readlink /proc/<pid>/exe` da `EACCES` con cada una, y `/proc/self/ns/user` sale
 distinto del de la sesión). Desde el 3/09 la unidad tenía varias: la lectura daba
 `EACCES`, y tanto este control como el del portal rechazaban a todo el mundo,
 también al sincronizador y al portal de verdad. Por eso `vasak-keyring.service`
-no las tiene, y una prueba (`la_unidad_deja_leer_quien_pide`) falla si vuelven.
+no las tiene, y una prueba (`unit_lets_requester_be_identified`) falla si vuelven.
 El aislamiento que queda —sin red, `NoNewPrivileges`, filtro de llamadas al
 sistema, `MemoryDenyWriteExecute`, `RestrictNamespaces`— no crea namespaces.
+
+Tampoco lleva `CapabilityBoundingSet` ni `AmbientCapabilities`: tocar las
+capacidades pide `CAP_SETPCAP`, que el gestor de systemd del usuario no tiene, y
+la unidad no arranca (`status=218/CAPABILITIES`). El proceso ya nace sin
+capacidades y `NoNewPrivileges` le impide ganarlas, así que no restringían nada.
+`unit_does_not_touch_capabilities` falla si vuelven.
 
 El control es **por ítem**: el resto de los secretos se sigue entregando
 normalmente, que es lo que necesitan el navegador, el cliente de correo y el

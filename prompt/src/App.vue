@@ -8,6 +8,14 @@ const password = ref('');
 const error = ref('');
 const working = ref(false);
 const field = ref<HTMLInputElement | null>(null);
+/**
+ * La contraseña con la que se inició sesión no abre el llavero: está cifrado
+ * con otra, casi siempre la anterior de la cuenta (vasak-keyring#38). Lo que se
+ * pide entonces es ésa, y al abrirlo queda cifrado con la de ahora.
+ */
+const stale = ref(false);
+/** Se pidió apartar el llavero y falta confirmarlo. */
+const confirmingReset = ref(false);
 
 /**
  * Colours, corner radius and font come from the configuration, the same way
@@ -34,6 +42,12 @@ onMounted(async () => {
 		// configuration is no reason not to ask for the password.
 	}
 
+	try {
+		stale.value = await invoke<boolean>('login_password_rejected');
+	} catch {
+		// Sin respuesta, el diálogo de siempre.
+	}
+
 	await nextTick();
 	field.value?.focus();
 });
@@ -54,7 +68,9 @@ const submit = async () => {
 
 		// A refusal is about this password, not about the keyring being broken:
 		// the answer is to try again, so the field is what gets the focus.
-		error.value = 'La contraseña no es correcta.';
+		error.value = stale.value
+			? 'Esa contraseña tampoco abre el llavero.'
+			: 'La contraseña no es correcta.';
 		password.value = '';
 		await nextTick();
 		field.value?.focus();
@@ -65,6 +81,30 @@ const submit = async () => {
 		// problem that is not there.
 		error.value = String(reason) || 'El servicio del llavero no respondió.';
 		password.value = '';
+	} finally {
+		working.value = false;
+	}
+};
+
+/**
+ * Aparta el llavero que no abre —no lo borra— y empieza uno vacío con la
+ * contraseña de ahora. Pide una confirmación: lo guardado deja de estar a mano.
+ */
+const reset = async () => {
+	if (working.value) return;
+	if (!confirmingReset.value) {
+		confirmingReset.value = true;
+		return;
+	}
+
+	working.value = true;
+	error.value = '';
+	try {
+		await invoke<string>('reset');
+		await invoke('finish', { unlocked: true });
+	} catch (reason) {
+		error.value = String(reason) || 'El servicio del llavero no respondió.';
+		confirmingReset.value = false;
 	} finally {
 		working.value = false;
 	}
@@ -86,8 +126,14 @@ const submit = async () => {
 	<WindowFrame hide-bar>
 		<div class="flex min-w-0 flex-1 select-none flex-col gap-4 p-6">
 		<div class="flex flex-col gap-2">
-			<h1 class="text-lg font-semibold text-tx-main">El llavero está bloqueado</h1>
-			<p class="text-sm text-tx-muted">
+			<h1 class="text-lg font-semibold text-tx-main">
+				{{ stale ? 'El llavero sigue con tu contraseña anterior' : 'El llavero está bloqueado' }}
+			</h1>
+			<p v-if="stale" class="text-sm text-tx-muted" data-stale-explanation>
+				La contraseña con la que iniciaste sesión no lo abre: seguramente la cambiaste.
+				Escribí la que usabas antes y el llavero queda con la de ahora.
+			</p>
+			<p v-else class="text-sm text-tx-muted">
 				Tus contraseñas guardadas están cifradas con la contraseña de tu cuenta.
 				Normalmente se entrega al iniciar sesión.
 			</p>
@@ -95,7 +141,7 @@ const submit = async () => {
 
 		<form class="flex flex-col gap-2" @submit.prevent="submit">
 			<label for="password" class="text-xs font-semibold uppercase text-tx-main">
-				Contraseña de tu cuenta
+				{{ stale ? 'Contraseña anterior de tu cuenta' : 'Contraseña de tu cuenta' }}
 			</label>
 			<input
 				id="password"
@@ -107,9 +153,23 @@ const submit = async () => {
 				class="rounded-corner border border-ui-border bg-ui-bg/80 p-2 text-tx-main outline-none focus:border-transparent focus:ring-2 focus:ring-primary disabled:opacity-50"
 			/>
 			<p v-if="error" role="alert" class="text-sm text-status-error">{{ error }}</p>
+			<p v-if="confirmingReset" role="alert" class="text-sm text-tx-main" data-reset-warning>
+				Se aparta el llavero actual —no se borra— y empezás uno vacío con tu contraseña de ahora.
+				Lo guardado ahí vuelve si después recordás la anterior.
+			</p>
 		</form>
 
 		<div class="mt-auto flex justify-end gap-2">
+			<button
+				v-if="stale"
+				type="button"
+				:disabled="working"
+				class="mr-auto rounded-corner px-4 py-2 text-sm text-tx-main hover:bg-ui-surface disabled:opacity-50"
+				data-reset
+				@click="reset"
+			>
+				{{ confirmingReset ? 'Apartar y empezar de nuevo' : 'No la recuerdo' }}
+			</button>
 			<button
 				type="button"
 				:disabled="working"

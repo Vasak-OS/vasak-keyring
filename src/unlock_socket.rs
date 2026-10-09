@@ -177,8 +177,11 @@ async fn atender(
     state: Arc<Mutex<KeyringState>>,
     conn: zbus::Connection,
 ) {
-    match stream.peer_cred() {
-        Ok(cred) if par_autorizado(cred.uid(), uid_propio) => {}
+    // Si la entrega viene de root —el módulo de PAM— o del propio usuario. Sólo
+    // la de root cuenta como «la contraseña del inicio de sesión»: ver
+    // `aplicar_desde_el_login`.
+    let desde_root = match stream.peer_cred() {
+        Ok(cred) if par_autorizado(cred.uid(), uid_propio) => cred.uid() == 0,
         Ok(cred) => {
             eprintln!(
                 "vasak-keyring: se rechaza una entrega del uid {} en el socket de desbloqueo",
@@ -190,7 +193,7 @@ async fn atender(
             eprintln!("vasak-keyring: no se pudo identificar al par del socket: {e}");
             return;
         }
-    }
+    };
 
     let mut buffer = Vec::new();
     let leido = tokio::time::timeout(
@@ -212,12 +215,23 @@ async fn atender(
         Ok(Ok(_)) => match interpretar_peticion(&buffer) {
             Ok(mut password) => {
                 let unlock = PamUnlockInterface::new(state, conn);
-                let abierto = unlock.aplicar(&password).await;
+                let abierto = unlock.aplicar_desde_el_login(&password, desde_root).await;
                 password.zeroize();
                 match abierto {
                     Ok(true) => {
                         println!("vasak-keyring: llavero desbloqueado al iniciar sesión");
                         true
+                    }
+                    Ok(false) if desde_root => {
+                        // PAM ya validó esta contraseña contra la cuenta: si no
+                        // abre, la base se cifró con otra (vasak-keyring#38).
+                        eprintln!(
+                            "vasak-keyring: la contraseña del inicio de sesión no abre la base \
+                             existente: está cifrada con otra, casi siempre la anterior de la \
+                             cuenta. Abrila una vez con esa en el diálogo de desbloqueo y queda \
+                             cifrada con la de ahora."
+                        );
+                        false
                     }
                     Ok(false) => {
                         eprintln!(

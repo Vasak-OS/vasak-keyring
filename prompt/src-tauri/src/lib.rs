@@ -23,12 +23,14 @@ pub mod ssh_askpass;
 
 const WINDOW_LABEL: &str = "unlock-dialog";
 const DIALOG_WIDTH: f64 = 460.0;
-const DIALOG_HEIGHT: f64 = 300.0;
+const DIALOG_HEIGHT: f64 = 340.0;
 
 const KEYRING_SERVICE: &str = "org.freedesktop.secrets";
 const KEYRING_PATH: &str = "/org/vasak/keyring";
 const KEYRING_INTERFACE: &str = "org.vasak.Keyring";
 const UNLOCK_METHOD: &str = "Unlock";
+const RESET_METHOD: &str = "Reset";
+const LOGIN_REJECTED_PROPERTY: &str = "LoginPasswordRejected";
 
 /// Hands the password to the daemon.
 ///
@@ -73,6 +75,60 @@ async fn unlock(password: String) -> Result<bool, String> {
         .map_err(|error| format!("{error}"))
 }
 
+/// Si la contraseña con la que se inició sesión no abrió el llavero
+/// (vasak-keyring#38): entonces lo que hay que pedir es la contraseña
+/// **anterior** de la cuenta, y el diálogo lo dice. Ante cualquier error, `false`:
+/// el diálogo de siempre sigue sirviendo.
+#[tauri::command]
+async fn login_password_rejected() -> bool {
+    let Ok(connection) = zbus::Connection::session().await else {
+        return false;
+    };
+    let Ok(proxy) = zbus::Proxy::new(
+        &connection,
+        KEYRING_SERVICE,
+        KEYRING_PATH,
+        KEYRING_INTERFACE,
+    )
+    .await
+    else {
+        return false;
+    };
+    proxy
+        .get_property::<bool>(LOGIN_REJECTED_PROPERTY)
+        .await
+        .unwrap_or(false)
+}
+
+/// Aparta el llavero que no abre y empieza uno vacío con la contraseña del
+/// inicio de sesión. No manda ninguna contraseña: el demonio usa la que le
+/// entregó el inicio de sesión. Devuelve dónde quedó el apartado.
+#[tauri::command]
+async fn reset() -> Result<String, String> {
+    let connection = zbus::Connection::session()
+        .await
+        .map_err(|error| format!("{error}"))?;
+
+    let reply = connection
+        .call_method(
+            Some(KEYRING_SERVICE),
+            KEYRING_PATH,
+            Some(KEYRING_INTERFACE),
+            RESET_METHOD,
+            &(),
+        )
+        .await
+        .map_err(|error| match error {
+            zbus::Error::MethodError(_, Some(message), _) => message,
+            other => format!("{other}"),
+        })?;
+
+    reply
+        .body()
+        .deserialize::<String>()
+        .map_err(|error| format!("{error}"))
+}
+
 /// Ends the process with the answer in the exit code.
 #[tauri::command]
 fn finish(app: tauri::AppHandle, unlocked: bool) {
@@ -84,7 +140,12 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_config_manager::init())
         .plugin(tauri_plugin_vicons::init())
-        .invoke_handler(tauri::generate_handler![unlock, finish])
+        .invoke_handler(tauri::generate_handler![
+            unlock,
+            finish,
+            login_password_rejected,
+            reset
+        ])
         .setup(|app| {
             let window = WebviewWindowBuilder::new(app, WINDOW_LABEL, WebviewUrl::default())
                 .title("Desbloquear el llavero")

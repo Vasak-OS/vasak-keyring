@@ -62,15 +62,23 @@ pub fn ruta_del_socket(uid: u32) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("/run/user/{uid}/vasak-keyring")).join("unlock.sock")
 }
 
-/// Quién puede entregar una contraseña por este socket.
+/// Quién puede entregar una contraseña por este socket: sólo root.
 ///
 /// Root, porque es quien acaba de autenticar a la persona y tiene la contraseña
-/// que escribió. Y el propio usuario, porque es el dueño del llavero y de todos
-/// modos ya puede leer la base cifrada. Nadie más: aunque el directorio de
-/// `/run/user` ya los deja afuera, el chequeo del par no depende de que los
-/// permisos de un directorio sigan siendo los que se esperan.
+/// que escribió: el módulo de PAM corre dentro del gestor de inicio de sesión.
+///
+/// El propio usuario **no**, aunque es el dueño del llavero. Cualquier programa
+/// de la sesión corre con ese uid —un AppImage confinado incluido, al que
+/// AppArmor le niega la base pero no los sockets—, y con una base todavía sin
+/// crear la contraseña que entregara sería la maestra de la base nueva. El
+/// usuario ya tiene su camino, que es `Unlock` por D-Bus desde el diálogo.
+///
+/// `uid_propio` queda en la firma para que la regla se lea contra el dueño: aunque
+/// el directorio de `/run/user` ya deja afuera a los demás, el chequeo del par no
+/// depende de que los permisos de un directorio sigan siendo los que se esperan.
 pub fn par_autorizado(uid_del_par: u32, uid_propio: u32) -> bool {
-    uid_del_par == 0 || uid_del_par == uid_propio
+    let _ = uid_propio;
+    uid_del_par == 0
 }
 
 /// Interpreta lo que llegó por el socket.
@@ -177,9 +185,10 @@ async fn atender(
     state: Arc<Mutex<KeyringState>>,
     conn: zbus::Connection,
 ) {
-    // Si la entrega viene de root —el módulo de PAM— o del propio usuario. Sólo
-    // la de root cuenta como «la contraseña del inicio de sesión»: ver
-    // `aplicar_desde_el_login`.
+    // Hoy sólo root pasa `par_autorizado`, pero quién entregó se sigue pasando:
+    // sólo la entrega de root cuenta como «la contraseña del inicio de sesión»
+    // (ver `aplicar_desde_el_login`), y esa regla no puede depender de que el
+    // filtro del par no se vuelva a abrir.
     let desde_root = match stream.peer_cred() {
         Ok(cred) if par_autorizado(cred.uid(), uid_propio) => cred.uid() == 0,
         Ok(cred) => {
@@ -395,14 +404,98 @@ mod tests {
     }
 
     #[test]
-    fn solo_root_y_el_dueno_pueden_entregar() {
+    fn solo_root_puede_entregar_y_el_dueno_no() {
         assert!(
             par_autorizado(0, 1000),
             "root autentica el inicio de sesión"
         );
-        assert!(par_autorizado(1000, 1000), "el dueño del llavero");
+        // El dueño no: cualquier programa de la sesión corre con su uid, y sin
+        // base todavía la contraseña que entregara sería la maestra de la nueva.
+        assert!(
+            !par_autorizado(1000, 1000),
+            "el dueño del llavero desbloquea por D-Bus, no por el socket"
+        );
         assert!(!par_autorizado(1001, 1000), "otra persona de la máquina");
         assert!(!par_autorizado(999, 1000), "una cuenta de servicio");
+    }
+
+    /// Un programa de la sesión —mismo uid que el demonio— que se conecta al
+    /// socket con un llavero todavía sin base. Antes elegía la maestra: la base
+    /// se creaba cifrada con lo que él mandara. Ahora no pasa del par.
+    ///
+    /// Va contra `atender`, que es lo que corre por cada conexión, y no contra
+    /// `escuchar`: `escuchar` arma la ruta desde el uid, en `/run/user/<uid>`, y
+    /// probarlo ahí borraría el socket del demonio de verdad. Un par de sockets
+    /// conectados tiene las mismas credenciales del par que una conexión real del
+    /// propio proceso, que es exactamente el caso a cerrar.
+    #[tokio::test]
+    async fn un_programa_de_la_sesion_no_elige_la_maestra_de_una_base_nueva() {
+        use crate::dbus_api::tests::{
+            base_de_las_pruebas, estado_de_la_sesion, maestra_en_memoria, EstadoDelLogin,
+        };
+
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        // Sin base es justamente el caso del hueco: con una base, la contraseña
+        // del intruso no la abre y no se adopta.
+        assert!(
+            !base_de_las_pruebas().exists(),
+            "la prueba arranca sin base"
+        );
+        assert!(maestra_en_memoria().is_none(), "y sin maestra");
+
+        let (extremo_del_demonio, extremo_del_bus) = UnixStream::pair().unwrap();
+        let demonio = zbus::connection::Builder::unix_stream(extremo_del_demonio)
+            .server(zbus::Guid::generate())
+            .unwrap()
+            .p2p()
+            .build();
+        let otra_punta = zbus::connection::Builder::unix_stream(extremo_del_bus)
+            .p2p()
+            .build();
+        let (demonio, _otra_punta) = tokio::join!(demonio, otra_punta);
+        let demonio = demonio.expect("no se pudo levantar el bus de la prueba");
+        let estado = Arc::new(Mutex::new(crate::dbus_api::KeyringState::new()));
+
+        let (servidor, mut intruso) = UnixStream::pair().unwrap();
+        assert_ne!(
+            servidor.peer_cred().unwrap().uid(),
+            0,
+            "la prueba tiene que correr sin ser root: el par es el propio usuario"
+        );
+        let atencion = tokio::spawn(atender(
+            servidor,
+            unsafe { libc::geteuid() },
+            estado,
+            demonio,
+        ));
+
+        // Si el demonio corta antes de leer, escribir puede dar EPIPE: lo que
+        // importa no es si la escritura entró, sino qué hizo el demonio con ella.
+        let _ = intruso.write_all(b"la-del-intruso\n").await;
+        let _ = intruso.shutdown().await;
+        let mut respuesta = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            intruso.read_to_end(&mut respuesta),
+        )
+        .await
+        .expect("el demonio no contestó ni cortó");
+        atencion
+            .await
+            .expect("la atención de la conexión no terminó");
+
+        // La base no se escribe al abrir sino en el primer guardado, y se cifra
+        // con la maestra que haya en memoria: que no quede ninguna es lo que
+        // impide que la base nueva nazca con la contraseña del intruso.
+        assert!(
+            maestra_en_memoria().is_none(),
+            "la contraseña de un programa de la sesión no puede quedar como maestra"
+        );
+        assert_ne!(
+            respuesta, b"1",
+            "el demonio no puede decirle al propio usuario que abrió el llavero"
+        );
     }
 
     #[test]

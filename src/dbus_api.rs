@@ -2988,9 +2988,10 @@ impl PamUnlockInterface {
     /// Sólo entonces se anota, para que el diálogo y los mensajes lo digan y para
     /// poder re-cifrar o empezar de nuevo con ella.
     ///
-    /// Una entrega del propio usuario (`desde_root == false`) no se anota nunca:
-    /// cualquier proceso de la sesión puede escribir en el socket, y si su rechazo
-    /// contara, elegiría con qué maestra queda cifrada la base al próximo
+    /// Una entrega que no sea de root (`desde_root == false`) no se anota nunca.
+    /// Hoy el socket ya no deja entrar a nadie más (`par_autorizado`), pero esta
+    /// regla no depende de eso: si un proceso de la sesión llegara hasta acá y su
+    /// rechazo contara, elegiría con qué maestra queda cifrada la base al próximo
     /// desbloqueo. Tampoco con el llavero ya abierto: ahí no hay nada que migrar,
     /// y la marca quedaría esperando al próximo inicio de sesión.
     pub async fn aplicar_desde_el_login(
@@ -3407,7 +3408,7 @@ async fn find_secret(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::test_bus::{self, pid_inexistente, BusFalso};
     use std::collections::BTreeSet;
@@ -3761,7 +3762,7 @@ mod tests {
     /// mismo motivo. El candado es el de tokio y no uno de `std` porque las
     /// pruebas son async: uno de `std` tomado a lo largo de un `.await` bloquea
     /// el hilo del runtime, que es justo lo que se está cuidando acá.
-    pub(super) fn estado_de_la_sesion() -> &'static Mutex<()> {
+    pub(crate) fn estado_de_la_sesion() -> &'static Mutex<()> {
         static ESTADO: OnceLock<Mutex<()>> = OnceLock::new();
         ESTADO.get_or_init(|| Mutex::new(()))
     }
@@ -7104,13 +7105,13 @@ mod tests {
     /// Deja el estado del desbloqueo limpio al entrar y al salir: sin maestra, sin
     /// login rechazado, sin intentos fallidos, sin bloqueo de escritura y sin base
     /// —ni apartadas— en la ruta de las pruebas.
-    struct EstadoDelLogin {
+    pub(crate) struct EstadoDelLogin {
         _sesion: Sesion,
         _escritura: EscrituraComoEstaba,
     }
 
     impl EstadoDelLogin {
-        fn limpio() -> Self {
+        pub(crate) fn limpio() -> Self {
             let estado = Self {
                 _sesion: sesion_cerrada(),
                 _escritura: EscrituraComoEstaba::nuevo(),
@@ -7136,7 +7137,7 @@ mod tests {
         }
     }
 
-    fn base_de_las_pruebas() -> PathBuf {
+    pub(crate) fn base_de_las_pruebas() -> PathBuf {
         let ruta = keyring_path().expect("en las pruebas siempre hay ruta");
         assert!(
             ruta.starts_with(std::env::temp_dir()),
@@ -7202,7 +7203,7 @@ mod tests {
         (desbloqueo, estado, demonio, cliente)
     }
 
-    fn maestra_en_memoria() -> Option<String> {
+    pub(crate) fn maestra_en_memoria() -> Option<String> {
         master_store()
             .lock()
             .ok()

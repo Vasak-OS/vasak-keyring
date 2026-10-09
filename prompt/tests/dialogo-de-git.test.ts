@@ -21,6 +21,12 @@ const PEDIDO_DE_CONTRASENA = {
 	username: 'pato',
 };
 
+const PEDIDO_DE_CERTIFICADO = {
+	field: 'certificate',
+	host: '/home/pato/cliente.p12',
+	username: null,
+};
+
 let vista: VueWrapper | null = null;
 
 async function abrir(pedido: unknown) {
@@ -108,5 +114,16 @@ describe('el diálogo de git', () => {
 
 		expect(invocaciones).toContain('git_cancel');
 		expect(invocaciones).not.toContain('git_answer');
+	});
+
+	test('la contraseña de un certificado se escribe oculta y dice de qué archivo es', async () => {
+		const dialogo = await abrir(PEDIDO_DE_CERTIFICADO);
+		const texto = dialogo.text().replace(/\s+/g, ' ');
+
+		expect(dialogo.get('input').attributes('type')).toBe('password');
+		expect(dialogo.get('label').text()).toBe('Contraseña del certificado');
+		expect(texto).toContain(
+			'El certificado /home/pato/cliente.p12 está protegido con una contraseña.'
+		);
 	});
 });

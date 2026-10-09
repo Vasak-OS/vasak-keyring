@@ -444,6 +444,44 @@ mod tests {
         }
     }
 
+    /// La contraseña de un certificado de cliente no tiene servidor: lo que el
+    /// diálogo muestra es la ruta del archivo. Git la escribe con cuatro barras
+    /// (`cert://` más una ruta absoluta) y tiene que verse como una ruta, con
+    /// una sola.
+    #[test]
+    fn la_contrasena_de_un_certificado_trae_la_ruta_con_una_sola_barra() {
+        for prompt in [
+            "Password for 'cert:////home/pato/cliente.p12': ",
+            "Password for 'cert:///home/pato/cliente.p12': ",
+        ] {
+            assert_eq!(
+                git_prompt_from(prompt),
+                Some(GitPrompt {
+                    field: GitField::Certificate,
+                    host: "/home/pato/cliente.p12".into(),
+                    username: None,
+                }),
+                "{prompt}"
+            );
+        }
+    }
+
+    /// El diálogo distingue el certificado por `field == "certificate"`. Con
+    /// otro nombre lo mostraría como un pedido de usuario, en texto visible.
+    #[test]
+    fn el_certificado_llega_al_dialogo_como_certificate() {
+        let certificado =
+            git_prompt_from("Password for 'cert:////home/pato/cliente.p12': ").unwrap();
+        assert_eq!(
+            serde_json::to_value(&certificado).unwrap(),
+            serde_json::json!({
+                "field": "certificate",
+                "host": "/home/pato/cliente.p12",
+                "username": null,
+            })
+        );
+    }
+
     #[test]
     fn el_nombre_para_el_dialogo_es_el_del_archivo() {
         let request = Request {

@@ -78,6 +78,12 @@ pub fn give_up() -> ! {
 /// `Enter passphrase for /home/pato/.ssh/id_ed25519:`. Both carry the path, and
 /// the path is what the passphrase is filed under.
 pub fn key_path_from(prompt: &str) -> Option<String> {
+    // Una URL no es una ruta: sin esto, `Username for 'https://github.com': `
+    // terminaba archivado como la clave `//github.com'`.
+    if is_git_credential_prompt(prompt) {
+        return None;
+    }
+
     if let Some(start) = prompt.find('\'') {
         let rest = &prompt[start + 1..];
         if let Some(end) = rest.find('\'') {
@@ -93,6 +99,18 @@ pub fn key_path_from(prompt: &str) -> Option<String> {
     let path = prompt[start..].trim_end();
     let path = path.strip_suffix(':').unwrap_or(path).trim_end();
     (!path.is_empty()).then(|| path.to_string())
+}
+
+/// Git preguntando el usuario o la contraseña de un remoto HTTPS.
+///
+/// Git, sin un credential helper, le pregunta a SSH_ASKPASS lo mismo que a
+/// ssh: `Username for 'https://github.com': ` y después
+/// `Password for 'https://usuario@github.com': `. No es una frase de clave,
+/// no hay nada que buscar en el llavero, y el diálogo de «Clave SSH» la
+/// presentaba como si lo fuera: lo que se escribiera ahí se mandaba a GitHub
+/// como nombre de usuario. Ssh nunca pone una URL en sus pedidos; git siempre.
+pub fn is_git_credential_prompt(prompt: &str) -> bool {
+    prompt.contains("://")
 }
 
 /// What the dialog needs to say.
@@ -121,6 +139,19 @@ pub fn start() -> Request {
     claim_stdout();
 
     let prompt = std::env::args().nth(1).unwrap_or_default();
+
+    // Se rechaza sin abrir nada: git corta con «could not read Username», que
+    // dice qué falta —un credential helper o un remoto por SSH—, en vez de un
+    // diálogo que pide otra cosa.
+    if is_git_credential_prompt(&prompt) {
+        eprintln!(
+            "[vasak-ssh-askpass] «{}» es un pedido de credenciales de git, no de una clave SSH: \
+             usá un remoto por SSH o un credential helper",
+            prompt.trim()
+        );
+        give_up();
+    }
+
     let key_path = key_path_from(&prompt);
 
     if let Some(path) = key_path.as_deref() {
@@ -189,6 +220,22 @@ mod tests {
     #[test]
     fn sin_ruta_no_inventa_una() {
         assert!(key_path_from("Are you sure you want to continue connecting?").is_none());
+    }
+
+    /// Git por HTTPS pregunta por SSH_ASKPASS. No es una clave: ni ruta ni
+    /// diálogo de «Clave SSH».
+    #[test]
+    fn los_pedidos_de_git_por_https_no_son_claves() {
+        for prompt in [
+            "Username for 'https://github.com': ",
+            "Password for 'https://erv0gbup@github.com': ",
+        ] {
+            assert!(is_git_credential_prompt(prompt), "{prompt}");
+            assert!(key_path_from(prompt).is_none(), "{prompt}");
+        }
+        assert!(!is_git_credential_prompt(
+            "Enter passphrase for key '/home/pato/.ssh/id_ed25519': "
+        ));
     }
 
     #[test]

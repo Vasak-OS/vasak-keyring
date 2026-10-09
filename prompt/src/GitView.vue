@@ -95,7 +95,7 @@ const submit = async () => {
 			<!-- Lo guarda git en el llavero cuando el servidor lo acepta, así que
 			     una contraseña mal escrita no queda recordada. -->
 			<p v-if="asksPassword" class="text-sm text-tx-muted">
-				Si el servidor la acepta, queda guardada en el llavero.
+				Si funciona, queda guardada en el llavero.
 			</p>
 		</form>
 

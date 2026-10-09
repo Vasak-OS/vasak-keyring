@@ -18,8 +18,17 @@ const field = ref<HTMLInputElement | null>(null);
 onMounted(async () => {
 	const configStore = useConfigStore();
 
+	// With a deadline, and not for the colours: the field gets focused after
+	// this await, so a configuration that never answers would leave the dialog
+	// waiting to focus a password box. If the deadline wins, the dialog still
+	// works with the shipped defaults, which is the whole point of the catch.
+	const PLAZO_CONFIG_MS = 2000;
 	try {
-		await configStore.loadConfig();
+		const lectura = configStore.loadConfig();
+		// If the deadline wins and the reading fails afterwards, that
+		// rejection cannot be left unattended.
+		lectura.catch(() => {});
+		await Promise.race([lectura, new Promise((resolve) => setTimeout(resolve, PLAZO_CONFIG_MS))]);
 	} catch {
 		// The shipped defaults are still a Vasak dialog; failing to read the
 		// configuration is no reason not to ask for the password.

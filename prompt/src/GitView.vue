@@ -5,7 +5,7 @@ import { WindowFrame } from '@vasakgroup/vue-libvasak';
 import { computed, nextTick, onMounted, ref } from 'vue';
 
 interface GitPrompt {
-	field: 'username' | 'password';
+	field: 'username' | 'password' | 'certificate';
 	host: string;
 	username: string | null;
 }
@@ -15,7 +15,9 @@ const value = ref('');
 const working = ref(false);
 const field = ref<HTMLInputElement | null>(null);
 
-const asksPassword = computed(() => request.value?.field === 'password');
+const asksCertificate = computed(() => request.value?.field === 'certificate');
+// Las dos se escriben ocultas; cambia lo que se le dice a quien la escribe.
+const asksPassword = computed(() => request.value?.field === 'password' || asksCertificate.value);
 
 /**
  * Del otro lado hay un `git` esperando, así que primero se pide lo que hay que
@@ -58,7 +60,12 @@ const submit = async () => {
 		<div class="flex min-w-0 flex-1 select-none flex-col gap-4 p-6">
 		<div class="flex flex-col gap-2">
 			<h1 class="text-lg font-semibold text-tx-main">Iniciar sesión en git</h1>
-			<p class="text-sm text-tx-muted">
+			<p v-if="asksCertificate" class="text-sm text-tx-muted">
+				El certificado
+				<span class="font-medium text-tx-main break-all">{{ request?.host }}</span>
+				está protegido con una contraseña.
+			</p>
+			<p v-else class="text-sm text-tx-muted">
 				<span class="font-medium text-tx-main">{{ request?.host || 'El servidor' }}</span>
 				pide
 				<template v-if="asksPassword">
@@ -72,7 +79,7 @@ const submit = async () => {
 		<form class="flex flex-col gap-3" @submit.prevent="submit">
 			<div class="flex flex-col gap-2">
 				<label for="credential" class="text-xs font-semibold uppercase text-tx-main">
-					{{ asksPassword ? 'Contraseña o token' : 'Usuario' }}
+					{{ asksCertificate ? 'Contraseña del certificado' : asksPassword ? 'Contraseña o token' : 'Usuario' }}
 				</label>
 				<input
 					id="credential"

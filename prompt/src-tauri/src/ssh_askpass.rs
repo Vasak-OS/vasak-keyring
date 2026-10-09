@@ -118,6 +118,9 @@ pub fn is_git_credential_prompt(prompt: &str) -> bool {
 pub enum GitField {
     Username,
     Password,
+    /// The password of a client certificate (`http.sslCertPasswordProtected`).
+    /// `host` then carries the certificate's path.
+    Certificate,
 }
 
 /// A git credential question, taken apart for the dialog.
@@ -144,7 +147,20 @@ pub fn git_prompt_from(prompt: &str) -> Option<GitPrompt> {
     let start = prompt.find('\'').map_or(0, |i| i + 1);
     let rest = &prompt[start..];
     let url = rest.find('\'').map_or(rest, |end| &rest[..end]);
-    let authority = url.split("://").nth(1)?.split('/').next()?;
+    let (scheme, location) = url.split_once("://")?;
+
+    // La contraseña de un certificado de cliente llega como `cert:///ruta`, sin
+    // servidor: lo que hay que mostrar es de qué archivo es.
+    if scheme == "cert" {
+        let path = format!("/{}", location.trim_start_matches('/'));
+        return Some(GitPrompt {
+            field: GitField::Certificate,
+            host: path,
+            username: None,
+        });
+    }
+
+    let authority = location.split('/').next()?;
 
     let (username, host) = match authority.rsplit_once('@') {
         Some((user, host)) => (Some(user.to_string()), host),
@@ -206,6 +222,16 @@ pub fn start() -> Request {
             key_path: None,
             git: Some(git),
         };
+    }
+
+    // Una URL que no se pudo interpretar sigue sin ser una clave SSH: se
+    // rechaza, como antes, en vez de caer en el diálogo de «Clave SSH».
+    if is_git_credential_prompt(&prompt) {
+        eprintln!(
+            "[vasak-ssh-askpass] «{}» es un pedido de git que no se pudo interpretar",
+            prompt.trim()
+        );
+        give_up();
     }
 
     let key_path = key_path_from(&prompt);
@@ -408,7 +434,6 @@ mod tests {
     /// `start()` sigue de largo hasta el diálogo de SSH, cuando antes del
     /// cambio se rechazaba.
     #[test]
-    #[ignore = "bug del cambio: la contraseña de un certificado de git cae al diálogo de SSH"]
     fn ningun_pedido_con_url_cae_al_dialogo_de_ssh() {
         for prompt in [
             "Password for 'cert:////home/pato/cliente.p12': ",

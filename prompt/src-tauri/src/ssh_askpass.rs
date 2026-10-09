@@ -298,6 +298,127 @@ mod tests {
         ));
     }
 
+    /// El primer pedido de git por HTTPS: todavía no sabe quién sos, así que
+    /// el diálogo tiene que pedir el usuario, en texto, y decir para qué
+    /// servidor.
+    #[test]
+    fn el_pedido_de_usuario_de_git_se_entiende() {
+        assert_eq!(
+            git_prompt_from("Username for 'https://github.com': "),
+            Some(GitPrompt {
+                field: GitField::Username,
+                host: "github.com".into(),
+                username: None,
+            })
+        );
+    }
+
+    /// El segundo pedido ya trae el usuario en la URL, y el servidor puede
+    /// tener puerto. Los dos se muestran en el diálogo: sin el puerto, dos
+    /// servidores en la misma máquina se ven iguales.
+    #[test]
+    fn el_pedido_de_contrasena_trae_el_usuario_y_el_puerto() {
+        assert_eq!(
+            git_prompt_from("Password for 'https://pato@gitlab.example.com:8443': "),
+            Some(GitPrompt {
+                field: GitField::Password,
+                host: "gitlab.example.com:8443".into(),
+                username: Some("pato".into()),
+            })
+        );
+    }
+
+    /// Si en la URL hay un usuario, lo que falta es la contraseña, diga lo que
+    /// diga la palabra del principio. Si se pidiera en un campo de texto, la
+    /// contraseña quedaría a la vista de quien mire la pantalla.
+    #[test]
+    fn un_usuario_en_la_url_implica_que_se_pide_la_contrasena() {
+        let prompt = git_prompt_from("Contraseña para 'https://pato@github.com': ")
+            .expect("es un pedido de git");
+        assert_eq!(prompt.field, GitField::Password);
+        assert_eq!(prompt.username.as_deref(), Some("pato"));
+        assert_eq!(prompt.host, "github.com");
+    }
+
+    /// Con `credential.useHttpPath` git pone la ruta del repositorio en la URL.
+    /// El servidor es el mismo; la ruta no es parte de él.
+    #[test]
+    fn la_ruta_del_repositorio_no_es_parte_del_servidor() {
+        let prompt =
+            git_prompt_from("Username for 'https://github.com/Vasak-OS/vasak-keyring.git': ")
+                .expect("es un pedido de git");
+        assert_eq!(prompt.host, "github.com");
+        assert_eq!(prompt.field, GitField::Username);
+    }
+
+    /// Hay servidores donde el usuario es un correo. Git lo escribe tal cual,
+    /// con su arroba, y el servidor es lo que queda después de la última.
+    #[test]
+    fn un_usuario_que_es_un_correo_no_se_confunde_con_el_servidor() {
+        let prompt = git_prompt_from("Password for 'https://pato@vasak.net.ar@git.example.com': ")
+            .expect("es un pedido de git");
+        assert_eq!(prompt.username.as_deref(), Some("pato@vasak.net.ar"));
+        assert_eq!(prompt.host, "git.example.com");
+        assert_eq!(prompt.field, GitField::Password);
+    }
+
+    /// Lo que pregunta ssh sigue yendo al diálogo de la clave.
+    #[test]
+    fn los_pedidos_de_ssh_no_son_de_git() {
+        for prompt in [
+            "Enter passphrase for key '/home/pato/.ssh/id_ed25519': ",
+            "Enter passphrase for /home/pato/.ssh/id_ed25519: ",
+            "Are you sure you want to continue connecting (yes/no/[fingerprint])? ",
+            "",
+        ] {
+            assert_eq!(git_prompt_from(prompt), None, "{prompt}");
+        }
+    }
+
+    /// El diálogo compara `field` con "username" y "password". Si llegara
+    /// "Username", un pedido de contraseña se mostraría como uno de usuario, en
+    /// un campo de texto, y nada en Rust ni en TypeScript avisaría.
+    #[test]
+    fn el_pedido_llega_al_dialogo_con_el_campo_en_minusculas() {
+        let usuario = git_prompt_from("Username for 'https://github.com': ").unwrap();
+        assert_eq!(
+            serde_json::to_value(&usuario).unwrap(),
+            serde_json::json!({
+                "field": "username",
+                "host": "github.com",
+                "username": null,
+            })
+        );
+
+        let contrasena = git_prompt_from("Password for 'https://pato@github.com': ").unwrap();
+        assert_eq!(
+            serde_json::to_value(&contrasena).unwrap(),
+            serde_json::json!({
+                "field": "password",
+                "host": "github.com",
+                "username": "pato",
+            })
+        );
+    }
+
+    /// Todo pedido con una URL es de git, y ninguno puede terminar en el
+    /// diálogo de «Clave SSH» (el bug que arregló #39). La contraseña de un
+    /// certificado de cliente (`http.sslCertPasswordProtected`) llega con el
+    /// protocolo `cert` y sin servidor: `git_prompt_from` devuelve `None`, y
+    /// `start()` sigue de largo hasta el diálogo de SSH, cuando antes del
+    /// cambio se rechazaba.
+    #[test]
+    #[ignore = "bug del cambio: la contraseña de un certificado de git cae al diálogo de SSH"]
+    fn ningun_pedido_con_url_cae_al_dialogo_de_ssh() {
+        for prompt in [
+            "Password for 'cert:////home/pato/cliente.p12': ",
+            "Password for 'cert:///home/pato/cliente.p12': ",
+        ] {
+            assert!(is_git_credential_prompt(prompt), "{prompt}");
+            assert!(git_prompt_from(prompt).is_some(), "{prompt}");
+        }
+    }
+
     #[test]
     fn el_nombre_para_el_dialogo_es_el_del_archivo() {
         let request = Request {

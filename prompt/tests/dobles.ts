@@ -1,20 +1,23 @@
 /**
  * Los dobles de lo que sólo existe adentro de la ventana de Tauri.
  *
- * Sin ellos, importar cualquiera de los tres diálogos falla en la primera
+ * Sin ellos, importar cualquiera de los diálogos falla en la primera
  * línea: el marco pide iconos, escucha el cambio de tema y lee la configuración
  * del escritorio.
  */
 
 export const invocaciones: string[] = [];
+/** Lo que se le pasó a cada comando, en el mismo orden que `invocaciones`. */
+export const argumentos: unknown[] = [];
 const respuestas = new Map<string, unknown>();
 
 export function contestar(comando: string, valor: unknown) {
 	respuestas.set(comando, valor);
 }
 
-export async function invoke(comando: string) {
+export async function invoke(comando: string, args?: unknown) {
 	invocaciones.push(comando);
+	argumentos.push(args);
 	return respuestas.get(comando);
 }
 
@@ -51,6 +54,7 @@ export async function getSymbolSource(_nombre: string) {
 
 export function olvidarTodo() {
 	invocaciones.length = 0;
+	argumentos.length = 0;
 	laVentanaRecibio.length = 0;
 	respuestas.clear();
 }

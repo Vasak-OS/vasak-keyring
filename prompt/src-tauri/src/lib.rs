@@ -389,3 +389,40 @@ pub fn run_pinentry_dialog() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Las ventanas a las que la capacidad les da permiso.
+    fn windows_with_capability() -> Vec<String> {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        capability["windows"]
+            .as_array()
+            .expect("la capacidad nombra sus ventanas")
+            .iter()
+            .map(|window| window.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Una ventana que no figura en la capacidad no puede llamar a los
+    /// complementos: el diálogo de git se abriría sin el tema ni los iconos del
+    /// sistema, y sin ningún error a la vista.
+    #[test]
+    fn la_ventana_de_git_tiene_permisos() {
+        assert!(
+            windows_with_capability().contains(&GIT_WINDOW_LABEL.to_string()),
+            "falta «{GIT_WINDOW_LABEL}» en capabilities/default.json"
+        );
+    }
+
+    /// Las que ya estaban no se pierden en el camino.
+    #[test]
+    fn las_ventanas_que_ya_tenian_permisos_los_conservan() {
+        let windows = windows_with_capability();
+        for label in [WINDOW_LABEL, SSH_WINDOW_LABEL] {
+            assert!(windows.contains(&label.to_string()), "falta «{label}»");
+        }
+    }
+}

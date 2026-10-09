@@ -1,11 +1,11 @@
 /**
- * Los tres diálogos del llavero, con el marco compartido y sin barra.
+ * Los diálogos del llavero, con el marco compartido y sin barra.
  *
- * Desbloquear el llavero, desbloquear una clave SSH y la frase que pide GPG son
- * la misma ventana con otro texto, y las tres dibujaban su propio borde, su
- * propia esquina y su propio fondo. Aparecen encima de lo que sea que estés
- * haciendo, así que si su esquina no es la misma que la de la ventana que
- * tienen debajo, se ve.
+ * Desbloquear el llavero, desbloquear una clave SSH, la frase que pide GPG y el
+ * usuario o la contraseña de un remoto de git son la misma ventana con otro
+ * texto. Las tres primeras dibujaban su propio borde, su propia esquina y su
+ * propio fondo. Aparecen encima de lo que sea que estés haciendo, así que si su
+ * esquina no es la misma que la de la ventana que tienen debajo, se ve.
  *
  * Sin barra y por lo tanto sin ningún botón de ventana: acá la ventana **se
  * responde**. Cerrarla dejaría al programa que pidió el secreto esperando, y la
@@ -17,15 +17,17 @@ import { WindowControls, WindowFrame } from '@vasakgroup/vue-libvasak';
 import { mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import App from '@/App.vue';
+import GitView from '@/GitView.vue';
 import GpgView from '@/GpgView.vue';
 import SshView from '@/SshView.vue';
 import { laVentanaRecibio, olvidarTodo } from './dobles';
 
-/** Los tres, para no escribir tres veces la misma prueba. */
+/** Todos, para no escribir cuatro veces la misma prueba. */
 const DIALOGOS = [
 	['el del llavero', App],
 	['el de SSH', SshView],
 	['el de GPG', GpgView],
+	['el de git', GitView],
 ] as const;
 
 let vista: VueWrapper | null = null;

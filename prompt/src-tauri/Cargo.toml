@@ -41,3 +41,9 @@ zeroize = "1"
 libc = "0.2"
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 futures-util = "0.3"
+
+[dev-dependencies]
+# Para mirar el JSON que le llega al diálogo de git tal como lo arma Tauri: el
+# frontend compara `field` con "username" y "password", y un cambio en cómo se
+# serializa lo rompería sin que el compilador diga nada.
+serde_json = "1"

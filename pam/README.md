@@ -48,7 +48,9 @@ imposible.
 
 El socket vive dentro de `/run/user/<uid>`, que es 0700 del usuario, y root entra
 igual porque no está sujeto a los permisos. El demonio verifica con `SO_PEERCRED`
-que quien entrega sea root o el propio usuario. De paso la contraseña ya no
+que quien entrega sea root: el propio usuario no, porque cualquier programa de
+la sesión corre con su uid y, sin base todavía, elegiría la maestra de la nueva.
+El usuario desbloquea por D-Bus, desde el diálogo. De paso la contraseña ya no
 atraviesa el proceso del broker, y el módulo dejó de cargar zbus y tokio dentro
 del gestor de inicio de sesión.
 

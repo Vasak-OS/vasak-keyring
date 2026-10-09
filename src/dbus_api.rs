@@ -261,6 +261,61 @@ fn master_password() -> Option<Zeroizing<String>> {
         .map(Zeroizing::new)
 }
 
+/// La maestra que entregó el inicio de sesión y **no abrió** la base que hay.
+///
+/// Es la marca de que la base se escribió con otra contraseña: la del login la
+/// validó PAM, así que si no abre no es un error de tipeo sino una base cifrada
+/// con la contraseña anterior de la cuenta —lo normal después de un `passwd`
+/// (vasak-keyring#38)—. Se guarda la maestra misma y no sólo la marca porque
+/// sirve para dos cosas: re-cifrar la base con ella cuando la persona la abre
+/// con la contraseña vieja ([`PamUnlockInterface::aplicar`]) y empezar una nueva
+/// con ella si la vieja no aparece ([`PamUnlockInterface::reset`]).
+///
+/// Vive en memoria y nunca en disco, como la maestra adoptada; es el mismo dato
+/// que estaría en [`master_store`] si la base hubiera abierto.
+fn rejected_login_store() -> &'static StdMutex<Option<Zeroizing<String>>> {
+    static STORE: OnceLock<StdMutex<Option<Zeroizing<String>>>> = OnceLock::new();
+    STORE.get_or_init(|| StdMutex::new(None))
+}
+
+/// Anota que la maestra del inicio de sesión no abrió la base.
+fn remember_rejected_login(password: &str) {
+    if let Ok(mut guard) = rejected_login_store().lock() {
+        *guard = Some(Zeroizing::new(password.to_string()));
+    }
+}
+
+/// La maestra del inicio de sesión que no abrió la base, si la hay.
+fn rejected_login() -> Option<Zeroizing<String>> {
+    rejected_login_store()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+fn forget_rejected_login() {
+    if let Ok(mut guard) = rejected_login_store().lock() {
+        *guard = None;
+    }
+}
+
+/// Lo que se dice cuando la contraseña del inicio de sesión no abre la base.
+const STALE_LOGIN_MESSAGE: &str = "el llavero está bloqueado: la contraseña con la que \
+     iniciaste sesión no lo abre, así que está cifrado con otra —casi siempre la anterior \
+     de la cuenta, de antes de cambiarla—. Abrilo una vez con esa contraseña en el diálogo \
+     de desbloqueo y queda cifrado con la de ahora; si no la recordás, el diálogo permite \
+     apartarlo y empezar uno nuevo.";
+
+/// El motivo de «bloqueado», con el caso de la contraseña cambiada aparte: volver
+/// a iniciar sesión —lo que dice [`LOCKED_MESSAGE`]— ahí no arregla nada.
+fn locked_message() -> &'static str {
+    if rejected_login().is_some() {
+        STALE_LOGIN_MESSAGE
+    } else {
+        LOCKED_MESSAGE
+    }
+}
+
 /// Message shown when the keyring cannot be written because it was never
 /// unlocked. Checked before a write mutates anything, so a rejected store
 /// leaves no half-created item behind that a later lookup would find.
@@ -366,7 +421,7 @@ fn estado_de_escritura() -> Escritura {
 fn ensure_unlocked() -> Result<(), String> {
     match estado_de_escritura() {
         Escritura::Allowed => Ok(()),
-        Escritura::Bloqueado => Err(LOCKED_MESSAGE.to_string()),
+        Escritura::Bloqueado => Err(locked_message().to_string()),
         Escritura::SinBaseDescifrada(motivo) => Err(motivo),
     }
 }
@@ -392,7 +447,7 @@ fn ensure_unlocked() -> Result<(), String> {
 fn escritura_bloqueada() -> Result<(), SecretError> {
     match estado_de_escritura() {
         Escritura::Allowed => Ok(()),
-        Escritura::Bloqueado => Err(SecretError::IsLocked(LOCKED_MESSAGE.to_string())),
+        Escritura::Bloqueado => Err(SecretError::IsLocked(locked_message().to_string())),
         Escritura::SinBaseDescifrada(motivo) => Err(SecretError::Plain(dbus_err(motivo))),
     }
 }
@@ -2821,6 +2876,10 @@ mod rate_limit_tests {
     /// it has to be, so two tests touching it in parallel would fight over it.
     #[test]
     fn three_wrong_passwords_close_the_door_and_the_right_one_opens_it() {
+        // Las pruebas de `aplicar` también cuentan intentos fallidos —una
+        // contraseña del inicio de sesión que no abre la base es uno—, así que
+        // ésta va en fila con ellas.
+        let _sesion = super::tests::estado_de_la_sesion().blocking_lock();
         assert_eq!(unlock_blocked_for(), None, "arranca sin bloqueo");
 
         for _ in 0..UNLOCK_MAX_ATTEMPTS - 1 {
@@ -2865,7 +2924,18 @@ impl PamUnlockInterface {
     /// usuario y usa el bus, pero el módulo de PAM corre como root dentro del
     /// gestor de inicio de sesión y el bus de sesión no lo deja entrar. Ese
     /// llega por el socket de `unlock_socket.rs`.
+    ///
+    /// Si el inicio de sesión había entregado otra contraseña que no abría la
+    /// base ([`rejected_login`]) y ésta sí la abre, la base se re-cifra con la del
+    /// inicio de sesión: es la contraseña de la cuenta de ahora, y así el próximo
+    /// inicio de sesión la abre solo (vasak-keyring#38).
     pub async fn aplicar(&self, password: &str) -> Result<bool, zbus::fdo::Error> {
+        let _turno = unlock_turn().lock().await;
+        self.aplicar_sin_turno(password).await
+    }
+
+    /// [`Self::aplicar`] sin tomar el turno, para quien ya lo tiene.
+    async fn aplicar_sin_turno(&self, password: &str) -> Result<bool, zbus::fdo::Error> {
         // Refused rather than answered `false`: the caller is being told to stop
         // trying, which is a different thing from the password being wrong, and
         // the dialog says so instead of blaming the password.
@@ -2886,6 +2956,104 @@ impl PamUnlockInterface {
             return Ok(false);
         };
 
+        self.publicar(db).await?;
+
+        if let Some(login) = rejected_login() {
+            forget_rejected_login();
+            if login.as_str() != password {
+                let items: Vec<ItemInfo> = {
+                    let state = self.state.lock().await;
+                    state.items.values().cloned().collect()
+                };
+                match reencrypt(&path, &items, &login, password) {
+                    Ok(()) => println!(
+                        "vasak-keyring: el llavero quedó cifrado con la contraseña de la cuenta \
+                         de ahora"
+                    ),
+                    Err(e) => eprintln!(
+                        "vasak-keyring: el llavero abrió, pero no se pudo cifrar con la \
+                         contraseña de ahora ({e}); sigue con la anterior"
+                    ),
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Lo mismo, con una contraseña que llegó por el socket de desbloqueo.
+    ///
+    /// Si la mandó **root** —el módulo de PAM, que acaba de validarla contra la
+    /// cuenta— un rechazo no es un error de tipeo: es una base cifrada con otra.
+    /// Sólo entonces se anota, para que el diálogo y los mensajes lo digan y para
+    /// poder re-cifrar o empezar de nuevo con ella.
+    ///
+    /// Una entrega que no sea de root (`desde_root == false`) no se anota nunca.
+    /// Hoy el socket ya no deja entrar a nadie más (`par_autorizado`), pero esta
+    /// regla no depende de eso: si un proceso de la sesión llegara hasta acá y su
+    /// rechazo contara, elegiría con qué maestra queda cifrada la base al próximo
+    /// desbloqueo. Tampoco con el llavero ya abierto: ahí no hay nada que migrar,
+    /// y la marca quedaría esperando al próximo inicio de sesión.
+    pub async fn aplicar_desde_el_login(
+        &self,
+        password: &str,
+        desde_root: bool,
+    ) -> Result<bool, zbus::fdo::Error> {
+        let _turno = unlock_turn().lock().await;
+        let ya_abierto = master_adopted();
+        let abierto = self.aplicar_sin_turno(password).await;
+        if should_remember_rejection(&abierto, desde_root, ya_abierto, base_exists().await) {
+            remember_rejected_login(password);
+        }
+        abierto
+    }
+
+    /// Aparta la base que la contraseña del inicio de sesión no abre y empieza una
+    /// vacía con ésa.
+    ///
+    /// Es la salida cuando la contraseña vieja no aparece. **No borra nada**: el
+    /// archivo queda al lado, renombrado, por si la contraseña aparece después.
+    ///
+    /// Sólo se puede con el llavero bloqueado y una contraseña del inicio de sesión
+    /// rechazada, y nunca con otra: la base nueva queda cifrada con la que va a
+    /// llegar en cada inicio de sesión, que es justamente lo que se quiere, y un
+    /// proceso de la sesión no puede usarlo para elegir con qué se cifra.
+    async fn apartar_y_empezar(&self) -> Result<String, zbus::fdo::Error> {
+        let _turno = unlock_turn().lock().await;
+        if master_adopted() {
+            return Err(dbus_err(
+                "el llavero está abierto: no hay nada que apartar".to_string(),
+            ));
+        }
+        let Some(login) = rejected_login() else {
+            return Err(dbus_err(
+                "sólo se puede apartar el llavero cuando la contraseña del inicio de sesión no \
+                 lo abre"
+                    .to_string(),
+            ));
+        };
+        let path = keyring_path()
+            .ok_or_else(|| dbus_err("no se pudo determinar la ruta del llavero".to_string()))?;
+
+        let aside = set_aside(&path, now()).map_err(dbus_err)?;
+        eprintln!(
+            "vasak-keyring: se apartó el llavero que no abría en {}",
+            aside.display()
+        );
+
+        forget_rejected_login();
+        let Some(db) = adopt_password(&path, &login).await.map_err(dbus_err)? else {
+            return Err(dbus_err(
+                "se apartó el llavero, pero no se pudo empezar uno nuevo".to_string(),
+            ));
+        };
+        self.publicar(db).await?;
+
+        Ok(aside.display().to_string())
+    }
+
+    /// Carga en la colección del login la base que acaba de abrirse y la publica.
+    async fn publicar(&self, db: crypto::KeyringDatabase) -> Result<(), zbus::fdo::Error> {
         let coll_path = "/org/freedesktop/secrets/collection/login".to_string();
 
         // La carga y el levantamiento del bloqueo van en una sola función, y en ese
@@ -2938,8 +3106,85 @@ impl PamUnlockInterface {
         // keyring is unusable for the rest of the session.
         announce_locked_changed(&self.conn, &coll_path, &item_paths).await;
 
-        Ok(true)
+        Ok(())
     }
+}
+
+/// Un turno para todo lo que cambia con qué maestra se abre la base: los dos
+/// desbloqueos y `Reset`. Sin él, un `Unlock` con la contraseña vieja que leyó
+/// la base antes de que `Reset` la apartara podía terminar después y dejar en
+/// memoria la colección nueva con la maestra vieja.
+fn unlock_turn() -> &'static Mutex<()> {
+    static TURN: OnceLock<Mutex<()>> = OnceLock::new();
+    TURN.get_or_init(|| Mutex::new(()))
+}
+
+/// Si esta sesión ya adoptó una maestra (no cuenta la variable de entorno de
+/// las pruebas: lo que importa es si una contraseña abrió la base).
+fn master_adopted() -> bool {
+    master_store().lock().map(|g| g.is_some()).unwrap_or(false)
+}
+
+/// Si un rechazo que llegó por el socket se anota como «la contraseña del
+/// inicio de sesión no abre la base». Ver [`PamUnlockInterface::aplicar_desde_el_login`].
+fn should_remember_rejection(
+    abierto: &Result<bool, zbus::fdo::Error>,
+    desde_root: bool,
+    ya_abierto: bool,
+    hay_base: bool,
+) -> bool {
+    matches!(abierto, Ok(false)) && desde_root && !ya_abierto && hay_base
+}
+
+/// Si quien pide `Reset` es el diálogo del llavero, por el ejecutable detrás de
+/// su pid. Es el mismo criterio que la puerta del almacén: no es infalible
+/// —el pid se puede reciclar—, pero deja afuera a cualquier otro programa de la
+/// sesión, que si no podría apartar la base que AppArmor no lo deja tocar.
+fn is_the_prompter(ejecutable: &str) -> bool {
+    ejecutable == PROMPTER
+}
+
+/// Si hay una base en el disco. Un error al mirar cuenta como que sí: lo que se
+/// decide con esto es si hay algo que no abrió.
+async fn base_exists() -> bool {
+    match keyring_path() {
+        Some(path) => !matches!(tokio::fs::try_exists(&path).await, Ok(false)),
+        None => false,
+    }
+}
+
+/// Vuelve a escribir la base con la maestra `nueva`, desde la `anterior` que la
+/// abrió.
+///
+/// Si la escritura falla, la maestra en memoria vuelve a ser la anterior: la base
+/// del disco sigue cifrada con ésa, y quedarse con la nueva haría que el próximo
+/// guardado de la sesión la cifrara con otra contraseña a medias.
+fn reencrypt(
+    path: &std::path::Path,
+    items: &[ItemInfo],
+    nueva: &str,
+    anterior: &str,
+) -> Result<(), String> {
+    set_master_password(nueva);
+    write_to(path, items).inspect_err(|_| set_master_password(anterior))
+}
+
+/// Renombra la base a `keyring.db.apartada-<segundos>` y devuelve la ruta nueva.
+///
+/// Con `rename` y no copiando: es el mismo directorio, así que es atómico y no
+/// hay un momento con dos bases ni con ninguna a medio escribir.
+fn set_aside(path: &std::path::Path, seconds: u64) -> Result<std::path::PathBuf, String> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "keyring.db".to_string());
+    let aside = path.with_file_name(format!("{name}.apartada-{seconds}"));
+    if aside.exists() {
+        return Err(format!("ya existe {}", aside.display()));
+    }
+    std::fs::rename(path, &aside)
+        .map_err(|e| format!("no se pudo apartar {}: {e}", path.display()))?;
+    Ok(aside)
 }
 
 #[interface(name = "org.vasak.Keyring")]
@@ -2947,6 +3192,45 @@ impl PamUnlockInterface {
     /// El desbloqueo por D-Bus, que usa el diálogo gráfico.
     async fn unlock(&mut self, password: &str) -> Result<bool, zbus::fdo::Error> {
         self.aplicar(password).await
+    }
+
+    /// Aparta la base que no abre y empieza una vacía con la contraseña del
+    /// inicio de sesión. Devuelve dónde quedó la apartada. Ver
+    /// [`PamUnlockInterface::apartar_y_empezar`].
+    ///
+    /// Sólo lo acepta el diálogo del llavero ([`is_the_prompter`]): es quien le
+    /// pidió confirmación a la persona.
+    async fn reset(
+        &mut self,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] cabecera: zbus::message::Header<'_>,
+    ) -> Result<String, zbus::fdo::Error> {
+        match ejecutable_del_emisor(conn, &cabecera).await {
+            Ok(ejecutable) if is_the_prompter(&ejecutable) => {}
+            Ok(ejecutable) => {
+                eprintln!(
+                    "vasak-keyring: se rechaza Reset de {ejecutable}: sólo lo puede pedir el \
+                     diálogo del llavero"
+                );
+                return Err(zbus::fdo::Error::AccessDenied(
+                    "sólo el diálogo del llavero puede apartarlo".to_string(),
+                ));
+            }
+            Err(motivo) => {
+                eprintln!("vasak-keyring: se rechaza Reset: {motivo}");
+                return Err(zbus::fdo::Error::AccessDenied(
+                    "no se pudo identificar a quien pidió apartar el llavero".to_string(),
+                ));
+            }
+        }
+        self.apartar_y_empezar().await
+    }
+
+    /// Si la contraseña con la que se inició sesión no abre la base: el diálogo
+    /// lo lee para pedir la contraseña **anterior** en vez de la de la cuenta.
+    #[zbus(property)]
+    async fn login_password_rejected(&self) -> bool {
+        rejected_login().is_some()
     }
 }
 
@@ -3124,7 +3408,7 @@ async fn find_secret(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::test_bus::{self, pid_inexistente, BusFalso};
     use std::collections::BTreeSet;
@@ -3478,7 +3762,7 @@ mod tests {
     /// mismo motivo. El candado es el de tokio y no uno de `std` porque las
     /// pruebas son async: uno de `std` tomado a lo largo de un `.await` bloquea
     /// el hilo del runtime, que es justo lo que se está cuidando acá.
-    fn estado_de_la_sesion() -> &'static Mutex<()> {
+    pub(crate) fn estado_de_la_sesion() -> &'static Mutex<()> {
         static ESTADO: OnceLock<Mutex<()>> = OnceLock::new();
         ESTADO.get_or_init(|| Mutex::new(()))
     }
@@ -6800,5 +7084,625 @@ mod tests {
             "org.freedesktop.DBus.Error.Failed",
             "todo lo que no es un bloqueo conserva el nombre que ya tenía"
         );
+    }
+
+    // ── Después de un `passwd`: la base sigue con la contraseña anterior (#38) ──
+    //
+    // La contraseña con la que se inicia sesión la validó PAM, así que si no abre
+    // la base no es un error de tipeo: la base está cifrada con la contraseña
+    // anterior de la cuenta. Sin esto el llavero quedaba bloqueado para siempre,
+    // con un mensaje que mandaba a volver a iniciar sesión —que no arregla nada—.
+    //
+    // Todas estas pruebas usan la base de `keyring_path()`, que en las pruebas es
+    // un temporal del proceso, y el estado global (maestra, login rechazado,
+    // intentos, bloqueo de escritura): van en fila con [`estado_de_la_sesion`] y
+    // [`EstadoDelLogin`] lo deja como estaba.
+
+    /// La ruta del desbloqueo de D-Bus, como la usa el diálogo.
+    const RUTA_DEL_DESBLOQUEO: &str = "/org/vasak/keyring";
+    const IFACE_DEL_DESBLOQUEO: &str = "org.vasak.Keyring";
+
+    /// Deja el estado del desbloqueo limpio al entrar y al salir: sin maestra, sin
+    /// login rechazado, sin intentos fallidos, sin bloqueo de escritura y sin base
+    /// —ni apartadas— en la ruta de las pruebas.
+    pub(crate) struct EstadoDelLogin {
+        _sesion: Sesion,
+        _escritura: EscrituraComoEstaba,
+    }
+
+    impl EstadoDelLogin {
+        pub(crate) fn limpio() -> Self {
+            let estado = Self {
+                _sesion: sesion_cerrada(),
+                _escritura: EscrituraComoEstaba::nuevo(),
+            };
+            Self::barrer();
+            estado
+        }
+
+        fn barrer() {
+            forget_rejected_login();
+            note_successful_unlock();
+            unblock_writes();
+            for apartada in apartadas() {
+                let _ = std::fs::remove_file(apartada);
+            }
+            let _ = std::fs::remove_file(base_de_las_pruebas());
+        }
+    }
+
+    impl Drop for EstadoDelLogin {
+        fn drop(&mut self) {
+            Self::barrer();
+        }
+    }
+
+    pub(crate) fn base_de_las_pruebas() -> PathBuf {
+        let ruta = keyring_path().expect("en las pruebas siempre hay ruta");
+        assert!(
+            ruta.starts_with(std::env::temp_dir()),
+            "la prueba no arranca: la base iría a {}",
+            ruta.display()
+        );
+        ruta
+    }
+
+    /// Los `keyring.db.apartada-*` que hay al lado de la base de las pruebas.
+    fn apartadas() -> Vec<PathBuf> {
+        let base = base_de_las_pruebas();
+        let Some(dir) = base.parent() else {
+            return Vec::new();
+        };
+        let Ok(entradas) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entradas
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("keyring.db.apartada-"))
+            })
+            .collect()
+    }
+
+    /// Una base de verdad en la ruta de las pruebas, cifrada con `password`.
+    async fn base_cifrada_con(password: &str) -> Vec<u8> {
+        let ruta = base_de_las_pruebas();
+        if let Some(dir) = ruta.parent() {
+            std::fs::create_dir_all(dir).expect("no se pudo crear el directorio de la base");
+        }
+        base_con_una_entrada(&ruta, password).await;
+        std::fs::read(&ruta).expect("la base recién escrita")
+    }
+
+    /// El desbloqueo de PAM y del diálogo sobre una conexión punto a punto, con
+    /// el estado de un demonio recién arrancado. Las conexiones se devuelven
+    /// para que sigan vivas mientras dure la prueba.
+    async fn desbloqueo() -> (
+        PamUnlockInterface,
+        Arc<Mutex<KeyringState>>,
+        zbus::Connection,
+        zbus::Connection,
+    ) {
+        let estado = Arc::new(Mutex::new(KeyringState::new()));
+        let (extremo_del_demonio, extremo_del_cliente) = tokio::net::UnixStream::pair().unwrap();
+        let demonio = zbus::connection::Builder::unix_stream(extremo_del_demonio)
+            .server(zbus::Guid::generate())
+            .unwrap()
+            .p2p()
+            .build();
+        let cliente = zbus::connection::Builder::unix_stream(extremo_del_cliente)
+            .p2p()
+            .build();
+        let (demonio, cliente) = tokio::join!(demonio, cliente);
+        let demonio = demonio.expect("no se pudo levantar el bus de la prueba");
+        let cliente = cliente.expect("no se pudo levantar el cliente de la prueba");
+        let desbloqueo = PamUnlockInterface::new(Arc::clone(&estado), demonio.clone());
+        (desbloqueo, estado, demonio, cliente)
+    }
+
+    pub(crate) fn maestra_en_memoria() -> Option<String> {
+        master_store()
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|pw| pw.as_str().to_string()))
+    }
+
+    #[tokio::test]
+    async fn una_contrasena_del_login_que_no_abre_la_base_queda_anotada() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        base_cifrada_con("la-vieja").await;
+        let (desbloqueo, _estado, _demonio, _cliente) = desbloqueo().await;
+
+        let abierto = desbloqueo
+            .aplicar_desde_el_login("la-nueva", true)
+            .await
+            .expect("una contraseña que no abre no es un error");
+
+        assert!(
+            !abierto,
+            "la contraseña nueva no abre una base cifrada con la vieja"
+        );
+        assert_eq!(
+            rejected_login().as_deref().map(String::as_str),
+            Some("la-nueva"),
+            "la contraseña del inicio de sesión que no abrió tiene que quedar anotada"
+        );
+        assert_eq!(
+            maestra_en_memoria(),
+            None,
+            "no se adopta una maestra que no abre"
+        );
+    }
+
+    #[tokio::test]
+    async fn sin_base_la_contrasena_del_login_no_queda_anotada_como_rechazada() {
+        // Una máquina nueva: no hay nada que la contraseña no haya abierto.
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        let (desbloqueo, _estado, _demonio, _cliente) = desbloqueo().await;
+
+        let abierto = desbloqueo
+            .aplicar_desde_el_login("la-nueva", true)
+            .await
+            .expect("sin base, la contraseña del login se adopta");
+
+        assert!(abierto);
+        assert!(rejected_login().is_none(), "sin base no hay nada rechazado");
+    }
+
+    #[tokio::test]
+    async fn una_contrasena_equivocada_en_el_dialogo_no_cuenta_como_login_rechazado() {
+        // Lo que se anota es la del inicio de sesión, que validó PAM; una
+        // equivocada en el diálogo es un error de tipeo y no dice nada de la base.
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        base_cifrada_con("la-vieja").await;
+        let (desbloqueo, _estado, _demonio, _cliente) = desbloqueo().await;
+
+        let abierto = desbloqueo
+            .aplicar("cualquiera")
+            .await
+            .expect("una contraseña que no abre no es un error");
+
+        assert!(!abierto);
+        assert!(rejected_login().is_none());
+    }
+
+    #[tokio::test]
+    async fn abrir_con_la_contrasena_anterior_deja_la_base_cifrada_con_la_del_login() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        base_cifrada_con("la-vieja").await;
+        let (desbloqueo, estado, _demonio, _cliente) = desbloqueo().await;
+
+        assert!(!desbloqueo
+            .aplicar_desde_el_login("la-nueva", true)
+            .await
+            .unwrap());
+        let abierto = desbloqueo
+            .aplicar("la-vieja")
+            .await
+            .expect("la contraseña anterior abre la base");
+        assert!(abierto, "la contraseña anterior tiene que abrir la base");
+
+        let crudo = std::fs::read(base_de_las_pruebas()).expect("la base sigue en su lugar");
+        let recifrada = crypto::decrypt_database(&crudo, "la-nueva").expect(
+            "después de abrirla con la anterior, la base tiene que abrir con la del inicio de \
+             sesión: si no, el próximo inicio de sesión vuelve a dejarla bloqueada",
+        );
+        assert_eq!(recifrada.items.len(), 1, "no se pierde lo que había");
+        assert_eq!(recifrada.items[0].secret, b"el secreto de la persona");
+        assert!(
+            crypto::decrypt_database(&crudo, "la-vieja").is_err(),
+            "la contraseña anterior ya no tiene que abrirla"
+        );
+
+        assert_eq!(
+            maestra_en_memoria().as_deref(),
+            Some("la-nueva"),
+            "lo que se guarde en el resto de la sesión va con la del inicio de sesión"
+        );
+        assert!(rejected_login().is_none(), "ya no hay nada rechazado");
+        assert_eq!(
+            estado.lock().await.items.len(),
+            1,
+            "la colección quedó cargada"
+        );
+    }
+
+    #[test]
+    fn si_no_se_puede_escribir_el_recifrado_vuelve_a_la_maestra_anterior() {
+        // La base del disco sigue cifrada con la anterior: quedarse con la nueva
+        // en memoria haría que el próximo guardado la cifrara con otra a medias.
+        let _sesion = estado_de_la_sesion().blocking_lock();
+        let _estado = EstadoDelLogin::limpio();
+        set_master_password("la-vieja");
+        let dir = DirDePrueba::nuevo("recifrado-sin-escribir");
+        let archivo = dir.ruta().join("keyring.db");
+        std::fs::write(&archivo, b"soy un archivo").unwrap();
+        // Debajo de un archivo no se puede escribir, sea cual sea el uid.
+        let imposible = archivo.join("keyring.db");
+
+        reencrypt(&imposible, &[], "la-nueva", "la-vieja")
+            .expect_err("no se puede escribir debajo de un archivo");
+
+        assert_eq!(maestra_en_memoria().as_deref(), Some("la-vieja"));
+    }
+
+    #[test]
+    fn apartar_renombra_la_base_sin_tocar_su_contenido() {
+        let dir = DirDePrueba::nuevo("apartar");
+        let base = dir.ruta().join("keyring.db");
+        std::fs::write(&base, b"la base de la persona").unwrap();
+
+        let apartada = set_aside(&base, 42).expect("apartar una base que existe");
+
+        assert_eq!(apartada, dir.ruta().join("keyring.db.apartada-42"));
+        assert!(!base.exists(), "la base ya no está en su lugar");
+        assert_eq!(
+            std::fs::read(&apartada).unwrap(),
+            b"la base de la persona",
+            "lo apartado es la base tal cual"
+        );
+    }
+
+    #[test]
+    fn apartar_no_pisa_una_base_apartada_antes() {
+        let dir = DirDePrueba::nuevo("apartar-dos-veces");
+        let base = dir.ruta().join("keyring.db");
+        let anterior = dir.ruta().join("keyring.db.apartada-42");
+        std::fs::write(&base, b"la de ahora").unwrap();
+        std::fs::write(&anterior, b"la apartada antes").unwrap();
+
+        set_aside(&base, 42).expect_err("no se puede pisar una base apartada");
+
+        assert_eq!(std::fs::read(&anterior).unwrap(), b"la apartada antes");
+        assert_eq!(std::fs::read(&base).unwrap(), b"la de ahora");
+    }
+
+    #[tokio::test]
+    async fn reset_no_aparta_nada_con_el_llavero_abierto() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        let original = base_cifrada_con("la-vieja").await;
+        let (desbloqueo, _estado, _demonio, _cliente) = desbloqueo().await;
+        remember_rejected_login("la-nueva");
+        set_master_password("la-vieja");
+
+        desbloqueo
+            .apartar_y_empezar()
+            .await
+            .expect_err("con el llavero abierto no hay nada que apartar");
+
+        assert_eq!(std::fs::read(base_de_las_pruebas()).unwrap(), original);
+        assert!(apartadas().is_empty(), "no se apartó nada");
+        assert_eq!(maestra_en_memoria().as_deref(), Some("la-vieja"));
+    }
+
+    #[tokio::test]
+    async fn reset_no_aparta_nada_sin_una_contrasena_del_login_rechazada() {
+        // Sin eso, cualquiera en la sesión podría apartar el llavero bloqueado y
+        // elegir con qué se cifra el nuevo.
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        let original = base_cifrada_con("la-vieja").await;
+        let (desbloqueo, _estado, _demonio, _cliente) = desbloqueo().await;
+
+        desbloqueo
+            .apartar_y_empezar()
+            .await
+            .expect_err("sin contraseña del login rechazada no se aparta nada");
+
+        assert_eq!(std::fs::read(base_de_las_pruebas()).unwrap(), original);
+        assert!(apartadas().is_empty(), "no se apartó nada");
+        assert_eq!(maestra_en_memoria(), None, "el llavero sigue bloqueado");
+    }
+
+    #[tokio::test]
+    async fn reset_aparta_la_base_y_empieza_una_con_la_contrasena_del_login() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        let original = base_cifrada_con("la-vieja").await;
+        let (desbloqueo, estado, _demonio, _cliente) = desbloqueo().await;
+        assert!(!desbloqueo
+            .aplicar_desde_el_login("la-nueva", true)
+            .await
+            .unwrap());
+
+        let apartada = desbloqueo
+            .apartar_y_empezar()
+            .await
+            .expect("con el llavero bloqueado y el login rechazado se aparta");
+
+        let apartada = PathBuf::from(apartada);
+        assert_eq!(apartadas(), vec![apartada.clone()]);
+        assert_eq!(
+            std::fs::read(&apartada).unwrap(),
+            original,
+            "no se borra nada: la base queda al lado, tal cual"
+        );
+        assert_eq!(maestra_en_memoria().as_deref(), Some("la-nueva"));
+        assert!(rejected_login().is_none());
+        assert!(
+            estado.lock().await.items.is_empty(),
+            "el llavero nuevo empieza vacío"
+        );
+
+        // Y lo que se guarde ahora abre con la del inicio de sesión.
+        write_to(&base_de_las_pruebas(), &[entrada(b"lo nuevo")])
+            .expect("el llavero nuevo se puede escribir");
+        let crudo = std::fs::read(base_de_las_pruebas()).unwrap();
+        assert!(crypto::decrypt_database(&crudo, "la-nueva").is_ok());
+    }
+
+    #[tokio::test]
+    async fn bloqueado_por_una_contrasena_cambiada_lo_dice_en_vez_de_mandar_a_iniciar_sesion() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+
+        assert_eq!(ensure_unlocked(), Err(LOCKED_MESSAGE.to_string()));
+
+        remember_rejected_login("la-nueva");
+
+        let motivo = ensure_unlocked().expect_err("sigue bloqueado");
+        assert_eq!(motivo, STALE_LOGIN_MESSAGE);
+        assert!(
+            motivo.contains("anterior"),
+            "el motivo tiene que nombrar la contraseña anterior: {motivo}"
+        );
+        match escritura_bloqueada() {
+            Err(SecretError::IsLocked(texto)) => assert_eq!(texto, STALE_LOGIN_MESSAGE),
+            _ => panic!("una escritura bloqueada tiene que contestar IsLocked"),
+        }
+    }
+
+    /// El contrato con el diálogo: la propiedad que lee por el bus, con ese
+    /// nombre. Si cambia, el diálogo deja de enterarse y vuelve a pedir «la
+    /// contraseña de tu cuenta», que es la que acaba de fallar.
+    #[tokio::test]
+    async fn el_dialogo_lee_por_el_bus_si_el_login_fue_rechazado() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        let (desbloqueo, _estado, demonio, cliente) = desbloqueo().await;
+        demonio
+            .object_server()
+            .at(RUTA_DEL_DESBLOQUEO, desbloqueo)
+            .await
+            .expect("no se pudo publicar el desbloqueo");
+
+        assert!(!login_rechazado_por_el_bus(&cliente).await);
+        remember_rejected_login("la-nueva");
+        assert!(login_rechazado_por_el_bus(&cliente).await);
+        forget_rejected_login();
+        assert!(!login_rechazado_por_el_bus(&cliente).await);
+    }
+
+    async fn login_rechazado_por_el_bus(cliente: &zbus::Connection) -> bool {
+        let respuesta = llamar(
+            cliente,
+            RUTA_DEL_DESBLOQUEO,
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            &(IFACE_DEL_DESBLOQUEO, "LoginPasswordRejected"),
+        )
+        .await
+        .expect("la propiedad LoginPasswordRejected existe");
+        let valor: OwnedValue = respuesta.body().deserialize().expect("un valor");
+        bool::try_from(valor).expect("un booleano")
+    }
+
+    // ── La revisión de seguridad del cambio ──
+
+    /// H1: una entrega por el socket que no viene de root la puede hacer
+    /// cualquier proceso de la sesión. Si su rechazo se anotara, el próximo
+    /// desbloqueo con la contraseña buena re-cifraría la base con la que eligió
+    /// ese proceso.
+    #[tokio::test]
+    async fn una_entrega_del_propio_uid_que_no_abre_no_queda_anotada() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        base_cifrada_con("la-vieja").await;
+        let (desbloqueo, _estado, _demonio, _cliente) = desbloqueo().await;
+
+        let abierto = desbloqueo
+            .aplicar_desde_el_login("la-del-intruso", false)
+            .await
+            .expect("una contraseña que no abre no es un error");
+        assert!(!abierto);
+        assert!(
+            rejected_login().is_none(),
+            "sólo cuenta como contraseña del inicio de sesión la que entrega root"
+        );
+
+        assert!(desbloqueo.aplicar("la-vieja").await.unwrap());
+        let crudo = std::fs::read(base_de_las_pruebas()).unwrap();
+        assert!(
+            crypto::decrypt_database(&crudo, "la-vieja").is_ok(),
+            "la base sigue con la contraseña de la persona"
+        );
+        assert!(
+            crypto::decrypt_database(&crudo, "la-del-intruso").is_err(),
+            "un proceso de la sesión no puede elegir con qué queda cifrada la base"
+        );
+        assert_eq!(maestra_en_memoria().as_deref(), Some("la-vieja"));
+    }
+
+    /// H1: con el llavero ya abierto no hay nada que migrar, y una marca anotada
+    /// ahí la usaría el próximo desbloqueo para re-cifrar con otra.
+    #[tokio::test]
+    async fn una_entrega_rechazada_con_el_llavero_ya_abierto_no_queda_anotada() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        base_cifrada_con("la-vieja").await;
+        let (desbloqueo, _estado, _demonio, _cliente) = desbloqueo().await;
+        assert!(desbloqueo.aplicar("la-vieja").await.unwrap());
+
+        let abierto = desbloqueo
+            .aplicar_desde_el_login("otra", true)
+            .await
+            .expect("una contraseña que no abre no es un error");
+        assert!(!abierto);
+        assert!(
+            rejected_login().is_none(),
+            "con una maestra ya adoptada no se anota ningún rechazo"
+        );
+
+        assert!(desbloqueo.aplicar("la-vieja").await.unwrap());
+        let crudo = std::fs::read(base_de_las_pruebas()).unwrap();
+        assert!(crypto::decrypt_database(&crudo, "la-vieja").is_ok());
+        assert!(crypto::decrypt_database(&crudo, "otra").is_err());
+        assert_eq!(maestra_en_memoria().as_deref(), Some("la-vieja"));
+    }
+
+    /// H1, la regla sola: hacen falta las cuatro condiciones.
+    #[test]
+    fn el_rechazo_se_anota_solo_si_vino_de_root_sin_maestra_y_con_base() {
+        let rechazo: Result<bool, zbus::fdo::Error> = Ok(false);
+        let abrio: Result<bool, zbus::fdo::Error> = Ok(true);
+        let fallo: Result<bool, zbus::fdo::Error> = Err(dbus_err("demasiados intentos"));
+
+        assert!(should_remember_rejection(&rechazo, true, false, true));
+
+        assert!(
+            !should_remember_rejection(&abrio, true, false, true),
+            "abrió"
+        );
+        assert!(
+            !should_remember_rejection(&fallo, true, false, true),
+            "error"
+        );
+        assert!(
+            !should_remember_rejection(&rechazo, false, false, true),
+            "no vino de root"
+        );
+        assert!(
+            !should_remember_rejection(&rechazo, true, true, true),
+            "ya había una maestra"
+        );
+        assert!(
+            !should_remember_rejection(&rechazo, true, false, false),
+            "no hay base"
+        );
+    }
+
+    /// M1: `Reset` sólo lo pide el diálogo, y la comparación es exacta.
+    #[test]
+    fn solo_el_dialogo_del_llavero_puede_pedir_reset() {
+        assert!(is_the_prompter("/usr/bin/vasak-keyring-prompt"));
+        for otro in [
+            "",
+            "vasak-keyring-prompt",
+            "/tmp/vasak-keyring-prompt",
+            "/usr/local/bin/vasak-keyring-prompt",
+            "/usr/bin/vasak-keyring-prompt.malicioso",
+            "/usr/bin/vasak-keyring-prompt ",
+            "/usr/bin/vasak-keyring",
+            "/usr/bin/python3",
+        ] {
+            assert!(!is_the_prompter(otro), "{otro:?} no es el diálogo");
+        }
+    }
+
+    /// M1, por el bus: un `Reset` de otro programa —acá, el binario de las
+    /// pruebas— se rechaza con `AccessDenied` aunque se den las condiciones para
+    /// apartar, y la base no se toca.
+    #[tokio::test]
+    async fn un_reset_que_no_viene_del_dialogo_se_rechaza_y_no_aparta_la_base() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        let original = base_cifrada_con("la-vieja").await;
+        let (desbloqueo, _estado, demonio, cliente) = desbloqueo().await;
+        assert!(!desbloqueo
+            .aplicar_desde_el_login("la-nueva", true)
+            .await
+            .unwrap());
+        assert!(
+            rejected_login().is_some(),
+            "las condiciones para apartar están"
+        );
+        demonio
+            .object_server()
+            .at(RUTA_DEL_DESBLOQUEO, desbloqueo)
+            .await
+            .expect("no se pudo publicar el desbloqueo");
+        // El bus le atribuye a quien llama el pid de este proceso: el
+        // ejecutable que lee el demonio es el de las pruebas.
+        test_bus::publicar(
+            &cliente,
+            BusFalso::nuevo(Some(":1.42"), Some(std::process::id())),
+        )
+        .await;
+        test_bus::calentar(&demonio).await;
+
+        let peticion = test_bus::armar(
+            RUTA_DEL_DESBLOQUEO,
+            IFACE_DEL_DESBLOQUEO,
+            "Reset",
+            Some(":1.42"),
+            &(),
+        );
+        let serial = peticion.header().primary().serial_num();
+        let mut salientes = zbus::MessageStream::from(&cliente);
+        cliente
+            .send(&peticion)
+            .await
+            .expect("no se pudo mandar Reset");
+        let error = como_resultado(test_bus::primera_respuesta(&mut salientes, serial).await)
+            .expect_err("un Reset que no viene del diálogo no se acepta");
+
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.DBus.Error.AccessDenied"
+        );
+        assert_eq!(
+            std::fs::read(base_de_las_pruebas()).unwrap(),
+            original,
+            "la base sigue en su lugar, tal cual"
+        );
+        assert!(apartadas().is_empty(), "no se apartó nada");
+        assert!(
+            rejected_login().is_some(),
+            "y la marca sigue para el diálogo"
+        );
+    }
+
+    /// L1: el turno lo toman los tres caminos, y el del login llama por dentro
+    /// al desbloqueo: si lo hiciera por el que vuelve a tomar el turno, se
+    /// quedaría esperándose a sí mismo para siempre.
+    #[tokio::test]
+    async fn el_turno_del_desbloqueo_no_se_traba_consigo_mismo() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        base_cifrada_con("la-vieja").await;
+        let (desbloqueo, _estado, _demonio, _cliente) = desbloqueo().await;
+        let plazo = std::time::Duration::from_secs(10);
+
+        let rechazado =
+            tokio::time::timeout(plazo, desbloqueo.aplicar_desde_el_login("la-nueva", true))
+                .await
+                .expect("aplicar_desde_el_login se trabó con el turno")
+                .unwrap();
+        assert!(!rechazado);
+        assert!(
+            unlock_turn().try_lock().is_ok(),
+            "al terminar, el turno queda libre"
+        );
+
+        tokio::time::timeout(plazo, desbloqueo.apartar_y_empezar())
+            .await
+            .expect("apartar_y_empezar se trabó con el turno")
+            .expect("con el login rechazado se aparta");
+        assert!(unlock_turn().try_lock().is_ok());
+
+        let abierto = tokio::time::timeout(plazo, desbloqueo.aplicar("la-nueva"))
+            .await
+            .expect("aplicar se trabó con el turno")
+            .unwrap();
+        assert!(abierto);
+        assert!(unlock_turn().try_lock().is_ok());
     }
 }

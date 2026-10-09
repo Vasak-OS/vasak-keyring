@@ -4,7 +4,8 @@
   "description": "Capability for the keyring unlock dialog",
   "windows": [
     "unlock-dialog",
-    "ssh-askpass"
+    "ssh-askpass",
+    "git-credential"
   ],
   "permissions": [
     "core:default",

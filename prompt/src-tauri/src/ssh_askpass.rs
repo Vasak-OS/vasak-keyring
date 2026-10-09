@@ -103,20 +103,77 @@ pub fn key_path_from(prompt: &str) -> Option<String> {
 
 /// Git preguntando el usuario o la contraseña de un remoto HTTPS.
 ///
-/// Git, sin un credential helper, le pregunta a SSH_ASKPASS lo mismo que a
-/// ssh: `Username for 'https://github.com': ` y después
-/// `Password for 'https://usuario@github.com': `. No es una frase de clave,
-/// no hay nada que buscar en el llavero, y el diálogo de «Clave SSH» la
-/// presentaba como si lo fuera: lo que se escribiera ahí se mandaba a GitHub
-/// como nombre de usuario. Ssh nunca pone una URL en sus pedidos; git siempre.
+/// Git, sin un credential helper que ya la tenga, le pregunta a SSH_ASKPASS lo
+/// mismo que a ssh: `Username for 'https://github.com': ` y después
+/// `Password for 'https://usuario@github.com': `. No es una frase de clave y no
+/// va al diálogo de «Clave SSH»: lo que se escribía ahí se mandaba a GitHub como
+/// nombre de usuario. Ssh nunca pone una URL en sus pedidos; git siempre.
 pub fn is_git_credential_prompt(prompt: &str) -> bool {
     prompt.contains("://")
+}
+
+/// Which of the two questions git is asking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitField {
+    Username,
+    Password,
+}
+
+/// A git credential question, taken apart for the dialog.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct GitPrompt {
+    pub field: GitField,
+    /// `github.com`, or `host:port` when there is one.
+    pub host: String,
+    /// The user the password is for, when git already knows it.
+    pub username: Option<String>,
+}
+
+/// Takes apart `Username for 'https://github.com': ` and
+/// `Password for 'https://usuario@github.com': `.
+///
+/// The word in front is what git asks; the URL says for whom. A user inside the
+/// URL also means it is the password being asked, which covers a git that words
+/// the question some other way.
+pub fn git_prompt_from(prompt: &str) -> Option<GitPrompt> {
+    if !is_git_credential_prompt(prompt) {
+        return None;
+    }
+
+    let start = prompt.find('\'').map_or(0, |i| i + 1);
+    let rest = &prompt[start..];
+    let url = rest.find('\'').map_or(rest, |end| &rest[..end]);
+    let authority = url.split("://").nth(1)?.split('/').next()?;
+
+    let (username, host) = match authority.rsplit_once('@') {
+        Some((user, host)) => (Some(user.to_string()), host),
+        None => (None, authority),
+    };
+    if host.is_empty() {
+        return None;
+    }
+
+    let asks_password = prompt.trim_start().starts_with("Password") || username.is_some();
+    let field = if asks_password {
+        GitField::Password
+    } else {
+        GitField::Username
+    };
+
+    Some(GitPrompt {
+        field,
+        host: host.to_string(),
+        username,
+    })
 }
 
 /// What the dialog needs to say.
 pub struct Request {
     pub prompt: String,
     pub key_path: Option<String>,
+    /// Set when it is git asking for a remote's credentials, not ssh for a key.
+    pub git: Option<GitPrompt>,
 }
 
 impl Request {
@@ -140,16 +197,15 @@ pub fn start() -> Request {
 
     let prompt = std::env::args().nth(1).unwrap_or_default();
 
-    // Se rechaza sin abrir nada: git corta con «could not read Username», que
-    // dice qué falta —un credential helper o un remoto por SSH—, en vez de un
-    // diálogo que pide otra cosa.
-    if is_git_credential_prompt(&prompt) {
-        eprintln!(
-            "[vasak-ssh-askpass] «{}» es un pedido de credenciales de git, no de una clave SSH: \
-             usá un remoto por SSH o un credential helper",
-            prompt.trim()
-        );
-        give_up();
+    // Git no pasa por el llavero desde acá: lo guarda su credential helper
+    // (libsecret, que es este llavero) cuando la autenticación sale bien, y la
+    // próxima vez ni siquiera pregunta.
+    if let Some(git) = git_prompt_from(&prompt) {
+        return Request {
+            prompt,
+            key_path: None,
+            git: Some(git),
+        };
     }
 
     let key_path = key_path_from(&prompt);
@@ -160,7 +216,11 @@ pub fn start() -> Request {
         }
     }
 
-    Request { prompt, key_path }
+    Request {
+        prompt,
+        key_path,
+        git: None,
+    }
 }
 
 /// Asks the keyring, and stays quiet if it cannot answer.
@@ -243,6 +303,7 @@ mod tests {
         let request = Request {
             prompt: String::new(),
             key_path: Some("/home/pato/.ssh/id_ed25519".into()),
+            git: None,
         };
         assert_eq!(request.key_name(), "id_ed25519");
     }

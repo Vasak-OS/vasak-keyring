@@ -178,9 +178,79 @@ fn ssh_request(state: tauri::State<'_, SshRequest>) -> SshRequest {
     state.inner().clone()
 }
 
+// ---------------------------------------------------------------------------
+// El usuario y la contraseña de un remoto de git por HTTPS
+// ---------------------------------------------------------------------------
+
+const GIT_WINDOW_LABEL: &str = "git-credential";
+const GIT_DIALOG_HEIGHT: f64 = 320.0;
+
+/// Entrega lo que se escribió a git y termina.
+///
+/// No se guarda acá: lo guarda el credential helper de git (libsecret, o sea
+/// este llavero) recién cuando el servidor lo aceptó, que es lo que evita
+/// recordar una contraseña mal escrita.
+#[tauri::command]
+fn git_answer(value: String) {
+    let value = Zeroizing::new(value);
+    ssh_askpass::answer(value.as_str())
+}
+
+#[tauri::command]
+fn git_cancel() {
+    ssh_askpass::give_up()
+}
+
+#[tauri::command]
+fn git_request(state: tauri::State<'_, ssh_askpass::GitPrompt>) -> ssh_askpass::GitPrompt {
+    state.inner().clone()
+}
+
+/// El diálogo que pide el usuario o la contraseña de un remoto de git.
+fn run_git_credential(prompt: ssh_askpass::GitPrompt) {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_config_manager::init())
+        .plugin(tauri_plugin_vicons::init())
+        .manage(prompt)
+        .invoke_handler(tauri::generate_handler![
+            git_request,
+            git_answer,
+            git_cancel
+        ])
+        .setup(|app| {
+            let window = WebviewWindowBuilder::new(
+                app,
+                GIT_WINDOW_LABEL,
+                WebviewUrl::App("index.html#/git".into()),
+            )
+            .title("Iniciar sesión en git")
+            .inner_size(DIALOG_WIDTH, GIT_DIALOG_HEIGHT)
+            .resizable(false)
+            .decorations(false)
+            .transparent(true)
+            .center()
+            // Del otro lado hay un git esperando, igual que con ssh.
+            .always_on_top(true)
+            .build()?;
+
+            window.on_window_event(|event| {
+                if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                    ssh_askpass::give_up();
+                }
+            });
+
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+
 /// El diálogo que pide la frase de una clave SSH.
 pub fn run_ssh_askpass() {
     let request = ssh_askpass::start();
+    if let Some(git) = request.git {
+        return run_git_credential(git);
+    }
     let state = SshRequest {
         key_name: request.key_name(),
         key_path: request.key_path.clone(),

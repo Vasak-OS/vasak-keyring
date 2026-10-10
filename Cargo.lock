@@ -4377,7 +4377,7 @@ dependencies = [
 
 [[package]]
 name = "vasak-keyring"
-version = "0.7.11"
+version = "0.8.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -4410,7 +4410,7 @@ dependencies = [
 
 [[package]]
 name = "vasak-keyring-prompt"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "futures-util",
  "libc",

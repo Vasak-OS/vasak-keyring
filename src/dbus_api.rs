@@ -950,6 +950,22 @@ fn portal_denied() -> zbus::fdo::Error {
     )
 }
 
+/// Un turno para guardar la base: se toma **antes** de la foto de las entradas
+/// y se suelta después de escribir.
+///
+/// Cada camino que guarda fotografía la lista entera y después la escribe. Sin
+/// turno, dos guardados se podían cruzar y el que escribía último dejaba en el
+/// disco una foto más vieja, sin lo que el otro había agregado. Con el re-cifrado
+/// de vasak-keyring#38 es peor: una foto tomada antes de migrar, escrita después
+/// con la maestra nueva, pisa la base migrada.
+///
+/// Se toma siempre antes que el candado del estado, nunca al revés, para que los
+/// dos no se puedan trabar entre sí.
+fn save_turn() -> &'static Mutex<()> {
+    static TURN: OnceLock<Mutex<()>> = OnceLock::new();
+    TURN.get_or_init(|| Mutex::new(()))
+}
+
 /// Writes every item to the encrypted database.
 ///
 /// Returns an error instead of only logging one: a store that cannot reach the
@@ -1460,6 +1476,7 @@ impl ItemInterface {
     /// mutations (set_secret/delete) so changes survive a daemon restart;
     /// no-ops if the keyring is locked (no master password in memory).
     async fn persist_all(&self) -> Result<(), zbus::fdo::Error> {
+        let _turno = save_turn().lock().await;
         let items: Vec<ItemInfo> = {
             let state = self.state.lock().await;
             state.items.values().cloned().collect()
@@ -1821,6 +1838,7 @@ impl CollectionInterface {
     /// disk the moment an item was added here — the loss only became visible
     /// after the next restart.
     async fn persist(&self) -> Result<(), zbus::fdo::Error> {
+        let _turno = save_turn().lock().await;
         let items: Vec<ItemInfo> = {
             let state = self.state.lock().await;
             state.items.values().cloned().collect()
@@ -2961,6 +2979,10 @@ impl PamUnlockInterface {
         if let Some(login) = rejected_login() {
             forget_rejected_login();
             if login.as_str() != password {
+                // Con el turno de guardado desde la foto hasta la escritura: un
+                // guardado común que hubiera tomado su foto antes no puede
+                // escribirla después, encima de la base migrada.
+                let _turno = save_turn().lock().await;
                 let items: Vec<ItemInfo> = {
                     let state = self.state.lock().await;
                     state.items.values().cloned().collect()
@@ -3374,11 +3396,14 @@ pub async fn app_master_secret(
     // Se guarda **antes** de devolverlo. Si el disco falla, la aplicación no debe
     // recibir un secreto que en el próximo arranque no va a existir: cifraría sus
     // datos con una clave que se pierde.
+    let turno = save_turn().lock().await;
     let items: Vec<ItemInfo> = {
         let state = state.lock().await;
         state.items.values().cloned().collect()
     };
-    if let Err(e) = save_db(&items) {
+    let guardado = save_db(&items);
+    drop(turno);
+    if let Err(e) = guardado {
         // Y si falló, el secreto se deshace. Dejándolo en memoria, el próximo
         // pedido lo encontraría y lo devolvería sin volver a intentar escribir:
         // un error transitorio de disco alcanzaría para que la aplicación cifre
@@ -7704,5 +7729,338 @@ pub(crate) mod tests {
             .unwrap();
         assert!(abierto);
         assert!(unlock_turn().try_lock().is_ok());
+    }
+
+    // ── El turno de guardado ──
+    //
+    // Cada camino que guarda saca una foto de `state.items` y después la escribe
+    // con la maestra que haya en memoria **al escribir**. Sin un turno que cubra
+    // las dos cosas, un guardado que sacó su foto antes del re-cifrado de
+    // vasak-keyring#38 la escribía después, con la maestra nueva, encima de la
+    // base migrada; y entre dos guardados cualesquiera ganaba la foto más vieja.
+
+    /// Hace avanzar `guardado` todo lo que pueda sin esperar a nadie y dice si
+    /// terminó.
+    ///
+    /// Es determinista: el runtime de las pruebas es de un solo hilo, así que en
+    /// esa pasada el guardado sólo puede pararse en un candado tomado. Ninguno de
+    /// los caminos que guardan tiene otra espera entre la foto y la escritura.
+    async fn termina_sin_esperar<F: std::future::Future>(
+        guardado: &mut std::pin::Pin<&mut F>,
+    ) -> bool {
+        futures_util::poll!(guardado.as_mut()).is_ready()
+    }
+
+    /// Una sesión abierta sobre una máquina nueva: sin base en el disco, la
+    /// contraseña se adopta y la colección del login queda publicada y vacía.
+    async fn llavero_abierto_sin_base() -> (
+        PamUnlockInterface,
+        Arc<Mutex<KeyringState>>,
+        zbus::Connection,
+        zbus::Connection,
+    ) {
+        let (desbloqueo, estado, demonio, cliente) = desbloqueo().await;
+        assert!(desbloqueo
+            .aplicar("la-de-la-prueba")
+            .await
+            .expect("sin base, la contraseña se adopta"));
+        (desbloqueo, estado, demonio, cliente)
+    }
+
+    /// Agrega una entrada en memoria, como un `CreateItem`.
+    ///
+    /// Con plazo: si un guardado tomara el candado del estado antes que el turno,
+    /// mientras la prueba tiene el turno se quedaría con el estado para siempre, y
+    /// sin plazo la prueba se colgaría en vez de fallar.
+    async fn agregar(estado: &Arc<Mutex<KeyringState>>, ruta: &str, secret: &[u8]) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), estado.lock())
+            .await
+            .expect("el candado del estado quedó tomado por alguien que espera el turno")
+            .items
+            .insert(ruta.to_string(), entrada(secret));
+    }
+
+    /// Los secretos de la base del disco, abierta con `password`, ordenados.
+    fn secretos_de_la_base(password: &str) -> Vec<Vec<u8>> {
+        let crudo = std::fs::read(base_de_las_pruebas()).expect("la base tiene que existir");
+        let db = crypto::decrypt_database(&crudo, password)
+            .expect("la base tiene que abrir con esa contraseña");
+        let mut secretos: Vec<Vec<u8>> = db.items.iter().map(|i| i.secret.clone()).collect();
+        secretos.sort();
+        secretos
+    }
+
+    /// `CollectionInterface::persist` no saca la foto ni escribe mientras otro
+    /// tiene el turno, y cuando lo recibe fotografía la lista de ese momento.
+    #[tokio::test]
+    async fn guardar_la_coleccion_espera_el_turno_y_fotografia_lo_ultimo() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        let (_desbloqueo, estado, demonio, _cliente) = llavero_abierto_sin_base().await;
+        let coleccion = CollectionInterface {
+            state: Arc::clone(&estado),
+            conn: demonio.clone(),
+            path: "/org/freedesktop/secrets/collection/login".into(),
+            alias: "login".into(),
+        };
+        agregar(&estado, "/prueba/items/1", b"la primera").await;
+        let antes = std::fs::read(base_de_las_pruebas()).ok();
+
+        let turno = save_turn().lock().await;
+        let guardado = coleccion.persist();
+        tokio::pin!(guardado);
+        assert!(
+            !termina_sin_esperar(&mut guardado).await,
+            "con el turno tomado por otro, el guardado de la colección no puede terminar"
+        );
+        assert_eq!(
+            std::fs::read(base_de_las_pruebas()).ok(),
+            antes,
+            "con el turno tomado por otro, el guardado no puede tocar la base"
+        );
+
+        // Lo que entra mientras espera tiene que ir en su foto: todavía no la sacó.
+        agregar(&estado, "/prueba/items/2", b"la segunda").await;
+        drop(turno);
+        tokio::time::timeout(std::time::Duration::from_secs(10), guardado)
+            .await
+            .expect("al soltar el turno, el guardado tiene que terminar")
+            .expect("el guardado tiene que poder escribir");
+
+        assert_eq!(
+            secretos_de_la_base("la-de-la-prueba"),
+            vec![b"la primera".to_vec(), b"la segunda".to_vec()],
+            "la base tiene que tener lo que había al recibir el turno"
+        );
+        assert!(
+            save_turn().try_lock().is_ok(),
+            "al terminar, el turno queda libre"
+        );
+    }
+
+    /// Lo mismo para `ItemInterface::persist_all`, el guardado de `SetSecret` y
+    /// `Delete`.
+    #[tokio::test]
+    async fn guardar_un_item_espera_el_turno_y_fotografia_lo_ultimo() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        let (_desbloqueo, estado, demonio, _cliente) = llavero_abierto_sin_base().await;
+        let item = ItemInterface {
+            state: Arc::clone(&estado),
+            conn: demonio.clone(),
+            path: "/prueba/items/1".into(),
+        };
+        agregar(&estado, "/prueba/items/1", b"la primera").await;
+        let antes = std::fs::read(base_de_las_pruebas()).ok();
+
+        let turno = save_turn().lock().await;
+        let guardado = item.persist_all();
+        tokio::pin!(guardado);
+        assert!(
+            !termina_sin_esperar(&mut guardado).await,
+            "con el turno tomado por otro, el guardado del ítem no puede terminar"
+        );
+        assert_eq!(
+            std::fs::read(base_de_las_pruebas()).ok(),
+            antes,
+            "con el turno tomado por otro, el guardado no puede tocar la base"
+        );
+
+        agregar(&estado, "/prueba/items/2", b"la segunda").await;
+        drop(turno);
+        tokio::time::timeout(std::time::Duration::from_secs(10), guardado)
+            .await
+            .expect("al soltar el turno, el guardado tiene que terminar")
+            .expect("el guardado tiene que poder escribir");
+
+        assert_eq!(
+            secretos_de_la_base("la-de-la-prueba"),
+            vec![b"la primera".to_vec(), b"la segunda".to_vec()],
+            "la base tiene que tener lo que había al recibir el turno"
+        );
+        assert!(
+            save_turn().try_lock().is_ok(),
+            "al terminar, el turno queda libre"
+        );
+    }
+
+    /// El secreto maestro del portal también se guarda con el turno: no se
+    /// entrega, ni se escribe, hasta recibirlo.
+    #[tokio::test]
+    async fn el_secreto_del_portal_espera_el_turno_para_guardarse() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        let (_desbloqueo, estado, _demonio, _cliente) = llavero_abierto_sin_base().await;
+        agregar(&estado, "/prueba/items/1", b"la primera").await;
+        let antes = std::fs::read(base_de_las_pruebas()).ok();
+
+        let turno = save_turn().lock().await;
+        let pedido = app_master_secret(&estado, "org.vasak.prueba.turno");
+        tokio::pin!(pedido);
+        assert!(
+            !termina_sin_esperar(&mut pedido).await,
+            "con el turno tomado por otro, el secreto del portal no puede guardarse"
+        );
+        assert_eq!(
+            std::fs::read(base_de_las_pruebas()).ok(),
+            antes,
+            "con el turno tomado por otro, el secreto del portal no puede tocar la base"
+        );
+
+        agregar(&estado, "/prueba/items/2", b"la segunda").await;
+        drop(turno);
+        let secreto = tokio::time::timeout(std::time::Duration::from_secs(10), pedido)
+            .await
+            .expect("al soltar el turno, el pedido tiene que terminar")
+            .expect("el secreto del portal se tiene que poder guardar");
+
+        let guardados = secretos_de_la_base("la-de-la-prueba");
+        assert_eq!(
+            guardados.len(),
+            3,
+            "las dos entradas y el secreto del portal"
+        );
+        assert!(
+            guardados.contains(&secreto),
+            "el secreto entregado está en la base"
+        );
+        assert!(guardados.contains(&b"la segunda".to_vec()));
+    }
+
+    /// Prepara el re-cifrado de vasak-keyring#38: una base con la contraseña
+    /// anterior y la del login rechazada. Devuelve el desbloqueo listo para que
+    /// `aplicar("la-vieja")` abra la base y la re-cifre con «la-nueva».
+    async fn base_por_migrar() -> (
+        PamUnlockInterface,
+        Arc<Mutex<KeyringState>>,
+        zbus::Connection,
+        zbus::Connection,
+    ) {
+        base_cifrada_con("la-vieja").await;
+        let (desbloqueo, estado, demonio, cliente) = desbloqueo().await;
+        assert!(!desbloqueo
+            .aplicar_desde_el_login("la-nueva", true)
+            .await
+            .unwrap());
+        assert!(rejected_login().is_some(), "hay una base por migrar");
+        (desbloqueo, estado, demonio, cliente)
+    }
+
+    /// Deja correr a las tareas lanzadas hasta que `aplicar` haya abierto la base
+    /// y llegado al re-cifrado: lo marca que olvida la contraseña rechazada, que
+    /// es lo último que hace antes de pedir el turno.
+    async fn hasta_el_re_cifrado() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while rejected_login().is_some() {
+                tokio::task::yield_now().await;
+            }
+            // Unas vueltas más, por si el desbloqueo se quedó sin presupuesto del
+            // runtime justo ahí: sin turno, en estas vueltas re-cifraría.
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("el desbloqueo con la contraseña anterior no llegó al re-cifrado");
+    }
+
+    /// El re-cifrado no escribe mientras un guardado tiene el turno: es lo que
+    /// impide que ese guardado, con su foto de antes, escriba después encima de
+    /// la base migrada.
+    #[tokio::test]
+    async fn el_re_cifrado_espera_el_turno_de_un_guardado_en_curso() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        let (desbloqueo, _estado, _demonio, _cliente) = base_por_migrar().await;
+
+        let turno = save_turn().lock().await;
+        let migracion = tokio::spawn(async move { desbloqueo.aplicar("la-vieja").await });
+        hasta_el_re_cifrado().await;
+
+        assert!(
+            !migracion.is_finished(),
+            "con el turno tomado por un guardado, el re-cifrado no puede terminar"
+        );
+        assert_eq!(
+            secretos_de_la_base("la-vieja"),
+            vec![b"el secreto de la persona".to_vec()],
+            "con el turno tomado por un guardado, la base sigue con la contraseña anterior"
+        );
+
+        drop(turno);
+        let abierto = tokio::time::timeout(std::time::Duration::from_secs(10), migracion)
+            .await
+            .expect("al soltar el turno, el re-cifrado tiene que terminar")
+            .expect("la tarea del desbloqueo no puede entrar en pánico")
+            .expect("la contraseña anterior abre la base");
+        assert!(abierto);
+        assert_eq!(
+            secretos_de_la_base("la-nueva"),
+            vec![b"el secreto de la persona".to_vec()],
+            "después, la base abre con la del inicio de sesión y conserva lo que tenía"
+        );
+    }
+
+    /// `aplicar` con re-cifrado y un guardado de la colección que llegan a la vez
+    /// no se traban, y la base termina con la contraseña del login y con todo:
+    /// lo que había y lo que agregó el guardado.
+    ///
+    /// El orden es el que más castiga un candado mal ordenado: el re-cifrado
+    /// espera el turno primero y el guardado después, así que al soltarlo el
+    /// re-cifrado lo recibe y va por el candado del estado. Si el guardado tomara
+    /// el estado antes que el turno, los dos quedarían esperándose para siempre.
+    #[tokio::test]
+    async fn el_re_cifrado_y_un_guardado_a_la_vez_no_se_traban() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        let (desbloqueo, estado, demonio, _cliente) = base_por_migrar().await;
+        let coleccion = CollectionInterface {
+            state: Arc::clone(&estado),
+            conn: demonio.clone(),
+            path: "/org/freedesktop/secrets/collection/login".into(),
+            alias: "login".into(),
+        };
+        let plazo = std::time::Duration::from_secs(10);
+
+        let turno = save_turn().lock().await;
+        let migracion = tokio::spawn(async move { desbloqueo.aplicar("la-vieja").await });
+        hasta_el_re_cifrado().await;
+
+        // Lo que agregaría una aplicación con el llavero ya abierto.
+        agregar(&estado, "/prueba/items/nueva", b"la de la aplicacion").await;
+        let guardado = tokio::spawn(async move { coleccion.persist().await });
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            secretos_de_la_base("la-vieja"),
+            vec![b"el secreto de la persona".to_vec()],
+            "con el turno tomado, ni el re-cifrado ni el guardado escriben"
+        );
+
+        drop(turno);
+        let (abierto, guardado) =
+            tokio::time::timeout(plazo, async { tokio::join!(migracion, guardado) })
+                .await
+                .expect("el re-cifrado y el guardado se trabaron entre sí");
+        assert!(abierto
+            .unwrap()
+            .expect("la contraseña anterior abre la base"));
+        guardado
+            .unwrap()
+            .expect("el guardado de la colección tiene que poder escribir");
+
+        assert_eq!(
+            secretos_de_la_base("la-nueva"),
+            vec![
+                b"el secreto de la persona".to_vec(),
+                b"la de la aplicacion".to_vec(),
+            ],
+            "la base abre con la del inicio de sesión y no pierde ninguna entrada"
+        );
+        assert!(
+            save_turn().try_lock().is_ok(),
+            "al terminar, el turno queda libre"
+        );
     }
 }

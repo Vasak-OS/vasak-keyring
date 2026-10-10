@@ -98,7 +98,7 @@ pub fn interpretar_peticion(bytes: &[u8]) -> Result<String, &'static str> {
         return Err("la contraseña llegó vacía");
     }
     std::str::from_utf8(sin_salto)
-        .map(|s| s.to_string())
+        .map(str::to_string)
         .map_err(|_| "la contraseña no es UTF-8 válido")
 }
 

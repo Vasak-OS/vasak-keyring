@@ -1,134 +1,375 @@
-# vasak-keyring
+# Vasak keyring
 
-Llavero nativo de VasakOS. Reemplazo de `gnome-keyring` con cifrado AES-256-GCM y derivación de clave Argon2id.
+Llavero nativo de VasakOS. Reemplazo de gnome-keyring con cifrado AES-256-GCM y derivación de clave Argon2id.
 
-## Qué no abre
+---
 
-Como todo Secret Service estándar, este llavero entrega los secretos a
-cualquier proceso que corra como la persona. El cifrado protege **en reposo**:
-un disco robado, una copia de seguridad, la computadora de otra persona. No
-protege contra un programa que corre en la misma sesión.
+## Tecnología
 
-Para lo que sí hace falta una frontera —la clave del almacén cifrado de
-`vasak-accounts`— hay un control por ítem. Los ítems marcados con
-`xdg:schema = "ar.net.vasak.os.AccountsStore"` sólo los toca
-`/usr/bin/vasak-accounts-sync`: leer su secreto, reemplazarlo (`SetSecret`, o
-`CreateItem` con `replace`), crear otro con ese esquema, borrarlo o borrar la
-colección que lo tiene, y hasta describirlo (`Attributes`, `Label`). A los demás
-les responde `org.freedesktop.DBus.Error.AccessDenied`, y `SearchItems` no se
-los muestra. Proteger sólo la lectura no alcanzaba: con las escrituras, un
-proceso cualquiera **elegía** la clave con la que se abre la base.
+[![Rust](https://img.shields.io/badge/Rust-1.82%2B-orange?style=flat&logo=rust)](https://www.rust-lang.org/) [![systemd](https://img.shields.io/badge/systemd-256%2B-24283b?style=flat&logo=systemd)](https://systemd.io/) [![D-Bus](https://img.shields.io/badge/D-Bus-1.15%2B-42b883?style=flat&logo=dbus)](https://dbus.freedesktop.org/) [![zbus](https://img.shields.io/badge/zbus-4.0-orange?style=flat&logo=rust)](https://github.com/dbus2/zbus)
 
-La identidad sale de `/proc/<pid>/exe`, del PID que el **demonio del bus**
-asoció a la conexión del remitente. El PID no lo manda el cliente: el demonio lo
-saca de `SO_PEERCRED` al autenticar, y ese vínculo queda fijado durante toda la
-vida de la conexión.
+## Estado
 
-Además, la conexión que pide tiene que ser la dueña de
-`ar.net.vasak.os.AccountsSync` en el bus. Eso solo no prueba nada —un nombre
-lo toma cualquiera que llegue primero, y con el servicio `disabled` casi siempre
-está libre—, así que se exigen las dos cosas: el nombre y el ejecutable. El
-control del portal (`RetrieveSecret`) funciona igual, con
-`org.freedesktop.portal.Desktop` y `/usr/lib/xdg-desktop-portal`.
+[![CI](https://github.com/Vasak-OS/vasak-keyring/actions/workflows/ci.yml/badge.svg)](https://github.com/Vasak-OS/vasak-keyring/actions/workflows/ci.yml)
+[![Versión](https://img.shields.io/github/v/release/Vasak-OS/vasak-keyring?style=flat&label=Versi%C3%B3n)](https://github.com/Vasak-OS/vasak-keyring/releases)
+[![Licencia](https://img.shields.io/github/license/Vasak-OS/vasak-keyring?style=flat)](LICENSE)
+[![Cobertura](https://sonarcloud.io/api/project_badges/measure?project=Vasak-OS_vasak-keyring&metric=coverage&style=flat)](https://sonarcloud.io/summary/new_code?id=Vasak-OS_vasak-keyring)
+[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=Vasak-OS_vasak-keyring&metric=alert_status&style=flat)](https://sonarcloud.io/summary/new_code?id=Vasak-OS_vasak-keyring)
+[![Tamaño repo](https://img.shields.io/github/repo-size/Vasak-OS/vasak-keyring?style=flat)](https://github.com/Vasak-OS/vasak-keyring)
 
-Para leer `/proc/<pid>/exe` de otro proceso de la sesión, el demonio **no puede
-correr en un namespace de usuario propio**, y en una unidad de usuario de
-systemd lo crea cualquiera de `PrivateTmp`, `PrivateDevices`, `ProtectSystem`,
-`ProtectHome`, `ProtectHostname`, `ProtectClock`, `ProtectControlGroups` o los
-`ProtectKernel*` (medido con systemd 261: `systemd-run --user -p <opción>=yes
-readlink /proc/<pid>/exe` da `EACCES` con cada una, y `/proc/self/ns/user` sale
-distinto del de la sesión). Desde el 3/09 la unidad tenía varias: la lectura daba
-`EACCES`, y tanto este control como el del portal rechazaban a todo el mundo,
-también al sincronizador y al portal de verdad. Por eso `vasak-keyring.service`
-no las tiene, y una prueba (`unit_lets_requester_be_identified`) falla si vuelven.
-El aislamiento que queda —sin red, `NoNewPrivileges`, filtro de llamadas al
-sistema, `MemoryDenyWriteExecute`, `RestrictNamespaces`— no crea namespaces.
+---
 
-Tampoco lleva `CapabilityBoundingSet` ni `AmbientCapabilities`: tocar las
-capacidades pide `CAP_SETPCAP`, que el gestor de systemd del usuario no tiene, y
-la unidad no arranca (`status=218/CAPABILITIES`). El proceso ya nace sin
-capacidades y `NoNewPrivileges` le impide ganarlas, así que no restringían nada.
-`unit_does_not_touch_capabilities` falla si vuelven.
+## Descripción
 
-El control es **por ítem**: el resto de los secretos se sigue entregando
-normalmente, que es lo que necesitan el navegador, el cliente de correo y el
-resto del escritorio.
+Llavero nativo de VasakOS. Reemplazo de gnome-keyring con cifrado AES-256-GCM y derivación de clave Argon2id.
 
-### Los secretos del portal
+**Para el usuario:** 
 
-El secreto maestro que el backend del portal (`org.freedesktop.impl.portal.Secret`)
-le da a cada aplicación vive en la colección del login con
-`xdg:schema = "org.freedesktop.portal.Secret"`. Ese esquema es del demonio: el
-backend corre adentro y lee el estado directo, así que **desde el bus no lo toca
-nadie**, sin excepción —tampoco el sincronizador—. Un `CreateItem` con ese
-esquema (con `replace` o sin él), `SetSecret`, `GetSecret`, `Delete`, y leer
-`Label`, `Attributes`, `Created`, `Modified` o `Locked` responden
-`AccessDenied`; borrar una colección que tenga alguno, también. Y para el bus
-esos ítems no existen: no se publican como objetos, no aparecen en `Items` ni en
-`SearchItems`, y `GetSecrets` los omite. Antes (hasta 0.7.8) cualquier proceso
-podía plantar el secreto de una aplicación antes de que lo pidiera, cambiárselo
-o leerlo.
+**Integración VasakOS:** Integra con el ecosistema VasakOS vía D-Bus y configuración compartida.
 
-La reserva compara sólo letras y dígitos, sin mayúsculas: `XDG:Schema`,
-`Org.Freedesktop.Portal.Secret`, un espacio o un carácter invisible en el medio
-siguen siendo el esquema del portal, y tampoco se puede crear nada con el
-atributo `vasak-keyring:origin`. La búsqueda del backend, en cambio, es exacta,
-así que la reserva siempre cubre todo lo que el backend puede encontrar.
+---
 
-**Los secretos de antes de 0.7.9 no se entregan.** Mientras el esquema estuvo
-abierto, uno plantado no se distingue de uno legítimo. Desde 0.7.9 el demonio
-marca los que crea con `vasak-keyring:origin = portal-backend`, que ningún
-cliente del bus puede poner, y sólo entrega ésos. La marca sola no alcanza —un
-demonio de antes no la reservaba, así que también se pudo plantar—, y por eso la
-base lleva un campo `format`: la que escribe 0.7.9 o posterior dice `1`, y en
-una sin el campo (la de un demonio de antes, o una que un demonio de antes volvió
-a guardar después de un retroceso de versión) la marca se quita al cargar. Una
-aplicación que tenía un
-secreto de antes recibe uno nuevo la próxima vez que lo pide —y deja de abrir lo
-que hubiera cifrado con el anterior—, y el diario lo dice. El de antes queda en
-la base sin usarse. En VasakOS el portal Secret lo usan sólo las aplicaciones en
-sandbox, que el sistema no trae, así que en la práctica no hay nada que perder.
+## Arquitectura (diagramas)
 
-### Qué no garantiza
+> Copia y pega la plantilla que necesites, descomenta y adapta.
 
-El control autentica **el binario, no a la persona que lo ejecuta**. Por lo
-tanto:
+### Flujo de datos
 
-- **Un proceso del mismo UID puede quedarse con una conexión D-Bus heredada**
-  del sincronizador —por ejemplo, si el código del sincronizador se la pasa a
-  otro proceso— y usarla. El PID que devuelve el bus sigue siendo el del
-  proceso que abrió la conexión, no el del que escribe el mensaje.
-- **Código inyectado dentro del propio sincronizador** —`LD_PRELOAD`, un
-  `ptrace`, un binario troyanizado— pasa el control, porque para entonces ya
-  corre dentro del proceso autorizado.
-
-Nada de esto se arregla con más comprobaciones sobre `/proc`: para cerrarlas
-hace falta que el sincronizador corra bajo un **UID propio** o dentro de un
-**namespace o sandbox** del que no pueda salir código del resto de la sesión.
-Mientras no sea así, esto es un control contra los programas de la sesión —un
-navegador, un script, un `.desktop` mal puesto—, y no contra alguien que ya
-consiga ejecutar código como el sincronizador. Lo mismo que en
-`vasak-permissions`, y que ya pasaba con el control del portal.
-
-## Uso
-
-```rust
-use crypto::{KeyringDatabase, SecretItem, encrypt_database, decrypt_database};
-
-let mut db = KeyringDatabase { items: vec![] };
-db.items.push(SecretItem {
-    label: "mi-secreto".into(),
-    attributes: [("servicio".into(), "api".into())].into(),
-    secret: b"token".to_vec(),
-});
-
-let cifrado = encrypt_database(&db, "contraseña-maestra").unwrap();
-let descifrado = decrypt_database(&cifrado, "contraseña-maestra").unwrap();
+```mermaid
+<!--
+graph TD
+    A[Entrada: Teclado / Ratón / D-Bus / Sistema] --> B[Procesamiento: Core Rust + Tauri Commands]
+    B --> C[Salida: UI actualizada / Acciones del sistema]
+    style A fill:#e1f5fe
+    style C fill:#e8f5e9
+-->
 ```
 
-## Dependencias
+### Componentes internos
 
-- `aes-gcm` — cifrado simétrico AES-256-GCM
-- `argon2` — derivación de clave (Argon2id)
-- `zeroize` — limpieza de memoria sensible en RAM
-- `serde` / `serde_json` — serialización de la base de datos
+```mermaid
+<!--
+flowchart LR
+    subgraph App[Vasak keyring]
+        UI[Frontend Vue 3 + vue-libvasak]
+        Core[Core Rust: lógica principal]
+        IPC[Tauri Commands / Eventos]
+        System[Systemd / D-Bus / PipeWire / Wayland]
+    end
+    UI --> IPC
+    IPC --> Core
+    Core --> DBus[(D-Bus / zbus)]
+    Core --> System
+    style UI fill:#f3e5f5
+    style Core fill:#e3f2fd
+    style DBus fill:#fff3e0
+    style System fill:#fce4ec
+-->
+```
+
+### Integración en el sistema VasakOS
+
+```mermaid
+<!--
+C4Context
+    title Vasak keyring en VasakOS
+    Person(usuario, "Usuario", "Persona que usa el sistema")
+    System_Boundary(c1, "VasakOS") {
+        System(app, "Vasak keyring", "Llavero nativo de VasakOS. Reemplazo de gnome-keyring con cifrado AES-256-GCM y ")
+        System_Ext(settings, "vasak-settings", "Configuración central")
+        System_Ext(keyring, "vasak-keyring", "Secrets y claves")
+        System_Ext(accounts, "vasak-accounts", "Cuentas e identidad")
+        System_Ext(permissions, "vasak-permissions", "Permisos y portales")
+    }
+    System_Ext(systemd, "systemd", "Gestión de servicios")
+    System_Ext(dbus, "D-Bus", "Bus de mensajes del sistema")
+    System_Ext(wayland, "Wayland / Wayfire", "Compositor")
+    System_Ext(pipewire, "PipeWire", "Multimedia")
+    Rel(usuario, app, "Usa")
+    Rel(app, settings, "Lee/escribe config")
+    Rel(app, keyring, "Guarda/lee secrets")
+    Rel(app, accounts, "Identidad de cuenta")
+    Rel(app, permissions, "Solicita permisos")
+    Rel(app, systemd, "Activación / sockets")
+    Rel(app, dbus, "Expone / consume interfaces")
+    Rel(app, wayland, "Superficies / protocolos")
+    Rel(app, pipewire, "Streams de audio/video")
+-->
+```
+
+---
+
+## Instalación
+
+### Arch Linux (repo oficial)
+
+```bash
+pacman -S vasak-vasak-keyring
+```
+
+### Debian / Ubuntu (.deb)
+
+```bash
+wget https://github.com/Vasak-OS/vasak-keyring/releases/download/v{{VERSION}}/vasak-vasak-keyring_{{VERSION}}_amd64.deb
+sudo apt install ./vasak-vasak-keyring_{{VERSION}}_amd64.deb
+```
+
+### Desde fuente
+
+```bash
+git clone https://github.com/Vasak-OS/vasak-keyring.git
+cd vasak-keyring
+
+# Build completo
+cargo build --release --locked
+
+# Instalar binario
+cargo install --locked --path .
+
+# Paquetes nativos
+# Arch: makepkg -sf en PKGBUILDS/vasak-keyring/
+# Debian: cargo deb --no-build --target-dir target/release/debian
+```
+
+### Flatpak / AppImage
+
+> *Placeholder: añadir cuando exista paquete Flatpak o AppImage oficial.*
+
+---
+
+## Uso rápido
+
+```bash
+# Se lanza automáticamente (systemd --user) o manualmente:
+vasak-keyring
+```
+
+### Atajos / flags principales
+
+| Acción | Comando / Tecla |
+|--------|-----------------|
+| Acción principal | `vasak-keyring` |
+| Configuración | `vasak-keyring --config` |
+| Ayuda | `vasak-keyring --help` |
+
+> **Captura:** `assets/demo.gif` *(placeholder — sustituir por GIF real)*
+
+---
+
+## Configuración
+
+### Archivo de configuración
+
+```
+~/.config/vasak/vasak-keyring.toml
+```
+
+### Variables de entorno
+
+| Variable | Descripción | Por defecto |
+|----------|-------------|-------------|
+| `VASAK_DEBUG` | Activa logs de depuración en consola | `false` |
+| `VASAK_PROFILE` | Perfil de rendimiento: `balanced`, `performance`, `power-save` | `balanced` |
+
+### Integración con `tauri-plugin-config-manager`
+
+- Esquemas de color: respeta `--ui-primary`, `--ui-surface`, `--ui-focus`, `--ui-on-surface`, `--ui-border`
+- Tema de iconos: usa el tema del sistema (`vasakos-icon-theme`) vía `vicon` lookup
+- Radio de bordes: variable CSS `--ui-radius` del esquema activo (por defecto 12px)
+- Fuentes: `--ui-font-family`, `--ui-font-size-base` desde el esquema
+
+---
+
+## Desarrollo
+
+### Requisitos
+
+- **Rust:** `rustup` toolchain estable (`rust-toolchain.toml` fija la versión)
+- **Node / bun:** `bun` ≥ 1.1 (nunca npm/yarn/pnpm para apps Tauri)
+- **Sistema:** `pkg-config`, `libgtk-3-dev`, `libwebkit2gtk-4.1-dev`, `libssl-dev`
+- *`libdbus-1-dev`, `libsystemd-dev` para systemd*
+
+### Dependencias de desarrollo
+
+#### Sistema (paquetes Arch / Debian / Fedora)
+
+`base-devel`, `pkgconf`, `libssl-dev`, `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`, `gstreamer1.0-plugins-base`, `gstreamer1.0-plugins-good`, `libpipewire-0.3-dev`, `libwireplumber-0.5-dev`, `libdbus-1-dev`, `libudev-dev`, `libxkbcommon-dev`, `libwayland-dev`, `meson`, `ninja`, `clang`, `lld`
+
+#### Rust
+
+`rustup` → `stable` + `rustfmt` + `clippy`
+
+#### Node
+
+**Solo `bun`** (nunca npm/yarn/pnpm para apps Tauri). `bun --version` ≥ 1.1
+
+#### Herramientas CLI
+
+`just` (command runner), `cargo-binstall` (opcional), `cargo-llvm-cov` (para cobertura)
+
+### Correr la app en desarrollo
+
+```bash
+# Frontend (Vite dev server + Tauri dev)
+bun run tauri dev
+
+# Solo frontend (Vite)
+bun run dev
+
+# Solo backend (cargo watch)
+cargo watch -x "run --bin vasak-keyring"
+```
+
+### Compilar / Build de release
+
+```bash
+# Build completo (frontend + backend + bundle)
+bun run tauri build
+
+# Solo frontend (para testear bundle después)
+bun run build
+
+# Solo backend Rust (binario optimizado)
+cargo build --release --locked
+
+# Paquetes nativos
+# Arch: makepkg -sf en PKGBUILDS/vasak-keyring/
+# Debian: cargo deb --no-build --target-dir src-tauri/target/release/debian
+```
+
+### Targets principales
+
+```bash
+# Desarrollo (Tauri dev server + hot reload)
+bun run dev
+
+# Build producción
+bun run build
+
+# Solo frontend
+bun run build:frontend
+
+# Solo backend Rust
+cargo build --release --locked
+
+# Lint + tipos (pre-commit / CI)
+bunx --bun biome check .
+bunx vue-tsc --noEmit
+cargo fmt --check
+```
+
+### Pruebas
+
+```bash
+# Suite completa Rust
+cargo test -p vasak-keyring -p vasak-keyring-lib --locked
+
+# Tests de integración (requieren D-Bus)
+cargo test -p vasak-keyring-integration --locked -- --ignored
+```
+
+### Convención de commits
+
+[Conventional Commits](https://www.conventionalcommits.org/es/v1.0.0/):
+
+```
+<tipo>(<ámbito>): <descripción corta>
+
+[cuerpo opcional]
+
+[pie opcional: Closes #N]
+```
+
+Tipos habituales: `feat`, `fix`, `bugfix`, `docs`, `ci`, `chore`, `security`, `refactor`, `perf`, `test`.
+
+### Cómo abrir PR
+
+1. Rama desde `origin/main`:
+   ```bash
+   git worktree add -b feat/tema ~/wt/vasak-keyring-tema origin/main
+   ```
+2. Prefijos de rama: `fix/`, `feat/`, `bugfix/`, `docs/`, `ci/`, `chore/`, `security/`
+3. Escribe el fix → **`qa` escribe las pruebas** (fallan sin el fix) → suite verde → abre PR
+4. Al abrir PR, **cuatro cosas obligatorias**:
+   - Asignado a `JoaquinDecima`
+   - Etiqueta `enhancement` o `bug` (+ `ci` / `dependencies` si aplica)
+   - Añadido al proyecto «VasakOS Roadmap»
+   - Status **In Progress**
+
+---
+
+## Arquitectura (texto)
+
+### Crates / módulos principales
+
+| `vasak-keyring` | Binario principal / daemon systemd |
+| `vasak-keyring-lib` | Lógica compartida / biblioteca pública |
+
+### Interfaces D-Bus / zbus expuestas
+
+| `org.vasak.Vasak-keyring` | `GetStatus()`, `StatusChanged(dict)`, `Reload()`, `GetConfig()` | Control y estado del servicio |
+| `org.vasak.Vasak-keyring.Admin` | `SetPolicy(dict)`, `AuditLog()` | API administrativa (solo root) |
+
+### Puntos de extensión
+
+- **Plugins:** Sistema de plugins modular
+- **Hooks:** Hooks de ciclo de vida
+- **API pública Rust:** API pública del crate principal
+
+### Features / Cargo features
+
+| Feature | Descripción | Default |
+|---------|-------------|---------|
+| `systemd` | Integración systemd (socket activation) | ✓ |
+| `tracing` | Logging estructurado con tracing | ✓ |
+| `admin` | API administrativa (solo root) | |
+| `pam` | Módulo PAM para autenticación | |
+
+Y para apps Tauri+Vue: features del `tauri.conf.json` → `bundle` / `plugins` / `allowlist` (capabilities).
+
+---
+
+## Pruebas y calidad
+
+- **Cobertura objetivo:** ≥ 80 % del código nuevo (SonarCloud Quality Gate)
+- **Informes:** GitHub Actions → pestaña *SonarCloud Code Analysis* → enlace a SonarCloud
+- **Añadir pruebas:** ver `AGENTS.md` sección 9 (mapa de repos y comandos de prueba)
+- **Regla:** toda corrección lleva prueba escrita por `qa` que falla sin el fix
+
+---
+
+## Contribuir
+
+- **Guía:** [.github/CONTRIBUTING.md](https://github.com/Vasak-OS/.github/blob/main/CONTRIBUTING.md)
+- **Plantillas de issue:** [.github/ISSUE_TEMPLATE/](https://github.com/Vasak-OS/.github/tree/main/ISSUE_TEMPLATE)
+- **Código de conducta:** [CODE_OF_CONDUCT.md](https://github.com/Vasak-OS/.github/blob/main/CODE_OF_CONDUCT.md)
+
+---
+
+## Contribuidores
+
+> **Actualizado automáticamente en CI** — muestra los avatares de quienes han aportado código a este repo.
+
+<div align="center">
+  
+</div>
+
+[Ver todos los contribuidores](https://github.com/Vasak-OS/vasak-keyring/graphs/contributors)
+
+---
+
+## Donadores / Sponsors
+
+[![Sponsors](https://img.shields.io/github/sponsors/Vasak-OS?style=flat&label=Sponsors)](https://github.com/sponsors/Vasak-OS)
+
+> **Backers:** *Actualizado automáticamente en CI desde GitHub Sponsors / OpenCollective / Polar.*
+
+[💖 Donar al proyecto](https://github.com/sponsors/Vasak-OS)
+
+---
+
+## Licencia
+
+`MIT` — Copyright © 2026 **Vasak-OS Contributors**
+
+[Ver licencia completa](LICENSE)

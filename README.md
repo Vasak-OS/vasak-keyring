@@ -31,70 +31,48 @@ Llavero nativo de VasakOS. Reemplazo de gnome-keyring con cifrado AES-256-GCM y 
 
 ## Arquitectura (diagramas)
 
-> Copia y pega la plantilla que necesites, descomenta y adapta.
-
 ### Flujo de datos
 
 ```mermaid
-<!--
 graph TD
-    A[Entrada: Teclado / Ratón / D-Bus / Sistema] --> B[Procesamiento: Core Rust + Tauri Commands]
-    B --> C[Salida: UI actualizada / Acciones del sistema]
+    A[Entrada: D-Bus / systemd socket / CLI admin] --> B[Procesamiento: Daemon Rust + zbus / SQLCipher]
+    B --> C[Salida: Estado D-Bus / Logs / Config]
     style A fill:#e1f5fe
     style C fill:#e8f5e9
--->
 ```
 
 ### Componentes internos
 
 ```mermaid
-<!--
 flowchart LR
-    subgraph App[Vasak keyring]
-        UI[Frontend Vue 3 + vue-libvasak]
-        Core[Core Rust: lógica principal]
-        IPC[Tauri Commands / Eventos]
-        System[Systemd / D-Bus / PipeWire / Wayland]
+    subgraph App[{{APP_NAME}}]
+        UI[{{UI_DESC}}]
+        Core[{{CORE_DESC}}]
+        IPC[{{IPC_DESC}}]
     end
     UI --> IPC
     IPC --> Core
     Core --> DBus[(D-Bus / zbus)]
-    Core --> System
+    Core --> System[{{SYSTEM_DESC}}]
     style UI fill:#f3e5f5
     style Core fill:#e3f2fd
     style DBus fill:#fff3e0
     style System fill:#fce4ec
--->
 ```
 
 ### Integración en el sistema VasakOS
 
 ```mermaid
-<!--
 C4Context
-    title Vasak keyring en VasakOS
+    title {{APP_NAME}} en VasakOS
     Person(usuario, "Usuario", "Persona que usa el sistema")
     System_Boundary(c1, "VasakOS") {
-        System(app, "Vasak keyring", "Llavero nativo de VasakOS. Reemplazo de gnome-keyring con cifrado AES-256-GCM y ")
-        System_Ext(settings, "vasak-settings", "Configuración central")
-        System_Ext(keyring, "vasak-keyring", "Secrets y claves")
-        System_Ext(accounts, "vasak-accounts", "Cuentas e identidad")
-        System_Ext(permissions, "vasak-permissions", "Permisos y portales")
+        System(app, "{{APP_NAME}}", "{{ONE_LINER}}")
+        {{SYSTEM_EXT}}
     }
-    System_Ext(systemd, "systemd", "Gestión de servicios")
-    System_Ext(dbus, "D-Bus", "Bus de mensajes del sistema")
-    System_Ext(wayland, "Wayland / Wayfire", "Compositor")
-    System_Ext(pipewire, "PipeWire", "Multimedia")
+    {{SYSTEM_EXT_EXTERNAL}}
     Rel(usuario, app, "Usa")
-    Rel(app, settings, "Lee/escribe config")
-    Rel(app, keyring, "Guarda/lee secrets")
-    Rel(app, accounts, "Identidad de cuenta")
-    Rel(app, permissions, "Solicita permisos")
-    Rel(app, systemd, "Activación / sockets")
-    Rel(app, dbus, "Expone / consume interfaces")
-    Rel(app, wayland, "Superficies / protocolos")
-    Rel(app, pipewire, "Streams de audio/video")
--->
+    {{RELATIONS}}
 ```
 
 ---
@@ -104,14 +82,14 @@ C4Context
 ### Arch Linux (repo oficial)
 
 ```bash
-pacman -S vasak-vasak-keyring
+pacman -S vasak-keyring
 ```
 
 ### Debian / Ubuntu (.deb)
 
 ```bash
-wget https://github.com/Vasak-OS/vasak-keyring/releases/download/v{{VERSION}}/vasak-vasak-keyring_{{VERSION}}_amd64.deb
-sudo apt install ./vasak-vasak-keyring_{{VERSION}}_amd64.deb
+wget https://github.com/Vasak-OS/vasak-keyring/releases/download/v{{VERSION}}/vasak-keyring_{{VERSION}}_amd64.deb
+sudo apt install ./vasak-keyring_{{VERSION}}_amd64.deb
 ```
 
 ### Desde fuente
@@ -125,23 +103,17 @@ cargo build --release --locked
 
 # Instalar binario
 cargo install --locked --path .
-
-# Paquetes nativos
-# Arch: makepkg -sf en PKGBUILDS/vasak-keyring/
-# Debian: cargo deb --no-build --target-dir target/release/debian
 ```
-
-### Flatpak / AppImage
-
-> *Placeholder: añadir cuando exista paquete Flatpak o AppImage oficial.*
 
 ---
 
 ## Uso rápido
 
 ```bash
-# Se lanza automáticamente (systemd --user) o manualmente:
-vasak-keyring
+# Se ejecuta como servicio systemd (socket-activated via D-Bus)
+# No se lanza manualmente normalmente.
+# Para debugging:
+cargo run --bin vasak-keyring
 ```
 
 ### Atajos / flags principales
@@ -161,22 +133,22 @@ vasak-keyring
 ### Archivo de configuración
 
 ```
-~/.config/vasak/vasak-keyring.toml
+/etc/vasak/keyring.toml  (sistema)
+~/.config/vasak/keyring.toml  (usuario, si aplica)
 ```
+
+> Servicios de sistema usan `/etc/vasak/`, configuración de usuario en `~/.config/vasak/`.
 
 ### Variables de entorno
 
 | Variable | Descripción | Por defecto |
 |----------|-------------|-------------|
 | `VASAK_DEBUG` | Activa logs de depuración en consola | `false` |
-| `VASAK_PROFILE` | Perfil de rendimiento: `balanced`, `performance`, `power-save` | `balanced` |
+| `RUST_LOG` | Nivel de log (trace, debug, info, warn, error) | `info` |
 
 ### Integración con `tauri-plugin-config-manager`
 
-- Esquemas de color: respeta `--ui-primary`, `--ui-surface`, `--ui-focus`, `--ui-on-surface`, `--ui-border`
-- Tema de iconos: usa el tema del sistema (`vasakos-icon-theme`) vía `vicon` lookup
-- Radio de bordes: variable CSS `--ui-radius` del esquema activo (por defecto 12px)
-- Fuentes: `--ui-font-family`, `--ui-font-size-base` desde el esquema
+(servicio headless — sin integración config-manager)
 
 ---
 
@@ -187,7 +159,7 @@ vasak-keyring
 - **Rust:** `rustup` toolchain estable (`rust-toolchain.toml` fija la versión)
 - **Node / bun:** `bun` ≥ 1.1 (nunca npm/yarn/pnpm para apps Tauri)
 - **Sistema:** `pkg-config`, `libgtk-3-dev`, `libwebkit2gtk-4.1-dev`, `libssl-dev`
-- *`libdbus-1-dev`, `libsystemd-dev` para systemd*
+- *`libdbus-1-dev`, `libsystemd-dev` para systemd, `libsqlcipher-dev` si usa SQLCipher*
 
 ### Dependencias de desarrollo
 
@@ -207,55 +179,48 @@ vasak-keyring
 
 `just` (command runner), `cargo-binstall` (opcional), `cargo-llvm-cov` (para cobertura)
 
-### Correr la app en desarrollo
+### Correr en desarrollo
 
 ```bash
-# Frontend (Vite dev server + Tauri dev)
-bun run tauri dev
+# Backend con recarga en caliente
+cargo watch -x "run --bin vasak-keyring`
 
-# Solo frontend (Vite)
-bun run dev
-
-# Solo backend (cargo watch)
-cargo watch -x "run --bin vasak-keyring"
+# Solo tests
+cargo test --locked
 ```
 
 ### Compilar / Build de release
 
 ```bash
-# Build completo (frontend + backend + bundle)
-bun run tauri build
-
-# Solo frontend (para testear bundle después)
-bun run build
-
-# Solo backend Rust (binario optimizado)
+# Build release optimizado
 cargo build --release --locked
+
+# Instalar
+cargo install --locked --path .
 
 # Paquetes nativos
 # Arch: makepkg -sf en PKGBUILDS/vasak-keyring/
-# Debian: cargo deb --no-build --target-dir src-tauri/target/release/debian
+# Debian: cargo deb --no-build --target-dir target/release/debian
 ```
 
 ### Targets principales
 
 ```bash
-# Desarrollo (Tauri dev server + hot reload)
-bun run dev
+# Desarrollo
+cargo watch -x "run --bin vasak-keyring"
 
 # Build producción
-bun run build
+cargo build --release --locked
 
 # Solo frontend
-bun run build:frontend
+(no aplica — sin frontend)
 
 # Solo backend Rust
 cargo build --release --locked
 
 # Lint + tipos (pre-commit / CI)
-bunx --bun biome check .
-bunx vue-tsc --noEmit
 cargo fmt --check
+cargo clippy -- -D warnings
 ```
 
 ### Pruebas
@@ -286,7 +251,7 @@ Tipos habituales: `feat`, `fix`, `bugfix`, `docs`, `ci`, `chore`, `security`, `r
 
 1. Rama desde `origin/main`:
    ```bash
-   git worktree add -b feat/tema ~/wt/vasak-keyring-tema origin/main
+   git worktree add -b feat/{{TEMA}} ~/wt/vasak-keyring-{{TEMA}} origin/main
    ```
 2. Prefijos de rama: `fix/`, `feat/`, `bugfix/`, `docs/`, `ci/`, `chore/`, `security/`
 3. Escribe el fix → **`qa` escribe las pruebas** (fallan sin el fix) → suite verde → abre PR
@@ -302,11 +267,15 @@ Tipos habituales: `feat`, `fix`, `bugfix`, `docs`, `ci`, `chore`, `security`, `r
 
 ### Crates / módulos principales
 
+| Crate / Módulo | Responsabilidad |
+|----------------|-----------------|
 | `vasak-keyring` | Binario principal / daemon systemd |
 | `vasak-keyring-lib` | Lógica compartida / biblioteca pública |
 
 ### Interfaces D-Bus / zbus expuestas
 
+| Interfaz | Métodos / Señales / Propiedades | Descripción |
+|----------|----------------------------------|-------------|
 | `org.vasak.Vasak-keyring` | `GetStatus()`, `StatusChanged(dict)`, `Reload()`, `GetConfig()` | Control y estado del servicio |
 | `org.vasak.Vasak-keyring.Admin` | `SetPolicy(dict)`, `AuditLog()` | API administrativa (solo root) |
 
@@ -325,7 +294,7 @@ Tipos habituales: `feat`, `fix`, `bugfix`, `docs`, `ci`, `chore`, `security`, `r
 | `admin` | API administrativa (solo root) | |
 | `pam` | Módulo PAM para autenticación | |
 
-Y para apps Tauri+Vue: features del `tauri.conf.json` → `bundle` / `plugins` / `allowlist` (capabilities).
+
 
 ---
 
@@ -340,8 +309,8 @@ Y para apps Tauri+Vue: features del `tauri.conf.json` → `bundle` / `plugins` /
 
 ## Contribuir
 
-- **Guía:** [.github/CONTRIBUTING.md](https://github.com/Vasak-OS/.github/blob/main/CONTRIBUTING.md)
-- **Plantillas de issue:** [.github/ISSUE_TEMPLATE/](https://github.com/Vasak-OS/.github/tree/main/ISSUE_TEMPLATE)
+- **Guía:** [CONTRIBUTING.md](https://github.com/Vasak-OS/.github/blob/main/CONTRIBUTING.md)
+- **Plantillas de issue:** [ISSUE_TEMPLATE](https://github.com/Vasak-OS/.github/tree/main/ISSUE_TEMPLATE)
 - **Código de conducta:** [CODE_OF_CONDUCT.md](https://github.com/Vasak-OS/.github/blob/main/CODE_OF_CONDUCT.md)
 
 ---
@@ -351,7 +320,7 @@ Y para apps Tauri+Vue: features del `tauri.conf.json` → `bundle` / `plugins` /
 > **Actualizado automáticamente en CI** — muestra los avatares de quienes han aportado código a este repo.
 
 <div align="center">
-  
+  <a href="https://github.com/JoaquinDecima" target="_blank"><img src="https://avatars.githubusercontent.com/u/11674229?v=4&s=40" width="40" height="40" alt="JoaquinDecima" style="border-radius: 50%; margin: 2px;" title="JoaquinDecima (116 contribuciones)"></a>
 </div>
 
 [Ver todos los contribuidores](https://github.com/Vasak-OS/vasak-keyring/graphs/contributors)

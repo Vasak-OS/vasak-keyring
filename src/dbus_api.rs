@@ -474,6 +474,26 @@ fn effectively_locked(collection_locked: bool) -> bool {
 /// el bus **y** cuyo ejecutable sea `/usr/bin/vasak-accounts-sync`. Ver
 /// [`es_el_sincronizador`].
 const ESQUEMA_PROTEGIDO: &str = "ar.net.vasak.os.AccountsStore";
+
+/// El esquema que protege la clave privada S/MIME de una identidad.
+///
+/// Misma puerta que [`ESQUEMA_PROTEGIDO`] —sólo el sincronizador, por nombre de
+/// bus y ejecutable—, pero esquema propio: la clave S/MIME es material distinto
+/// de la clave del almacén, y separarla deja ponerle otra retención o enumerarla
+/// aparte sin tocar la del almacén. El servicio la guarda y la lee con el Secret
+/// Service (`CreateItem` con `replace`, `SearchItems`/`GetSecret`); el manejo de
+/// la clave y la cripto S/MIME viven en `vasak-accounts-sync`, no acá. Ver
+/// `vasak-mail#78`.
+const SMIME_SCHEMA: &str = "ar.net.vasak.os.SmimeKey";
+
+/// Los esquemas cuyos ítems sólo toca el sincronizador.
+///
+/// La puerta es por **pertenencia** a este conjunto y no por igualdad a una sola
+/// constante: cada esquema que se agregue acá queda con la misma protección
+/// —entrega, escritura, borrado y descripción restringidos al ejecutable
+/// autorizado— sin repetir la regla en cada sitio que la consulta.
+const PROTECTED_SCHEMAS: &[&str] = &[ESQUEMA_PROTEGIDO, SMIME_SCHEMA];
+
 const ATRIBUTO_ESQUEMA: &str = "xdg:schema";
 const EJECUTABLE_AUTORIZADO: &str = "/usr/bin/vasak-accounts-sync";
 
@@ -563,7 +583,7 @@ fn es_esquema_protegido(item: &ItemInfo) -> bool {
 fn atributos_protegidos(atributos: &HashMap<String, String>) -> bool {
     atributos
         .get(ATRIBUTO_ESQUEMA)
-        .is_some_and(|s| s == ESQUEMA_PROTEGIDO)
+        .is_some_and(|s| PROTECTED_SCHEMAS.contains(&s.as_str()))
 }
 
 /// Si quien llama puede tocar lo que pide.

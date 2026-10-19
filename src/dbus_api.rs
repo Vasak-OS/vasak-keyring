@@ -474,6 +474,26 @@ fn effectively_locked(collection_locked: bool) -> bool {
 /// el bus **y** cuyo ejecutable sea `/usr/bin/vasak-accounts-sync`. Ver
 /// [`es_el_sincronizador`].
 const ESQUEMA_PROTEGIDO: &str = "ar.net.vasak.os.AccountsStore";
+
+/// El esquema que protege la clave privada S/MIME de una identidad.
+///
+/// Misma puerta que [`ESQUEMA_PROTEGIDO`] —sólo el sincronizador, por nombre de
+/// bus y ejecutable—, pero esquema propio: la clave S/MIME es material distinto
+/// de la clave del almacén, y separarla deja ponerle otra retención o enumerarla
+/// aparte sin tocar la del almacén. El servicio la guarda y la lee con el Secret
+/// Service (`CreateItem` con `replace`, `SearchItems`/`GetSecret`); el manejo de
+/// la clave y la cripto S/MIME viven en `vasak-accounts-sync`, no acá. Ver
+/// `vasak-mail#78`.
+const SMIME_SCHEMA: &str = "ar.net.vasak.os.SmimeKey";
+
+/// Los esquemas cuyos ítems sólo toca el sincronizador.
+///
+/// La puerta es por **pertenencia** a este conjunto y no por igualdad a una sola
+/// constante: cada esquema que se agregue acá queda con la misma protección
+/// —entrega, escritura, borrado y descripción restringidos al ejecutable
+/// autorizado— sin repetir la regla en cada sitio que la consulta.
+const PROTECTED_SCHEMAS: &[&str] = &[ESQUEMA_PROTEGIDO, SMIME_SCHEMA];
+
 const ATRIBUTO_ESQUEMA: &str = "xdg:schema";
 const EJECUTABLE_AUTORIZADO: &str = "/usr/bin/vasak-accounts-sync";
 
@@ -563,7 +583,7 @@ fn es_esquema_protegido(item: &ItemInfo) -> bool {
 fn atributos_protegidos(atributos: &HashMap<String, String>) -> bool {
     atributos
         .get(ATRIBUTO_ESQUEMA)
-        .is_some_and(|s| s == ESQUEMA_PROTEGIDO)
+        .is_some_and(|s| PROTECTED_SCHEMAS.contains(&s.as_str()))
 }
 
 /// Si quien llama puede tocar lo que pide.
@@ -4084,8 +4104,8 @@ pub(crate) mod tests {
 
     /// Un atributo con otro valor no es el esquema protegido, aunque se parezca.
     ///
-    /// El filtro es una igualdad exacta contra `ESQUEMA_PROTEGIDO`: si fuera un
-    /// `contains` o un prefijo, cualquier aplicación que se Vie con
+    /// El filtro es una pertenencia exacta al conjunto `PROTECTED_SCHEMAS`: si
+    /// fuera un `contains` o un prefijo, cualquier aplicación que se Vie con
     /// `ar.net.vasak.os.AccountsStoreBackup` quedaría protegida por accidente —o,
     /// al revés, se le negaría su propia clave sin que nadie entienda por qué.
     #[test]
@@ -4104,6 +4124,78 @@ pub(crate) mod tests {
             assert!(
                 access_allowed(&item, false),
                 "`{esquema}` no es el esquema protegido y no puede quedar bloqueado"
+            );
+        }
+    }
+
+    /// Un ítem con el esquema de la clave S/MIME.
+    fn entrada_smime(secret: &[u8]) -> ItemInfo {
+        ItemInfo {
+            attributes: HashMap::from([(ATRIBUTO_ESQUEMA.to_string(), SMIME_SCHEMA.to_string())]),
+            ..entrada(secret)
+        }
+    }
+
+    /// El bug que cierra el esquema nuevo: antes la puerta era una igualdad
+    /// contra el esquema del almacén, así que una clave privada S/MIME guardada
+    /// con su propio esquema no era «protegida» y se le entregaba a cualquier
+    /// proceso de la sesión.
+    #[test]
+    fn la_clave_smime_no_se_le_entrega_a_un_proceso_no_autorizado() {
+        let item = entrada_smime(b"la clave privada smime");
+
+        assert!(
+            es_esquema_protegido(&item),
+            "el esquema S/MIME tiene que contar como protegido"
+        );
+        assert!(
+            !access_allowed(&item, false),
+            "un proceso que no es el sincronizador no puede leer la clave S/MIME"
+        );
+    }
+
+    /// El camino feliz del esquema nuevo: la puerta es la misma, así que el
+    /// sincronizador sigue entrando.
+    #[test]
+    fn el_proceso_autorizado_si_puede_leer_la_clave_smime() {
+        assert!(access_allowed(
+            &entrada_smime(b"la clave privada smime"),
+            true
+        ));
+    }
+
+    /// Los dos esquemas protegidos, por separado: agregar el de S/MIME no le
+    /// saca nada al del almacén, y ninguno protege al otro por accidente.
+    #[test]
+    fn los_dos_esquemas_protegidos_siguen_protegidos() {
+        assert!(!access_allowed(&entrada_protegida(b"almacen"), false));
+        assert!(!access_allowed(&entrada_smime(b"smime"), false));
+        assert!(access_allowed(&entrada_protegida(b"almacen"), true));
+        assert!(access_allowed(&entrada_smime(b"smime"), true));
+    }
+
+    /// Lo mismo que `un_esquema_que_solo_se_parece_al_protegido_no_lo_es`, para
+    /// el esquema nuevo: la pertenencia es por elemento exacto, no por prefijo
+    /// ni por `contains`. Con `contains`, `SmimeKeyX` quedaría protegido.
+    #[test]
+    fn un_esquema_que_solo_se_parece_al_smime_no_queda_protegido() {
+        let parecidos = [
+            "ar.net.vasak.os.SmimeKeyX",
+            "ar.net.vasak.os.SmimeKey ",
+            "ar.net.vasak.os.smimekey",
+            "ar.net.vasak.os.Smime",
+            "ar.net.vasak.os.SmimeKey.Backup",
+            "ar.net.vasak.os.AccountsStore ar.net.vasak.os.SmimeKey",
+            "",
+        ];
+        for esquema in parecidos {
+            let item = ItemInfo {
+                attributes: HashMap::from([(ATRIBUTO_ESQUEMA.to_string(), esquema.to_string())]),
+                ..entrada(b"secreto")
+            };
+            assert!(
+                access_allowed(&item, false),
+                "`{esquema}` no pertenece al conjunto protegido y no puede quedar bloqueado"
             );
         }
     }
@@ -5170,9 +5262,14 @@ pub(crate) mod tests {
     /// Las propiedades de un ítem que alguien pide crear, con el esquema del
     /// almacén o sin él.
     fn propiedades(protegido: bool) -> HashMap<String, Value<'static>> {
+        propiedades_con_esquema(protegido.then_some(ESQUEMA_PROTEGIDO))
+    }
+
+    /// Lo mismo, con el esquema que se quiera (o ninguno).
+    fn propiedades_con_esquema(esquema: Option<&str>) -> HashMap<String, Value<'static>> {
         let mut atributos = HashMap::from([("account_id".to_string(), "abc".to_string())]);
-        if protegido {
-            atributos.insert(ATRIBUTO_ESQUEMA.to_string(), ESQUEMA_PROTEGIDO.to_string());
+        if let Some(esquema) = esquema {
+            atributos.insert(ATRIBUTO_ESQUEMA.to_string(), esquema.to_string());
         }
         HashMap::from([
             (
@@ -5278,6 +5375,89 @@ pub(crate) mod tests {
             "org.freedesktop.Secret.Error.IsLocked",
             "el sincronizador pasa la puerta: lo único que lo frena es que el llavero está cerrado"
         );
+    }
+
+    /// `CreateItem` con el esquema S/MIME, de punta a punta: un impostor recibe
+    /// `AccessDenied` (sin la pertenencia al conjunto recibiría `IsLocked`, que
+    /// es lo que se le contesta a quien pasa la puerta) y el sincronizador pasa.
+    #[tokio::test]
+    async fn crear_una_clave_smime_es_solo_del_sincronizador() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _cerrada = sesion_cerrada();
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        for (emisor, espera) in [
+            (DE_UN_IMPOSTOR, "org.freedesktop.DBus.Error.AccessDenied"),
+            (DEL_SINCRONIZADOR, "org.freedesktop.Secret.Error.IsLocked"),
+        ] {
+            for replace in [true, false] {
+                let error = almacen
+                    .llamar_como(
+                        emisor,
+                        COLECCION_DEL_LOGIN,
+                        IFACE_COLECCION,
+                        "CreateItem",
+                        &(
+                            propiedades_con_esquema(Some(SMIME_SCHEMA)),
+                            secreto("la clave privada smime"),
+                            replace,
+                        ),
+                    )
+                    .await
+                    .expect_err("con la sesión cerrada no se escribe");
+                assert_eq!(
+                    nombre_del_error(&error),
+                    espera,
+                    "CreateItem S/MIME de {emisor} con replace={replace}"
+                );
+            }
+        }
+    }
+
+    /// `SearchItems` no le muestra la clave S/MIME a un impostor y se la muestra
+    /// al sincronizador, igual que con el ítem del almacén.
+    #[tokio::test]
+    async fn search_items_no_le_muestra_la_clave_smime_a_un_impostor() {
+        const ITEM_SMIME: &str = "/org/freedesktop/secrets/collection/login/items/9";
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+        {
+            let mut estado = almacen.estado.lock().await;
+            estado
+                .collections
+                .get_mut(COLECCION_DEL_LOGIN)
+                .expect("la colección de la prueba")
+                .items
+                .push(ITEM_SMIME.to_string());
+            estado.items.insert(
+                ITEM_SMIME.to_string(),
+                ItemInfo {
+                    label: "la clave smime".into(),
+                    ..entrada_smime(b"la clave privada smime")
+                },
+            );
+        }
+        let todos: HashMap<String, String> = HashMap::new();
+
+        for (emisor, espera_la_clave) in [(DE_UN_IMPOSTOR, false), (DEL_SINCRONIZADOR, true)] {
+            let respuesta = almacen
+                .llamar_como(
+                    emisor,
+                    COLECCION_DEL_LOGIN,
+                    IFACE_COLECCION,
+                    "SearchItems",
+                    &(&todos,),
+                )
+                .await
+                .expect("Collection.SearchItems");
+            let rutas: Vec<OwnedObjectPath> = respuesta.body().deserialize().expect("rutas");
+            let rutas: Vec<&str> = rutas.iter().map(|r| r.as_str()).collect();
+            assert!(rutas.contains(&ITEM_COMUN), "{emisor} ve la común");
+            assert_eq!(
+                rutas.contains(&ITEM_SMIME),
+                espera_la_clave,
+                "Collection.SearchItems de {emisor}: {rutas:?}"
+            );
+        }
     }
 
     #[tokio::test]

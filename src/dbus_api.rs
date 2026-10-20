@@ -565,7 +565,6 @@ async fn pid_del_emisor(conn: &Connection, cabecera: &zbus::message::Header<'_>)
     respuesta.body().deserialize().ok()
 }
 
-/// Obtiene la ruta del ejecutable a partir del PID.
 /// La ruta del ejecutable de un proceso, sin el adorno de los borrados.
 ///
 /// `readlink /proc/<pid>/exe` no devuelve la ruta del archivo: devuelve la del
@@ -574,19 +573,22 @@ async fn pid_del_emisor(conn: &Connection, cabecera: &zbus::message::Header<'_>)
 /// final. Comprobado sobre un binario borrado en caliente: `readlink` da
 /// `/tmp/x/miapp (deleted)`.
 ///
-/// Sin quitarlo, una actualización del sistema con la unidad del sincronizador
-/// corriendo le negaría el acceso al proceso **legítimo** en cada `GetSecret`
-/// hasta que se reinicie la unidad, y el síntoma —«el almacén de cuentas se
-/// rompió después de actualizar»— no lleva a ninguna parte. Falla cerrado, que
+/// Sin quitarlo, una actualización del sistema con el autorizado de una puerta
+/// corriendo —el sincronizador, el asistente— le negaría el acceso al proceso
+/// **legítimo** en cada `GetSecret` hasta que se reinicie, y el síntoma —«el
+/// almacén de cuentas se rompió después de actualizar»— no lleva a ninguna
+/// parte. Falla cerrado, que
 /// es lo correcto; lo que no es correcto es que falle.
 ///
 /// El sufijo se quita y no se recorta: la comparación de abajo sigue siendo
 /// exacta contra la ruta entera, así que quitarlo no abre la puerta a que un
-/// `/usr/bin/vasak-accounts-sync.malicioso` passe por el sincronizador.
+/// `/usr/bin/vasak-accounts-sync.malicioso` pase por el autorizado.
 ///
 /// El `Err` es el motivo, y no se traga: un `.ok()` acá es lo que dejó a la
 /// puerta rechazando al sincronizador sin que nada lo dijera, cuando la unidad
-/// tenía un namespace de usuario propio y la lectura daba `EACCES`.
+/// tenía un namespace de usuario propio y la lectura daba `EACCES`. Lo mismo
+/// pasa con un autorizado que se marca no volcable (`PR_SET_DUMPABLE=0`): para
+/// el llavero, sin `CAP_SYS_PTRACE`, su `/proc/<pid>/exe` da `EACCES`.
 fn ejecutable_de(pid: u32) -> Result<String, std::io::Error> {
     std::fs::read_link(format!("/proc/{pid}/exe"))
         .map(|r| r.to_string_lossy().into_owned())
@@ -595,7 +597,7 @@ fn ejecutable_de(pid: u32) -> Result<String, std::io::Error> {
 
 /// Saca el `" (deleted)"` que el kernel le cuelga a un inodo sin archivo.
 ///
-/// Va aparte de `ejecutable_de` por la misma razón que `es_el_autorizado` va
+/// Va aparte de `ejecutable_de` por la misma razón que `is_expected_executable` va
 /// aparte de `caller_is_authorized`: la regla se prueba sola, sin
 /// un proceso que haya que arrancar ni un `/proc` que haya que existido. Que la
 /// cadena con el adorno llegue como llega, eso lo comprueba la otra prueba, que
@@ -737,9 +739,10 @@ fn access_allowed(item: &ItemInfo, autorizadas: &[SchemaGuard]) -> bool {
 
 /// Si el proceso que llama pasa la puerta de un esquema protegido.
 ///
-/// Hacen falta las dos cosas de [`es_el_sincronizador`]: que la conexión que
-/// llama sea la dueña de `bus_name`, y que el ejecutable de su pid sea
-/// `esperado`. Cualquier cosa que no se pueda averiguar —tampoco un
+/// Hacen falta las dos cosas de [`owns_name_and_executable`]: que la conexión
+/// que llama sea la dueña de `bus_name`, y que el ejecutable de su pid sea
+/// `esperado`. Cada esquema tiene su puerta, y pasar una no dice nada de las
+/// otras: quien llama a esta función ya eligió cuál mira. Cualquier cosa que no se pueda averiguar —tampoco un
 /// `/proc/<pid>/exe` que no se deja leer— es un no.
 ///
 /// `bus_name` y `esperado` salen de la [`SchemaGuard`] del esquema en
@@ -798,7 +801,7 @@ async fn caller_is_authorized(
         }
     };
 
-    if es_el_sincronizador(&emisor, duenia.as_deref(), Some(&ejecutable), esperado) {
+    if owns_name_and_executable(&emisor, duenia.as_deref(), Some(&ejecutable), esperado) {
         return true;
     }
 
@@ -847,36 +850,36 @@ async fn ejecutable_del_emisor(
         .map_err(|e| format!("no se pudo leer /proc/{pid}/exe: {e}"))
 }
 
-/// Si la conexión que llama es la del sincronizador.
+/// Si la conexión que llama es la autorizada por una puerta.
 ///
 /// Dos condiciones y hacen falta las dos:
 ///
-/// 1. La conexión tiene que tener tomado `ar.net.vasak.os.AccountsSync`. La
-///    contesta el bus.
+/// 1. La conexión tiene que tener tomado el `bus_name` de la puerta
+///    (`duenia` es quién lo tiene). La contesta el bus.
 /// 2. El ejecutable de su pid tiene que ser `esperado`. Un `None` —no se pudo
 ///    leer— es un no: el nombre solo lo puede tener cualquiera que haya llegado
 ///    primero, y el ejecutable es lo que no se puede fingir.
-fn es_el_sincronizador(
+fn owns_name_and_executable(
     emisor: &str,
     duenia: Option<&str>,
     ejecutable: Option<&str>,
     esperado: &str,
 ) -> bool {
-    duenia == Some(emisor) && ejecutable.is_some_and(|ruta| es_el_autorizado(ruta, esperado))
+    duenia == Some(emisor) && ejecutable.is_some_and(|ruta| is_expected_executable(ruta, esperado))
 }
 
-/// Si esta ruta de ejecutable es la del sincronizador.
+/// Si esta ruta de ejecutable es la que espera la puerta.
 ///
 /// La comparación es exacta y no por prefijo, y eso es el punto: con un
 /// `starts_with`, `/usr/bin/vasak-accounts-sync.malicioso` —o cualquier
-/// `...-sync2`— pasaría por el sincronizador. No hace falta ser root para
+/// `...-sync2`, o `/usr/bin/vasak-assistant2`— pasaría por el autorizado. No hace falta ser root para
 /// exploitear eso, alcanza con poder dejar un archivo en un directorio que esté
 /// en el `PATH` del atacante... salvo que el camino esté completo, que es
 /// justamente por lo que se compara contra la ruta entera y no contra el
 /// nombre. Separáda de `caller_is_authorized` para que se pueda
 /// probar sin un bus: la de acá es la regla, y una regla que no se prueba sola
 /// termina cediendo en el `if` de arriba.
-fn es_el_autorizado(ejecutable: &str, esperado: &str) -> bool {
+fn is_expected_executable(ejecutable: &str, esperado: &str) -> bool {
     ejecutable == esperado
 }
 
@@ -1511,7 +1514,7 @@ impl ItemInterface {
         let guard = path_guard(&self.state, &self.path).await;
         if !passes_guards(&self.conn, &cabecera, &self.state, guard.as_slice()).await {
             return Err(zbus::fdo::Error::AccessDenied(
-                "el ítem es del almacén de cuentas".into(),
+                "el ítem pertenece a un esquema protegido".into(),
             ));
         }
 
@@ -1562,7 +1565,7 @@ impl ItemInterface {
             Ok(())
         } else {
             Err(zbus::fdo::Error::AccessDenied(
-                "el ítem es del almacén de cuentas".into(),
+                "el ítem pertenece a un esquema protegido".into(),
             ))
         }
     }
@@ -1834,16 +1837,17 @@ impl CollectionInterface {
     }
 
     ///
-    /// Una colección que guarda la clave del almacén la borra sólo el
-    /// sincronizador: borrarla se lleva la clave con todo lo demás, y es la
-    /// misma sustitución que `Item.Delete` por un camino más ancho.
+    /// Una colección que guarda ítems de esquemas protegidos la borra sólo
+    /// quien pasa las puertas de **todos** ellos: borrarla se lleva esas claves
+    /// con todo lo demás, y es la misma sustitución que `Item.Delete` por un
+    /// camino más ancho.
     async fn delete(
         &mut self,
         #[zbus(header)] cabecera: zbus::message::Header<'_>,
     ) -> Result<OwnedObjectPath, zbus::fdo::Error> {
         let negado = || {
             zbus::fdo::Error::AccessDenied(
-                "la colección guarda la clave del almacén de cuentas".into(),
+                "la colección guarda ítems de un esquema protegido".into(),
             )
         };
         // Una colección con secretos del portal no la borra nadie: se llevaría
@@ -4448,7 +4452,7 @@ pub(crate) mod tests {
 
         for ejecutable in parecidos {
             assert!(
-                !es_el_autorizado(ejecutable, ACCOUNTS_SYNC_EXECUTABLE),
+                !is_expected_executable(ejecutable, ACCOUNTS_SYNC_EXECUTABLE),
                 "`{ejecutable}` no es el sincronizador y no puede pasar por él"
             );
         }
@@ -4459,7 +4463,7 @@ pub(crate) mod tests {
     #[test]
     fn el_ejecutable_del_sincronizador_es_autorizado() {
         assert!(
-            es_el_autorizado(ACCOUNTS_SYNC_EXECUTABLE, ACCOUNTS_SYNC_EXECUTABLE),
+            is_expected_executable(ACCOUNTS_SYNC_EXECUTABLE, ACCOUNTS_SYNC_EXECUTABLE),
             "el sincronizador de cuentas tiene que poder leer el almacen"
         );
     }
@@ -4493,7 +4497,7 @@ pub(crate) mod tests {
         let aceptadas: Vec<&PathBuf> = rutas
             .iter()
             .filter(|ruta| {
-                es_el_autorizado(ruta.to_str().unwrap_or_default(), ACCOUNTS_SYNC_EXECUTABLE)
+                is_expected_executable(ruta.to_str().unwrap_or_default(), ACCOUNTS_SYNC_EXECUTABLE)
             })
             .collect();
 
@@ -4598,7 +4602,7 @@ pub(crate) mod tests {
     /// mismo antes y después del adorno.
     ///
     /// El reparto importa: el adorno se saca en `ejecutable_de`, no en
-    /// `es_el_autorizado`. Por eso esta prueba compone las dos como lo hace el
+    /// `is_expected_executable`. Por eso esta prueba compone las dos como lo hace el
     /// camino real —limpiar y después comparar— en vez de pasarle la ruta con
     /// el adorno a la puerta: si el adorno se sacara en el lugar equivocado, esta
     /// forma de probarlo no se enteraría.
@@ -4607,7 +4611,7 @@ pub(crate) mod tests {
         let con_adorno = format!("{ACCOUNTS_SYNC_EXECUTABLE}{SUFIJO_DE_BORRADO}");
 
         assert!(
-            es_el_autorizado(sin_adorno_de_borrado(&con_adorno), ACCOUNTS_SYNC_EXECUTABLE),
+            is_expected_executable(sin_adorno_de_borrado(&con_adorno), ACCOUNTS_SYNC_EXECUTABLE),
             "una actualización del sistema no le puede cerrar el almacen al sincronizador \
              legítimo: `pacman` borra el archivo mientras el proceso sigue corriendo, y el \
              kernel cuelga el adorno a la ruta"
@@ -4616,7 +4620,7 @@ pub(crate) mod tests {
         // siendo exacta contra la ruta entera, que es lo que impide que un
         // `...-sync.malicioso` pase por el sincronizador.
         assert!(
-            !es_el_autorizado(
+            !is_expected_executable(
                 sin_adorno_de_borrado(&format!(
                     "{ACCOUNTS_SYNC_EXECUTABLE}.malicioso{SUFIJO_DE_BORRADO}"
                 )),
@@ -4637,7 +4641,7 @@ pub(crate) mod tests {
 
     /// Una ruta que es **sólo** el adorno se queda vacía, y eso es lo correcto:
     /// el kernel no devuelve nunca una cosa así, y un `unwrap_or(ruta)` que
-    /// devolviera la ruta entera haría que `es_el_autorizado` comparara contra
+    /// devolviera la ruta entera haría que `is_expected_executable` comparara contra
     /// `" (deleted)"` —que no es el sincronizador, así que no abriría nada—.
     /// Se anota para que el cambio de `unwrap_or` a otra cosa se piense.
     #[test]
@@ -4709,7 +4713,7 @@ pub(crate) mod tests {
     // también el nombre, y ninguna de las dos condiciones alcanza sola.
     //
     // Va en dos capas porque fallan distinto. La de las pruebas puras llama a
-    // `es_el_sincronizador` con las respuestas ya resueltas: comprueba la regla.
+    // `owns_name_and_executable` con las respuestas ya resueltas: comprueba la regla.
     // La de abajo monta un bus falso detrás del cliente y deja que corra el
     // código de verdad: comprueba que la regla se llegue a formular. Un `if` que
     // devuelve `false` siempre compila, pasa todas las pruebas de la función que
@@ -4891,7 +4895,7 @@ pub(crate) mod tests {
     #[test]
     fn el_sincronizador_con_su_nombre_y_su_binario_entra() {
         assert!(
-            es_el_sincronizador(
+            owns_name_and_executable(
                 DEL_SINCRONIZADOR,
                 Some(DEL_SINCRONIZADOR),
                 Some(ACCOUNTS_SYNC_EXECUTABLE),
@@ -4911,7 +4915,7 @@ pub(crate) mod tests {
     /// cualquiera que llegue primero; el ejecutable no se finge.
     #[test]
     fn sin_ejecutable_no_entra_ni_quien_tiene_el_nombre() {
-        assert!(!es_el_sincronizador(
+        assert!(!owns_name_and_executable(
             DEL_SINCRONIZADOR,
             Some(DEL_SINCRONIZADOR),
             None,
@@ -4929,7 +4933,7 @@ pub(crate) mod tests {
             "/usr/bin/vasak-accounts-sync.malicioso",
         ] {
             assert!(
-                !es_el_sincronizador(
+                !owns_name_and_executable(
                     DEL_SINCRONIZADOR,
                     Some(DEL_SINCRONIZADOR),
                     Some(otro),
@@ -4944,13 +4948,13 @@ pub(crate) mod tests {
     /// ser la que tiene tomado el nombre.
     #[test]
     fn el_binario_bueno_sin_el_nombre_no_entra() {
-        assert!(!es_el_sincronizador(
+        assert!(!owns_name_and_executable(
             DE_UN_IMPOSTOR,
             Some(DEL_SINCRONIZADOR),
             Some(ACCOUNTS_SYNC_EXECUTABLE),
             ACCOUNTS_SYNC_EXECUTABLE
         ));
-        assert!(!es_el_sincronizador(
+        assert!(!owns_name_and_executable(
             DE_UN_IMPOSTOR,
             None,
             Some(ACCOUNTS_SYNC_EXECUTABLE),

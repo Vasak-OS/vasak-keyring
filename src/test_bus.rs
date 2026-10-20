@@ -41,6 +41,9 @@ pub struct BusFalso {
     /// con el que contesta un bus que no conoce la conexión.
     pid: Option<u32>,
     preguntados: Arc<Mutex<Vec<String>>>,
+    /// Dueño distinto por nombre, para las pruebas con más de una puerta. Un
+    /// nombre que no está acá cae en `duenia`.
+    por_nombre: std::collections::HashMap<String, String>,
 }
 
 impl BusFalso {
@@ -49,7 +52,18 @@ impl BusFalso {
             duenia: duenia.map(str::to_owned),
             pid,
             preguntados: Arc::new(Mutex::new(Vec::new())),
+            por_nombre: std::collections::HashMap::new(),
         }
+    }
+
+    /// Un bus donde cada nombre tiene su dueño y los demás no tienen ninguno.
+    pub fn con_duenios(duenios: &[(&str, &str)], pid: Option<u32>) -> Self {
+        let mut bus = Self::nuevo(None, pid);
+        bus.por_nombre = duenios
+            .iter()
+            .map(|(nombre, duenio)| ((*nombre).to_owned(), (*duenio).to_owned()))
+            .collect();
+        bus
     }
 
     /// El registro de los nombres preguntados, para leerlo después de haber
@@ -64,7 +78,7 @@ impl BusFalso {
     #[zbus(name = "GetNameOwner")]
     async fn duenia_de(&self, nombre: &str) -> Result<String, zbus::fdo::Error> {
         self.preguntados.lock().await.push(nombre.to_owned());
-        match &self.duenia {
+        match self.por_nombre.get(nombre).or(self.duenia.as_ref()) {
             Some(duenia) => Ok(duenia.clone()),
             // El error con el que un bus de verdad contesta que nadie tiene el
             // nombre. Es una respuesta, no una pregunta que salió mal.

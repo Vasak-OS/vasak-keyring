@@ -472,43 +472,79 @@ fn effectively_locked(collection_locked: bool) -> bool {
 /// Los ítems con este esquema en `xdg:schema` sólo se le entregan al
 /// sincronizador: la conexión que tenga tomado `ar.net.vasak.os.AccountsSync` en
 /// el bus **y** cuyo ejecutable sea `/usr/bin/vasak-accounts-sync`. Ver
-/// [`es_el_sincronizador`].
-const ESQUEMA_PROTEGIDO: &str = "ar.net.vasak.os.AccountsStore";
+/// [`ACCOUNTS_SYNC_GUARD`].
+const ACCOUNTS_STORE_SCHEMA: &str = "ar.net.vasak.os.AccountsStore";
 
 /// El esquema que protege la clave privada S/MIME de una identidad.
 ///
-/// Misma puerta que [`ESQUEMA_PROTEGIDO`] —sólo el sincronizador, por nombre de
-/// bus y ejecutable—, pero esquema propio: la clave S/MIME es material distinto
-/// de la clave del almacén, y separarla deja ponerle otra retención o enumerarla
-/// aparte sin tocar la del almacén. El servicio la guarda y la lee con el Secret
-/// Service (`CreateItem` con `replace`, `SearchItems`/`GetSecret`); el manejo de
-/// la clave y la cripto S/MIME viven en `vasak-accounts-sync`, no acá. Ver
-/// `vasak-mail#78`.
+/// Misma puerta que [`ACCOUNTS_STORE_SCHEMA`] —sólo el sincronizador, por nombre
+/// de bus y ejecutable—, pero esquema propio: la clave S/MIME es material
+/// distinto de la clave del almacén, y separarla deja ponerle otra retención o
+/// enumerarla aparte sin tocar la del almacén. El servicio la guarda y la lee con
+/// el Secret Service (`CreateItem` con `replace`, `SearchItems`/`GetSecret`); el
+/// manejo de la clave y la cripto S/MIME viven en `vasak-accounts-sync`, no acá.
+/// Ver `vasak-mail#78`.
 const SMIME_SCHEMA: &str = "ar.net.vasak.os.SmimeKey";
 
-/// Los esquemas cuyos ítems sólo toca el sincronizador.
+/// El esquema de los secretos de vasak-assistant (Lince).
 ///
-/// La puerta es por **pertenencia** a este conjunto y no por igualdad a una sola
-/// constante: cada esquema que se agregue acá queda con la misma protección
-/// —entrega, escritura, borrado y descripción restringidos al ejecutable
-/// autorizado— sin repetir la regla en cada sitio que la consulta.
-const PROTECTED_SCHEMAS: &[&str] = &[ESQUEMA_PROTEGIDO, SMIME_SCHEMA];
+/// Cubre la clave del proveedor de modelo (`purpose=provider`, buscada también
+/// por `url`) y la llave de la memoria (`purpose=memory`). Sólo los toca
+/// vasak-assistant, por nombre de bus y ejecutable: antes la clave del proveedor
+/// era un ítem común que cualquier proceso de la sesión podía leer o plantar
+/// (Vasak-OS/vasak-keyring#55).
+const ASSISTANT_SCHEMA: &str = "ar.net.vasak.os.Assistant";
 
-const ATRIBUTO_ESQUEMA: &str = "xdg:schema";
-const EJECUTABLE_AUTORIZADO: &str = "/usr/bin/vasak-accounts-sync";
+/// Quién puede tocar los ítems de un esquema protegido: la conexión que tenga
+/// tomado `bus_name` en el bus de sesión **y** cuyo ejecutable sea `executable`.
+///
+/// Ninguna de las dos condiciones alcanza sola: un nombre lo toma cualquiera que
+/// llegue primero, y el ejecutable es lo que no se finge. Ver
+/// [`caller_is_authorized`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SchemaGuard {
+    executable: &'static str,
+    bus_name: &'static str,
+}
+
+/// El ejecutable del sincronizador de cuentas.
+const ACCOUNTS_SYNC_EXECUTABLE: &str = "/usr/bin/vasak-accounts-sync";
 
 /// El nombre con el que el sincronizador se presenta en el bus de sesión.
-///
-/// Una de las dos condiciones de [`es_el_sincronizador`], y **no alcanza sola**:
-/// el sincronizador lo toma al arrancar, pero un nombre lo puede tomar cualquiera
-/// que llegue primero, y el servicio viene `disabled`, así que casi siempre está
-/// libre. Por eso el ejecutable también se exige.
 ///
 /// El sincronizador lo pide **después** de publicar el almacén
 /// (`sync/src/main.rs`, `StoreService::start` antes del `request_name`). Hoy no
 /// pide la clave en ese intervalo —las cuentas se abren con `accounts_listed`,
 /// que viene después—, pero si algún día la pidiera, este control se la negaría.
-const NOMBRE_DEL_SINCRONIZADOR: &str = "ar.net.vasak.os.AccountsSync";
+const ACCOUNTS_SYNC_BUS_NAME: &str = "ar.net.vasak.os.AccountsSync";
+
+/// La puerta del almacén de cuentas y de la clave S/MIME.
+const ACCOUNTS_SYNC_GUARD: SchemaGuard = SchemaGuard {
+    executable: ACCOUNTS_SYNC_EXECUTABLE,
+    bus_name: ACCOUNTS_SYNC_BUS_NAME,
+};
+
+/// La puerta de los secretos de vasak-assistant.
+const ASSISTANT_GUARD: SchemaGuard = SchemaGuard {
+    executable: "/usr/bin/vasak-assistant",
+    bus_name: "ar.net.vasak.os.Assistant",
+};
+
+/// Los esquemas protegidos y la puerta de cada uno.
+///
+/// La puerta es por **pertenencia** a esta tabla y no por igualdad a una sola
+/// constante: cada esquema que se agregue acá queda con la misma protección
+/// —entrega, escritura, borrado y descripción restringidos a su ejecutable—
+/// sin repetir la regla en cada sitio que la consulta. Y es **por esquema**: el
+/// autorizado de uno no toca los ítems de otro, así que vasak-assistant no lee
+/// el almacén de cuentas ni el sincronizador la clave del asistente.
+const PROTECTED_SCHEMAS: &[(&str, SchemaGuard)] = &[
+    (ACCOUNTS_STORE_SCHEMA, ACCOUNTS_SYNC_GUARD),
+    (SMIME_SCHEMA, ACCOUNTS_SYNC_GUARD),
+    (ASSISTANT_SCHEMA, ASSISTANT_GUARD),
+];
+
+const ATRIBUTO_ESQUEMA: &str = "xdg:schema";
 
 /// Obtiene el PID del proceso que envió el mensaje D-Bus.
 ///
@@ -529,7 +565,6 @@ async fn pid_del_emisor(conn: &Connection, cabecera: &zbus::message::Header<'_>)
     respuesta.body().deserialize().ok()
 }
 
-/// Obtiene la ruta del ejecutable a partir del PID.
 /// La ruta del ejecutable de un proceso, sin el adorno de los borrados.
 ///
 /// `readlink /proc/<pid>/exe` no devuelve la ruta del archivo: devuelve la del
@@ -538,19 +573,22 @@ async fn pid_del_emisor(conn: &Connection, cabecera: &zbus::message::Header<'_>)
 /// final. Comprobado sobre un binario borrado en caliente: `readlink` da
 /// `/tmp/x/miapp (deleted)`.
 ///
-/// Sin quitarlo, una actualización del sistema con la unidad del sincronizador
-/// corriendo le negaría el acceso al proceso **legítimo** en cada `GetSecret`
-/// hasta que se reinicie la unidad, y el síntoma —«el almacén de cuentas se
-/// rompió después de actualizar»— no lleva a ninguna parte. Falla cerrado, que
+/// Sin quitarlo, una actualización del sistema con el autorizado de una puerta
+/// corriendo —el sincronizador, el asistente— le negaría el acceso al proceso
+/// **legítimo** en cada `GetSecret` hasta que se reinicie, y el síntoma —«el
+/// almacén de cuentas se rompió después de actualizar»— no lleva a ninguna
+/// parte. Falla cerrado, que
 /// es lo correcto; lo que no es correcto es que falle.
 ///
 /// El sufijo se quita y no se recorta: la comparación de abajo sigue siendo
 /// exacta contra la ruta entera, así que quitarlo no abre la puerta a que un
-/// `/usr/bin/vasak-accounts-sync.malicioso` passe por el sincronizador.
+/// `/usr/bin/vasak-accounts-sync.malicioso` pase por el autorizado.
 ///
 /// El `Err` es el motivo, y no se traga: un `.ok()` acá es lo que dejó a la
 /// puerta rechazando al sincronizador sin que nada lo dijera, cuando la unidad
-/// tenía un namespace de usuario propio y la lectura daba `EACCES`.
+/// tenía un namespace de usuario propio y la lectura daba `EACCES`. Lo mismo
+/// pasa con un autorizado que se marca no volcable (`PR_SET_DUMPABLE=0`): para
+/// el llavero, sin `CAP_SYS_PTRACE`, su `/proc/<pid>/exe` da `EACCES`.
 fn ejecutable_de(pid: u32) -> Result<String, std::io::Error> {
     std::fs::read_link(format!("/proc/{pid}/exe"))
         .map(|r| r.to_string_lossy().into_owned())
@@ -559,8 +597,8 @@ fn ejecutable_de(pid: u32) -> Result<String, std::io::Error> {
 
 /// Saca el `" (deleted)"` que el kernel le cuelga a un inodo sin archivo.
 ///
-/// Va aparte de `ejecutable_de` por la misma razón que `es_el_autorizado` va
-/// aparte de `autorizado_para_esquema_protegido`: la regla se prueba sola, sin
+/// Va aparte de `ejecutable_de` por la misma razón que `is_expected_executable` va
+/// aparte de `caller_is_authorized`: la regla se prueba sola, sin
 /// un proceso que haya que arrancar ni un `/proc` que haya que existido. Que la
 /// cadena con el adorno llegue como llega, eso lo comprueba la otra prueba, que
 /// sí arranca un proceso de verdad.
@@ -571,48 +609,82 @@ fn sin_adorno_de_borrado(ruta: &str) -> &str {
 /// Lo que le cuelga el kernel a la ruta de un inodo que ya no tiene archivo.
 const SUFIJO_DE_BORRADO: &str = " (deleted)";
 
-/// Verifica si un ítem tiene un esquema protegido.
-fn es_esquema_protegido(item: &ItemInfo) -> bool {
-    atributos_protegidos(&item.attributes)
+/// La puerta del esquema protegido de un ítem, si lo tiene.
+fn item_guard(item: &ItemInfo) -> Option<SchemaGuard> {
+    attributes_guard(&item.attributes)
 }
 
-/// Si una lista de atributos lleva el esquema protegido.
+/// La puerta del esquema protegido que lleva una lista de atributos, si lleva
+/// uno.
 ///
-/// Aparte de [`es_esquema_protegido`] porque `CreateItem` la necesita sobre los
-/// atributos que **llegan**, antes de que haya un ítem.
-fn atributos_protegidos(atributos: &HashMap<String, String>) -> bool {
-    atributos
-        .get(ATRIBUTO_ESQUEMA)
-        .is_some_and(|s| PROTECTED_SCHEMAS.contains(&s.as_str()))
+/// Aparte de [`item_guard`] porque `CreateItem` la necesita sobre los atributos
+/// que **llegan**, antes de que haya un ítem.
+fn attributes_guard(atributos: &HashMap<String, String>) -> Option<SchemaGuard> {
+    let esquema = atributos.get(ATRIBUTO_ESQUEMA)?;
+    PROTECTED_SCHEMAS
+        .iter()
+        .find(|(protegido, _)| protegido == esquema)
+        .map(|(_, guard)| *guard)
 }
 
-/// Si quien llama puede tocar lo que pide.
+/// Las puertas que quien llama pasa, de entre las que pide el pedido.
 ///
-/// `protegido` es si el pedido toca algún ítem del almacén —leerlo,
-/// describirlo, reemplazarlo, borrarlo o crear uno con su esquema—. Si no toca
-/// ninguno, sí, y sin preguntarle nada al bus: la puerta cuesta dos idas y
-/// vueltas y una lectura de `/proc`, y cada contraseña del navegador no tiene
-/// por qué pagarlas.
+/// `needed` son las puertas de los ítems protegidos que el pedido toca —leerlos,
+/// describirlos, reemplazarlos, borrarlos o crear uno con su esquema—, con
+/// repetidas si las hay. Si no toca ninguno, no se le pregunta nada al bus: la
+/// puerta cuesta dos idas y vueltas y una lectura de `/proc` por esquema, y cada
+/// contraseña del navegador no tiene por qué pagarlas.
+///
+/// Cada puerta se mira por separado: quien pasa la del asistente no pasa por eso
+/// la del almacén. El estado se toma un momento para copiar los ejecutables
+/// esperados y se suelta antes de ir al bus.
+async fn authorized_guards(
+    conn: &Connection,
+    cabecera: &zbus::message::Header<'_>,
+    state: &Mutex<KeyringState>,
+    needed: &[SchemaGuard],
+) -> Vec<SchemaGuard> {
+    if needed.is_empty() {
+        return Vec::new();
+    }
+    let esperados: Vec<(SchemaGuard, String)> = {
+        let state = state.lock().await;
+        let mut distintas: Vec<SchemaGuard> = Vec::new();
+        for guard in needed {
+            if !distintas.contains(guard) {
+                distintas.push(*guard);
+            }
+        }
+        distintas
+            .into_iter()
+            .map(|guard| (guard, state.expected_executable(guard)))
+            .collect()
+    };
+    let mut pasadas = Vec::new();
+    for (guard, esperado) in esperados {
+        if caller_is_authorized(conn, cabecera, guard.bus_name, &esperado).await {
+            pasadas.push(guard);
+        }
+    }
+    pasadas
+}
+
+/// Si quien llama pasa **todas** las puertas que pide el pedido. Sin puertas,
+/// sí, y sin ir al bus.
 ///
 /// Es la misma puerta que protege `GetSecret` desde Vasak-OS/vasak-keyring#24.
 /// Leer la clave era la mitad: con `CreateItem`, `SetSecret` o los borrados, un
 /// proceso cualquiera **elegía** la clave con la que se abre la base, y con
 /// `SearchItems` y `Attributes` encontraba el ítem para hacerlo
 /// (Vasak-OS/vasak-keyring#29 y #30).
-///
-/// El estado se toma un momento para copiar el ejecutable esperado y se suelta
-/// antes de ir al bus.
-async fn puede_tocar_el_almacen(
+async fn passes_guards(
     conn: &Connection,
     cabecera: &zbus::message::Header<'_>,
     state: &Mutex<KeyringState>,
-    protegido: bool,
+    needed: &[SchemaGuard],
 ) -> bool {
-    if !protegido {
-        return true;
-    }
-    let esperado = state.lock().await.ejecutable_del_sincronizador();
-    autorizado_para_esquema_protegido(conn, cabecera, &esperado).await
+    let pasadas = authorized_guards(conn, cabecera, state, needed).await;
+    needed.iter().all(|guard| pasadas.contains(guard))
 }
 
 /// Si un ítem coincide con lo que se busca: tiene cada atributo pedido con ese
@@ -623,31 +695,33 @@ fn coincide(item: &ItemInfo, buscados: &HashMap<String, String>) -> bool {
         .all(|(k, v)| item.attributes.get(k) == Some(v))
 }
 
-/// Si una colección guarda algún ítem del almacén.
-fn coleccion_protegida(state: &KeyringState, ruta: &str) -> bool {
-    state.collections.get(ruta).is_some_and(|col| {
-        col.items
-            .iter()
-            .any(|ip| state.items.get(ip).is_some_and(es_esquema_protegido))
-    })
+/// Las puertas de los ítems protegidos que guarda una colección, con
+/// repetidas. Vacía si no guarda ninguno o no existe.
+fn collection_guards(state: &KeyringState, ruta: &str) -> Vec<SchemaGuard> {
+    state
+        .collections
+        .get(ruta)
+        .map(|col| {
+            col.items
+                .iter()
+                .filter_map(|ip| state.items.get(ip).and_then(item_guard))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-/// Si el ítem de esa ruta es del almacén. Uno que no existe no lo es: el que
-/// llama recibe el mismo «no encontrado» de siempre.
-async fn ruta_protegida(state: &Mutex<KeyringState>, ruta: &str) -> bool {
-    state
-        .lock()
-        .await
-        .items
-        .get(ruta)
-        .is_some_and(es_esquema_protegido)
+/// La puerta del ítem de esa ruta, si es protegido. Uno que no existe no lo es:
+/// el que llama recibe el mismo «no encontrado» de siempre.
+async fn path_guard(state: &Mutex<KeyringState>, ruta: &str) -> Option<SchemaGuard> {
+    state.lock().await.items.get(ruta).and_then(item_guard)
 }
 
 /// Si a quien pregunta se le puede entregar este ítem.
 ///
 /// Es la decisión sola, sin bus ni async, a propósito. El «quién pregunta» ya
-/// está resuelto para cuando se la llama: es el `bool` que devuelve
-/// [`autorizado_para_esquema_protegido`].
+/// está resuelto para cuando se la llama: `autorizadas` son las puertas que pasó,
+/// lo que devuelve [`authorized_guards`]. Un ítem protegido se entrega sólo si
+/// su puerta está entre ésas: haber pasado la de otro esquema no alcanza.
 ///
 /// Una regla de dos líneas tiene que poder probarse sin montar nada, y por eso
 /// vive acá y no repartida en los dos métodos que la usan: los dos la llaman,
@@ -655,55 +729,58 @@ async fn ruta_protegida(state: &Mutex<KeyringState>, ruta: &str) -> bool {
 /// romper sin que se rompa esta, así que las pruebas de las dos cosas tienen que
 /// poder fallar por separado.
 ///
-/// Un secreto del portal no se le entrega a nadie, autorizado o no: el
-/// `autorizado` es el del almacén de cuentas, y el portal no tiene a nadie
-/// autorizado en el bus (Vasak-OS/vasak-keyring#33). Va acá y no sólo en los
-/// métodos porque es la segunda mirada, la que se hace con el candado tomado.
-fn access_allowed(item: &ItemInfo, autorizado: bool) -> bool {
-    !is_portal_item(item) && (!es_esquema_protegido(item) || autorizado)
+/// Un secreto del portal no se le entrega a nadie, autorizado o no: el portal no
+/// tiene a nadie autorizado en el bus (Vasak-OS/vasak-keyring#33). Va acá y no
+/// sólo en los métodos porque es la segunda mirada, la que se hace con el
+/// candado tomado.
+fn access_allowed(item: &ItemInfo, autorizadas: &[SchemaGuard]) -> bool {
+    !is_portal_item(item) && item_guard(item).is_none_or(|guard| autorizadas.contains(&guard))
 }
 
-/// Verifica si el proceso que llama está autorizado para acceder a un esquema protegido.
+/// Si el proceso que llama pasa la puerta de un esquema protegido.
 ///
-/// Sólo el sincronizador puede leer ítems con el esquema protegido, y hacen
-/// falta las dos cosas de [`es_el_sincronizador`]: que la conexión que llama sea
-/// la dueña de `ar.net.vasak.os.AccountsSync`, y que el ejecutable de su pid
-/// sea `esperado`. Cualquier cosa que no se pueda averiguar es un no.
+/// Hacen falta las dos cosas de [`owns_name_and_executable`]: que la conexión
+/// que llama sea la dueña de `bus_name`, y que el ejecutable de su pid sea
+/// `esperado`. Cada esquema tiene su puerta, y pasar una no dice nada de las
+/// otras: quien llama a esta función ya eligió cuál mira. Cualquier cosa que no se pueda averiguar —tampoco un
+/// `/proc/<pid>/exe` que no se deja leer— es un no.
 ///
-/// `esperado` es siempre [`EJECUTABLE_AUTORIZADO`] fuera de las pruebas: sale de
-/// [`KeyringState::ejecutable_del_sincronizador`], que no se cambia desde ningún
-/// lado del demonio.
+/// `bus_name` y `esperado` salen de la [`SchemaGuard`] del esquema en
+/// [`PROTECTED_SCHEMAS`]; `esperado` es siempre su `executable` fuera de las
+/// pruebas: lo resuelve [`KeyringState::expected_executable`], que no se cambia
+/// desde ningún lado del demonio.
 ///
 /// **Lo que esto autentica es el binario, no a quien lo ejecuta.** Un proceso del
-/// mismo UID al que el sincronizador le pase su conexión D-Bus la usa sin
-/// problema —el bus devuelve el PID de quien *abrió* la conexión, no el de quien
-/// escribe— y el código inyectado dentro del propio sincronizador pasa el
-/// control de la misma manera. Ninguna comprobación más sobre `/proc` cierra
-/// esos dos casos: hacen falta un UID propio o un sandbox. Está anotado igual en
-/// el `README.md`, y es la misma frontera que ya tenían `vasak-permissions` y el
+/// mismo UID al que el autorizado le pase su conexión D-Bus la usa sin problema
+/// —el bus devuelve el PID de quien *abrió* la conexión, no el de quien
+/// escribe— y el código inyectado dentro del propio autorizado pasa el control
+/// de la misma manera. Ninguna comprobación más sobre `/proc` cierra esos dos
+/// casos: hacen falta un UID propio o un sandbox. Está anotado igual en el
+/// `README.md`, y es la misma frontera que ya tenían `vasak-permissions` y el
 /// control del portal.
-async fn autorizado_para_esquema_protegido(
+async fn caller_is_authorized(
     conn: &Connection,
     cabecera: &zbus::message::Header<'_>,
+    bus_name: &str,
     esperado: &str,
 ) -> bool {
     let emisor = match cabecera.sender() {
         Some(emisor) => emisor.as_str().to_owned(),
         None => {
             eprintln!(
-                "vasak-keyring: se rechaza el acceso a un ítem del almacén que vino sin emisor \
-                 en la cabecera"
+                "vasak-keyring: se rechaza el acceso a un ítem protegido por {bus_name} que vino \
+                 sin emisor en la cabecera"
             );
             return false;
         }
     };
 
-    let duenia = match dueno_de(conn, NOMBRE_DEL_SINCRONIZADOR).await {
+    let duenia = match dueno_de(conn, bus_name).await {
         Ok(duenia) => duenia,
         Err(e) => {
             eprintln!(
-                "vasak-keyring: se rechaza el acceso a un ítem del almacén de {emisor}: no se \
-                 pudo preguntar al bus quién tiene {NOMBRE_DEL_SINCRONIZADOR}: {e}"
+                "vasak-keyring: se rechaza el acceso a un ítem protegido de {emisor}: no se pudo \
+                 preguntar al bus quién tiene {bus_name}: {e}"
             );
             return false;
         }
@@ -713,35 +790,35 @@ async fn autorizado_para_esquema_protegido(
         Ok(ejecutable) => ejecutable,
         Err(motivo) => {
             // Sin ejecutable no hay puerta: el nombre solo no alcanza. Si esto
-            // aparece con el sincronizador de verdad, lo primero es mirar si la
-            // unidad volvió a tener un namespace de usuario propio.
+            // aparece con el autorizado de verdad, lo primero es mirar si su
+            // unidad o la del llavero volvió a tener un namespace de usuario
+            // propio, o si el autorizado se marcó como no volcable.
             eprintln!(
-                "vasak-keyring: se rechaza el acceso a un ítem del almacén de {emisor}: \
-                 {motivo}, y sin el ejecutable el nombre no alcanza"
+                "vasak-keyring: se rechaza el acceso a un ítem protegido por {bus_name} de \
+                 {emisor}: {motivo}, y sin el ejecutable el nombre no alcanza"
             );
             return false;
         }
     };
 
-    if es_el_sincronizador(&emisor, duenia.as_deref(), Some(&ejecutable), esperado) {
+    if owns_name_and_executable(&emisor, duenia.as_deref(), Some(&ejecutable), esperado) {
         return true;
     }
 
     if duenia.as_deref() == Some(emisor.as_str()) {
         eprintln!(
-            "vasak-keyring: se rechaza el acceso a un ítem del almacén de {emisor}: tiene el \
-             nombre del sincronizador pero su ejecutable es {ejecutable} y no {esperado}"
+            "vasak-keyring: se rechaza el acceso a un ítem protegido de {emisor}: tiene \
+             {bus_name} pero su ejecutable es {ejecutable} y no {esperado}"
         );
     } else {
         match duenia.as_deref() {
             Some(duenia) => eprintln!(
-                "vasak-keyring: se rechaza el acceso a un ítem del almacén de {emisor}: no es el \
-                 sincronizador, y {NOMBRE_DEL_SINCRONIZADOR} lo tiene {duenia}"
+                "vasak-keyring: se rechaza el acceso a un ítem protegido de {emisor}: \
+                 {bus_name} lo tiene {duenia}"
             ),
             None => eprintln!(
-                "vasak-keyring: se rechaza el acceso a un ítem del almacén de {emisor}: en el \
-                 bus nadie tiene {NOMBRE_DEL_SINCRONIZADOR}, así que el sincronizador no está \
-                 andando"
+                "vasak-keyring: se rechaza el acceso a un ítem protegido de {emisor}: en el bus \
+                 nadie tiene {bus_name}, así que su autorizado no está andando"
             ),
         }
     }
@@ -773,36 +850,36 @@ async fn ejecutable_del_emisor(
         .map_err(|e| format!("no se pudo leer /proc/{pid}/exe: {e}"))
 }
 
-/// Si la conexión que llama es la del sincronizador.
+/// Si la conexión que llama es la autorizada por una puerta.
 ///
 /// Dos condiciones y hacen falta las dos:
 ///
-/// 1. La conexión tiene que tener tomado `ar.net.vasak.os.AccountsSync`. La
-///    contesta el bus.
+/// 1. La conexión tiene que tener tomado el `bus_name` de la puerta
+///    (`duenia` es quién lo tiene). La contesta el bus.
 /// 2. El ejecutable de su pid tiene que ser `esperado`. Un `None` —no se pudo
 ///    leer— es un no: el nombre solo lo puede tener cualquiera que haya llegado
 ///    primero, y el ejecutable es lo que no se puede fingir.
-fn es_el_sincronizador(
+fn owns_name_and_executable(
     emisor: &str,
     duenia: Option<&str>,
     ejecutable: Option<&str>,
     esperado: &str,
 ) -> bool {
-    duenia == Some(emisor) && ejecutable.is_some_and(|ruta| es_el_autorizado(ruta, esperado))
+    duenia == Some(emisor) && ejecutable.is_some_and(|ruta| is_expected_executable(ruta, esperado))
 }
 
-/// Si esta ruta de ejecutable es la del sincronizador.
+/// Si esta ruta de ejecutable es la que espera la puerta.
 ///
 /// La comparación es exacta y no por prefijo, y eso es el punto: con un
 /// `starts_with`, `/usr/bin/vasak-accounts-sync.malicioso` —o cualquier
-/// `...-sync2`— pasaría por el sincronizador. No hace falta ser root para
+/// `...-sync2`, o `/usr/bin/vasak-assistant2`— pasaría por el autorizado. No hace falta ser root para
 /// exploitear eso, alcanza con poder dejar un archivo en un directorio que esté
 /// en el `PATH` del atacante... salvo que el camino esté completo, que es
 /// justamente por lo que se compara contra la ruta entera y no contra el
-/// nombre. Separáda de `autorizado_para_esquema_protegido` para que se pueda
+/// nombre. Separáda de `caller_is_authorized` para que se pueda
 /// probar sin un bus: la de acá es la regla, y una regla que no se prueba sola
 /// termina cediendo en el `if` de arriba.
-fn es_el_autorizado(ejecutable: &str, esperado: &str) -> bool {
+fn is_expected_executable(ejecutable: &str, esperado: &str) -> bool {
     ejecutable == esperado
 }
 
@@ -1147,11 +1224,11 @@ pub struct KeyringState {
     next_session: u64,
     next_collection: u64,
     next_item: u64,
-    /// El ejecutable que tiene que tener quien lee el almacén cifrado. Siempre
-    /// [`EJECUTABLE_AUTORIZADO`]: sólo las pruebas lo cambian, para poder
+    /// Ejecutables que reemplazan al de una [`SchemaGuard`], por el `executable`
+    /// de producción. Siempre vacío: sólo las pruebas lo llenan, para poder
     /// recorrer el camino que acepta con un binario que exista en la máquina que
     /// las corre.
-    ejecutable_del_sincronizador: String,
+    executable_overrides: HashMap<&'static str, String>,
 }
 
 impl KeyringState {
@@ -1164,13 +1241,17 @@ impl KeyringState {
             next_session: 0,
             next_collection: 0,
             next_item: 0,
-            ejecutable_del_sincronizador: EJECUTABLE_AUTORIZADO.to_owned(),
+            executable_overrides: HashMap::new(),
         }
     }
 
-    /// Ver el campo del mismo nombre.
-    fn ejecutable_del_sincronizador(&self) -> String {
-        self.ejecutable_del_sincronizador.clone()
+    /// El ejecutable que tiene que tener quien pasa `guard`. Ver
+    /// `executable_overrides`.
+    fn expected_executable(&self, guard: SchemaGuard) -> String {
+        self.executable_overrides
+            .get(guard.executable)
+            .cloned()
+            .unwrap_or_else(|| guard.executable.to_owned())
     }
 
     /// Reserves the next free item id.
@@ -1320,23 +1401,20 @@ impl ItemInterface {
         // contraseña que lee el navegador.
         //
         // Entre las dos tomas del lock el ítem puede cambiar. Si pasa a ser
-        // protegido, `autorizado` quedó en `false` y se niega: falla cerrado.
+        // protegido por otra puerta que la que se pasó, se niega: falla cerrado.
         //
         // Un secreto del portal se niega antes que nada y sin ir al bus: no hay
         // nadie a quien preguntar por él (#33).
-        let (protegido, esperado) = {
+        let guard = {
             let state = self.state.lock().await;
             let item = state.items.get(&self.path);
             if item.is_some_and(is_portal_item) {
                 return Err(SecretError::AccessDenied);
             }
-            (
-                item.is_some_and(es_esquema_protegido),
-                state.ejecutable_del_sincronizador(),
-            )
+            item.and_then(item_guard)
         };
-        let autorizado =
-            protegido && autorizado_para_esquema_protegido(&self.conn, &cabecera, &esperado).await;
+        let autorizadas =
+            authorized_guards(&self.conn, &cabecera, &self.state, guard.as_slice()).await;
 
         let state = self.state.lock().await;
         // Never release a secret from a locked collection.
@@ -1352,7 +1430,7 @@ impl ItemInterface {
             .get(&self.path)
             .ok_or_else(|| dbus_err("item not found"))?;
 
-        if !access_allowed(item, autorizado) {
+        if !access_allowed(item, &autorizadas) {
             return Err(SecretError::AccessDenied);
         }
 
@@ -1385,8 +1463,8 @@ impl ItemInterface {
         if is_portal_path(&self.state, &self.path).await {
             return Err(SecretError::AccessDenied);
         }
-        let protegido = ruta_protegida(&self.state, &self.path).await;
-        if !puede_tocar_el_almacen(&self.conn, &cabecera, &self.state, protegido).await {
+        let guard = path_guard(&self.state, &self.path).await;
+        if !passes_guards(&self.conn, &cabecera, &self.state, guard.as_slice()).await {
             return Err(SecretError::AccessDenied);
         }
         escritura_bloqueada()?;
@@ -1433,10 +1511,10 @@ impl ItemInterface {
         if is_portal_path(&self.state, &self.path).await {
             return Err(portal_denied());
         }
-        let protegido = ruta_protegida(&self.state, &self.path).await;
-        if !puede_tocar_el_almacen(&self.conn, &cabecera, &self.state, protegido).await {
+        let guard = path_guard(&self.state, &self.path).await;
+        if !passes_guards(&self.conn, &cabecera, &self.state, guard.as_slice()).await {
             return Err(zbus::fdo::Error::AccessDenied(
-                "el ítem es del almacén de cuentas".into(),
+                "el ítem pertenece a un esquema protegido".into(),
             ));
         }
 
@@ -1476,18 +1554,18 @@ impl ItemInterface {
         if is_portal_path(&self.state, &self.path).await {
             return Err(portal_denied());
         }
-        if !ruta_protegida(&self.state, &self.path).await {
+        let Some(guard) = path_guard(&self.state, &self.path).await else {
             return Ok(());
-        }
+        };
         let autorizado = match cabecera {
-            Some(cabecera) => puede_tocar_el_almacen(&self.conn, cabecera, &self.state, true).await,
+            Some(cabecera) => passes_guards(&self.conn, cabecera, &self.state, &[guard]).await,
             None => false,
         };
         if autorizado {
             Ok(())
         } else {
             Err(zbus::fdo::Error::AccessDenied(
-                "el ítem es del almacén de cuentas".into(),
+                "el ítem pertenece a un esquema protegido".into(),
             ))
         }
     }
@@ -1599,7 +1677,7 @@ impl CollectionInterface {
         #[zbus(header)] cabecera: zbus::message::Header<'_>,
         attributes: HashMap<String, String>,
     ) -> Result<Vec<OwnedObjectPath>, zbus::fdo::Error> {
-        let encontrados: Vec<(String, bool)> = {
+        let encontrados: Vec<(String, Option<SchemaGuard>)> = {
             let state = self.state.lock().await;
             state
                 .collections
@@ -1614,21 +1692,19 @@ impl CollectionInterface {
                             if is_portal_item(item) {
                                 return None;
                             }
-                            coincide(item, &attributes)
-                                .then(|| (ip.clone(), es_esquema_protegido(item)))
+                            coincide(item, &attributes).then(|| (ip.clone(), item_guard(item)))
                         })
                         .collect()
                 })
                 .unwrap_or_default()
         };
 
-        let alguno_protegido = encontrados.iter().any(|(_, protegido)| *protegido);
-        let autorizado =
-            puede_tocar_el_almacen(&self.conn, &cabecera, &self.state, alguno_protegido).await;
+        let guards: Vec<SchemaGuard> = encontrados.iter().filter_map(|(_, g)| *g).collect();
+        let autorizadas = authorized_guards(&self.conn, &cabecera, &self.state, &guards).await;
 
         Ok(encontrados
             .into_iter()
-            .filter(|(_, protegido)| autorizado || !protegido)
+            .filter(|(_, guard)| guard.is_none_or(|g| autorizadas.contains(&g)))
             .map(|(ip, _)| owned_path_try(&ip).unwrap_or_else(|_| owned_path("/")))
             .collect())
     }
@@ -1675,8 +1751,8 @@ impl CollectionInterface {
 
         // Quién pide, antes que si se puede escribir: a quien no puede tocar el
         // almacén no le importa si el llavero está abierto.
-        let protegido = atributos_protegidos(&attributes);
-        if !puede_tocar_el_almacen(&self.conn, &cabecera, &self.state, protegido).await {
+        let guard = attributes_guard(&attributes);
+        if !passes_guards(&self.conn, &cabecera, &self.state, guard.as_slice()).await {
             return Err(SecretError::AccessDenied);
         }
         escritura_bloqueada()?;
@@ -1761,16 +1837,17 @@ impl CollectionInterface {
     }
 
     ///
-    /// Una colección que guarda la clave del almacén la borra sólo el
-    /// sincronizador: borrarla se lleva la clave con todo lo demás, y es la
-    /// misma sustitución que `Item.Delete` por un camino más ancho.
+    /// Una colección que guarda ítems de esquemas protegidos la borra sólo
+    /// quien pasa las puertas de **todos** ellos: borrarla se lleva esas claves
+    /// con todo lo demás, y es la misma sustitución que `Item.Delete` por un
+    /// camino más ancho.
     async fn delete(
         &mut self,
         #[zbus(header)] cabecera: zbus::message::Header<'_>,
     ) -> Result<OwnedObjectPath, zbus::fdo::Error> {
         let negado = || {
             zbus::fdo::Error::AccessDenied(
-                "la colección guarda la clave del almacén de cuentas".into(),
+                "la colección guarda ítems de un esquema protegido".into(),
             )
         };
         // Una colección con secretos del portal no la borra nadie: se llevaría
@@ -1781,18 +1858,17 @@ impl CollectionInterface {
                 "la colección guarda secretos del portal, que sólo usa el llavero".into(),
             )
         };
-        let (protegida, del_portal) = {
+        let (guards, del_portal) = {
             let state = self.state.lock().await;
             (
-                coleccion_protegida(&state, &self.path),
+                collection_guards(&state, &self.path),
                 holds_portal_items(&state, &self.path),
             )
         };
         if del_portal {
             return Err(negado_portal());
         }
-        let autorizado =
-            puede_tocar_el_almacen(&self.conn, &cabecera, &self.state, protegida).await;
+        let autorizado = passes_guards(&self.conn, &cabecera, &self.state, &guards).await;
         if !autorizado {
             return Err(negado());
         }
@@ -1802,9 +1878,13 @@ impl CollectionInterface {
         {
             let mut state = self.state.lock().await;
             // Se vuelve a mirar con el candado que borra: mientras la puerta iba
-            // al bus, el sincronizador pudo haber guardado su clave acá. Si la
-            // colección pasó a tenerla y la puerta no se consultó, falla cerrado.
-            if !protegida && coleccion_protegida(&state, &self.path) {
+            // al bus, un autorizado pudo haber guardado su clave acá. Si la
+            // colección pasó a tener un ítem cuya puerta no se consultó, falla
+            // cerrado.
+            if collection_guards(&state, &self.path)
+                .iter()
+                .any(|guard| !guards.contains(guard))
+            {
                 return Err(negado());
             }
             // Lo mismo con el portal: mientras la puerta iba al bus, una
@@ -2483,8 +2563,8 @@ impl ServiceInterface {
         #[zbus(header)] cabecera: zbus::message::Header<'_>,
         attributes: HashMap<String, String>,
     ) -> Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>), zbus::fdo::Error> {
-        // (ruta, bloqueado, protegido)
-        let encontrados: Vec<(String, bool, bool)> = {
+        // (ruta, bloqueado, puerta)
+        let encontrados: Vec<(String, bool, Option<SchemaGuard>)> = {
             let state = self.state.lock().await;
             state
                 .collections
@@ -2495,26 +2575,20 @@ impl ServiceInterface {
                         if is_portal_item(item) {
                             return None;
                         }
-                        coincide(item, &attributes).then(|| {
-                            (
-                                ip.clone(),
-                                effectively_locked(col.locked),
-                                es_esquema_protegido(item),
-                            )
-                        })
+                        coincide(item, &attributes)
+                            .then(|| (ip.clone(), effectively_locked(col.locked), item_guard(item)))
                     })
                 })
                 .collect()
         };
 
-        let alguno_protegido = encontrados.iter().any(|(_, _, protegido)| *protegido);
-        let autorizado =
-            puede_tocar_el_almacen(&self.conn, &cabecera, &self.state, alguno_protegido).await;
+        let guards: Vec<SchemaGuard> = encontrados.iter().filter_map(|(_, _, g)| *g).collect();
+        let autorizadas = authorized_guards(&self.conn, &cabecera, &self.state, &guards).await;
 
         let mut unlocked = Vec::new();
         let mut locked = Vec::new();
-        for (ip, bloqueado, protegido) in encontrados {
-            if protegido && !autorizado {
+        for (ip, bloqueado, guard) in encontrados {
+            if guard.is_some_and(|g| !autorizadas.contains(&g)) {
                 continue;
             }
             let o = owned_path_try(&ip).unwrap_or_else(|_| owned_path("/"));
@@ -2670,22 +2744,19 @@ impl ServiceInterface {
         // Keyed by object path, not string: the spec declares `a{o(oayays)}`
         // and libsecret refuses the `a{s(oayays)}` a String key produces.
     ) -> Result<HashMap<OwnedObjectPath, SecretStruct>, zbus::fdo::Error> {
-        // Una sola vez por llamada, antes del lock, y sólo si la lista tiene
-        // algún ítem del almacén: el chequeo no depende del ítem —depende de
-        // quién pregunta—, y para una lista de contraseñas comunes no hace falta.
+        // Una sola vez por llamada y por puerta, antes del lock, y sólo si la
+        // lista tiene algún ítem protegido: el chequeo no depende del ítem
+        // —depende de quién pregunta y de qué puerta—, y para una lista de
+        // contraseñas comunes no hace falta.
         // Ver `get_secret`.
-        let (alguno_protegido, esperado) = {
+        let guards: Vec<SchemaGuard> = {
             let state = self.state.lock().await;
-            let alguno = items.iter().any(|ip| {
-                state
-                    .items
-                    .get(ip.as_str())
-                    .is_some_and(es_esquema_protegido)
-            });
-            (alguno, state.ejecutable_del_sincronizador())
+            items
+                .iter()
+                .filter_map(|ip| state.items.get(ip.as_str()).and_then(item_guard))
+                .collect()
         };
-        let autorizado = alguno_protegido
-            && autorizado_para_esquema_protegido(&self.conn, &cabecera, &esperado).await;
+        let autorizadas = authorized_guards(&self.conn, &cabecera, &self.state, &guards).await;
 
         let state = self.state.lock().await;
         let mut result = HashMap::new();
@@ -2705,7 +2776,7 @@ impl ServiceInterface {
                     // es el mismo trato que reciben las colecciones bloqueadas
                     // acá arriba, y el contrato de `GetSecrets` es devolver la
                     // parte que sí se puede leer.
-                    if !access_allowed(item, autorizado) {
+                    if !access_allowed(item, &autorizadas) {
                         continue;
                     }
                     // Encrypted sessions used to be skipped outright here, so a
@@ -4050,7 +4121,7 @@ pub(crate) mod tests {
         ItemInfo {
             attributes: HashMap::from([(
                 ATRIBUTO_ESQUEMA.to_string(),
-                ESQUEMA_PROTEGIDO.to_string(),
+                ACCOUNTS_STORE_SCHEMA.to_string(),
             )]),
             ..entrada(secret)
         }
@@ -4069,7 +4140,7 @@ pub(crate) mod tests {
         let item = entrada_protegida(b"la clave del almacen");
 
         assert!(
-            !access_allowed(&item, false),
+            !access_allowed(&item, &[]),
             "un proceso que no es el sincronizador no puede leer el item protegido: \
              el llavero lo entregaba a cualquiera"
         );
@@ -4084,7 +4155,7 @@ pub(crate) mod tests {
         let item = entrada("la contraseña del navegador".as_bytes());
 
         assert!(
-            access_allowed(&item, false),
+            access_allowed(&item, &[]),
             "el control es sobre el item protegido, no sobre el llavero entero"
         );
     }
@@ -4097,7 +4168,7 @@ pub(crate) mod tests {
         let item = entrada_protegida(b"la clave del almacen");
 
         assert!(
-            access_allowed(&item, true),
+            access_allowed(&item, &[ACCOUNTS_SYNC_GUARD]),
             "el sincronizador de cuentas es el que puede leer el almacen"
         );
     }
@@ -4122,7 +4193,7 @@ pub(crate) mod tests {
                 ..entrada(b"secreto")
             };
             assert!(
-                access_allowed(&item, false),
+                access_allowed(&item, &[]),
                 "`{esquema}` no es el esquema protegido y no puede quedar bloqueado"
             );
         }
@@ -4145,11 +4216,11 @@ pub(crate) mod tests {
         let item = entrada_smime(b"la clave privada smime");
 
         assert!(
-            es_esquema_protegido(&item),
+            item_guard(&item).is_some(),
             "el esquema S/MIME tiene que contar como protegido"
         );
         assert!(
-            !access_allowed(&item, false),
+            !access_allowed(&item, &[]),
             "un proceso que no es el sincronizador no puede leer la clave S/MIME"
         );
     }
@@ -4160,7 +4231,7 @@ pub(crate) mod tests {
     fn el_proceso_autorizado_si_puede_leer_la_clave_smime() {
         assert!(access_allowed(
             &entrada_smime(b"la clave privada smime"),
-            true
+            &[ACCOUNTS_SYNC_GUARD]
         ));
     }
 
@@ -4168,10 +4239,16 @@ pub(crate) mod tests {
     /// saca nada al del almacén, y ninguno protege al otro por accidente.
     #[test]
     fn los_dos_esquemas_protegidos_siguen_protegidos() {
-        assert!(!access_allowed(&entrada_protegida(b"almacen"), false));
-        assert!(!access_allowed(&entrada_smime(b"smime"), false));
-        assert!(access_allowed(&entrada_protegida(b"almacen"), true));
-        assert!(access_allowed(&entrada_smime(b"smime"), true));
+        assert!(!access_allowed(&entrada_protegida(b"almacen"), &[]));
+        assert!(!access_allowed(&entrada_smime(b"smime"), &[]));
+        assert!(access_allowed(
+            &entrada_protegida(b"almacen"),
+            &[ACCOUNTS_SYNC_GUARD]
+        ));
+        assert!(access_allowed(
+            &entrada_smime(b"smime"),
+            &[ACCOUNTS_SYNC_GUARD]
+        ));
     }
 
     /// Lo mismo que `un_esquema_que_solo_se_parece_al_protegido_no_lo_es`, para
@@ -4194,7 +4271,7 @@ pub(crate) mod tests {
                 ..entrada(b"secreto")
             };
             assert!(
-                access_allowed(&item, false),
+                access_allowed(&item, &[]),
                 "`{esquema}` no pertenece al conjunto protegido y no puede quedar bloqueado"
             );
         }
@@ -4211,7 +4288,7 @@ pub(crate) mod tests {
         };
 
         assert!(
-            access_allowed(&item, false),
+            access_allowed(&item, &[]),
             "sin el atributo no hay nada que proteger"
         );
     }
@@ -4359,7 +4436,7 @@ pub(crate) mod tests {
     /// el sincronizador. Con un `ends_with` o una comparación contra el nombre
     /// pelado, alcanzaba con un binario con el mismo nombre en otro directorio.
     /// Esta prueba llama a la comparación real —no a las constantes— justamente
-    /// porque una versión anterior suya comparaba `EJECUTABLE_AUTORIZADO` contra
+    /// porque una versión anterior suya comparaba `ACCOUNTS_SYNC_EXECUTABLE` contra
     /// sí mismo y daba verde aunque el código usara `starts_with`.
     #[test]
     fn un_ejecutable_que_solo_se_parece_al_autorizado_no_lo_es() {
@@ -4375,7 +4452,7 @@ pub(crate) mod tests {
 
         for ejecutable in parecidos {
             assert!(
-                !es_el_autorizado(ejecutable, EJECUTABLE_AUTORIZADO),
+                !is_expected_executable(ejecutable, ACCOUNTS_SYNC_EXECUTABLE),
                 "`{ejecutable}` no es el sincronizador y no puede pasar por él"
             );
         }
@@ -4386,7 +4463,7 @@ pub(crate) mod tests {
     #[test]
     fn el_ejecutable_del_sincronizador_es_autorizado() {
         assert!(
-            es_el_autorizado(EJECUTABLE_AUTORIZADO, EJECUTABLE_AUTORIZADO),
+            is_expected_executable(ACCOUNTS_SYNC_EXECUTABLE, ACCOUNTS_SYNC_EXECUTABLE),
             "el sincronizador de cuentas tiene que poder leer el almacen"
         );
     }
@@ -4420,14 +4497,14 @@ pub(crate) mod tests {
         let aceptadas: Vec<&PathBuf> = rutas
             .iter()
             .filter(|ruta| {
-                es_el_autorizado(ruta.to_str().unwrap_or_default(), EJECUTABLE_AUTORIZADO)
+                is_expected_executable(ruta.to_str().unwrap_or_default(), ACCOUNTS_SYNC_EXECUTABLE)
             })
             .collect();
 
         assert!(
             !aceptadas.is_empty(),
-            "la puerta sólo acepta a {EJECUTABLE_AUTORIZADO} y el sincronizador de esta máquina \
-             está en {rutas:?}: hay que cambiar EJECUTABLE_AUTORIZADO, o el almacen de cuentas \
+            "la puerta sólo acepta a {ACCOUNTS_SYNC_EXECUTABLE} y el sincronizador de esta máquina \
+             está en {rutas:?}: hay que cambiar ACCOUNTS_SYNC_EXECUTABLE, o el almacen de cuentas \
              no se va a poder abrir nunca y no va a haber ningún error que lo diga"
         );
     }
@@ -4436,7 +4513,7 @@ pub(crate) mod tests {
     ///
     /// **Se busca en todos los lugares donde un paquete lo pondría, no sólo en el
     /// que dice la constante.** Una versión anterior de la prueba de arriba
-    /// miraba `Path::new(EJECUTABLE_AUTORIZADO).is_file()` y se saltaba si no
+    /// miraba `Path::new(ACCOUNTS_SYNC_EXECUTABLE).is_file()` y se saltaba si no
     /// estaba: con la constante desactualizada no encuentra nada ahí, se salta,
     /// y da verde —que es el mismo salto que casi se lleva por delante la del
     /// portal—. Buscar el binario de verdad y compararlo es lo único que
@@ -4447,7 +4524,7 @@ pub(crate) mod tests {
     fn rutas_del_sincronizador_instaladas() -> BTreeSet<PathBuf> {
         const NOMBRE: &str = "vasak-accounts-sync";
 
-        let mut candidatas = vec![PathBuf::from(EJECUTABLE_AUTORIZADO)];
+        let mut candidatas = vec![PathBuf::from(ACCOUNTS_SYNC_EXECUTABLE)];
         if let Some(path) = std::env::var_os("PATH") {
             candidatas.extend(std::env::split_paths(&path).map(|dir| dir.join(NOMBRE)));
         }
@@ -4525,16 +4602,16 @@ pub(crate) mod tests {
     /// mismo antes y después del adorno.
     ///
     /// El reparto importa: el adorno se saca en `ejecutable_de`, no en
-    /// `es_el_autorizado`. Por eso esta prueba compone las dos como lo hace el
+    /// `is_expected_executable`. Por eso esta prueba compone las dos como lo hace el
     /// camino real —limpiar y después comparar— en vez de pasarle la ruta con
     /// el adorno a la puerta: si el adorno se sacara en el lugar equivocado, esta
     /// forma de probarlo no se enteraría.
     #[test]
     fn el_adorno_de_borrado_no_altera_la_comparacion_de_la_puerta() {
-        let con_adorno = format!("{EJECUTABLE_AUTORIZADO}{SUFIJO_DE_BORRADO}");
+        let con_adorno = format!("{ACCOUNTS_SYNC_EXECUTABLE}{SUFIJO_DE_BORRADO}");
 
         assert!(
-            es_el_autorizado(sin_adorno_de_borrado(&con_adorno), EJECUTABLE_AUTORIZADO),
+            is_expected_executable(sin_adorno_de_borrado(&con_adorno), ACCOUNTS_SYNC_EXECUTABLE),
             "una actualización del sistema no le puede cerrar el almacen al sincronizador \
              legítimo: `pacman` borra el archivo mientras el proceso sigue corriendo, y el \
              kernel cuelga el adorno a la ruta"
@@ -4543,11 +4620,11 @@ pub(crate) mod tests {
         // siendo exacta contra la ruta entera, que es lo que impide que un
         // `...-sync.malicioso` pase por el sincronizador.
         assert!(
-            !es_el_autorizado(
+            !is_expected_executable(
                 sin_adorno_de_borrado(&format!(
-                    "{EJECUTABLE_AUTORIZADO}.malicioso{SUFIJO_DE_BORRADO}"
+                    "{ACCOUNTS_SYNC_EXECUTABLE}.malicioso{SUFIJO_DE_BORRADO}"
                 )),
-                EJECUTABLE_AUTORIZADO
+                ACCOUNTS_SYNC_EXECUTABLE
             ),
             "quitar el adorno no puede convertir un nombre parecido en el sincronizador"
         );
@@ -4564,7 +4641,7 @@ pub(crate) mod tests {
 
     /// Una ruta que es **sólo** el adorno se queda vacía, y eso es lo correcto:
     /// el kernel no devuelve nunca una cosa así, y un `unwrap_or(ruta)` que
-    /// devolviera la ruta entera haría que `es_el_autorizado` comparara contra
+    /// devolviera la ruta entera haría que `is_expected_executable` comparara contra
     /// `" (deleted)"` —que no es el sincronizador, así que no abriría nada—.
     /// Se anota para que el cambio de `unwrap_or` a otra cosa se piense.
     #[test]
@@ -4583,7 +4660,7 @@ pub(crate) mod tests {
     #[test]
     fn el_esquema_protegido_es_el_del_almacen_de_cuentas() {
         assert_eq!(
-            ESQUEMA_PROTEGIDO, "ar.net.vasak.os.AccountsStore",
+            ACCOUNTS_STORE_SCHEMA, "ar.net.vasak.os.AccountsStore",
             "este valor tiene que coincidir con store::key::SCHEMA de vasak-accounts"
         );
         assert_eq!(
@@ -4636,7 +4713,7 @@ pub(crate) mod tests {
     // también el nombre, y ninguna de las dos condiciones alcanza sola.
     //
     // Va en dos capas porque fallan distinto. La de las pruebas puras llama a
-    // `es_el_sincronizador` con las respuestas ya resueltas: comprueba la regla.
+    // `owns_name_and_executable` con las respuestas ya resueltas: comprueba la regla.
     // La de abajo monta un bus falso detrás del cliente y deja que corra el
     // código de verdad: comprueba que la regla se llegue a formular. Un `if` que
     // devuelve `false` siempre compila, pasa todas las pruebas de la función que
@@ -4721,7 +4798,7 @@ pub(crate) mod tests {
         /// Con el ejecutable de producción como el esperado: nada de lo que
         /// corre en la prueba lo tiene, así que por acá no entra nadie.
         async fn nuevo(duenia: Option<&str>, pid: Option<u32>) -> Self {
-            Self::con(duenia, pid, EJECUTABLE_AUTORIZADO).await
+            Self::con(duenia, pid, ACCOUNTS_SYNC_EXECUTABLE).await
         }
 
         /// Con este mismo proceso haciendo de sincronizador: el pid es el
@@ -4751,8 +4828,13 @@ pub(crate) mod tests {
         /// una colección bloqueada, un ítem que no existe.
         async fn puerta(&self, emisor: Option<&str>) -> bool {
             let peticion = peticion(emisor);
-            autorizado_para_esquema_protegido(&self.demonio, &peticion.header(), &self.esperado)
-                .await
+            caller_is_authorized(
+                &self.demonio,
+                &peticion.header(),
+                ACCOUNTS_SYNC_BUS_NAME,
+                &self.esperado,
+            )
+            .await
         }
 
         /// Un `GetSecret` de punta a punta: entra por el bus, lo decide el
@@ -4813,11 +4895,11 @@ pub(crate) mod tests {
     #[test]
     fn el_sincronizador_con_su_nombre_y_su_binario_entra() {
         assert!(
-            es_el_sincronizador(
+            owns_name_and_executable(
                 DEL_SINCRONIZADOR,
                 Some(DEL_SINCRONIZADOR),
-                Some(EJECUTABLE_AUTORIZADO),
-                EJECUTABLE_AUTORIZADO
+                Some(ACCOUNTS_SYNC_EXECUTABLE),
+                ACCOUNTS_SYNC_EXECUTABLE
             ),
             "la conexión del sincronizador, con el nombre y con el binario, tiene que poder leer \
              el almacén: una puerta que rechaza esto no abre nada"
@@ -4833,11 +4915,11 @@ pub(crate) mod tests {
     /// cualquiera que llegue primero; el ejecutable no se finge.
     #[test]
     fn sin_ejecutable_no_entra_ni_quien_tiene_el_nombre() {
-        assert!(!es_el_sincronizador(
+        assert!(!owns_name_and_executable(
             DEL_SINCRONIZADOR,
             Some(DEL_SINCRONIZADOR),
             None,
-            EJECUTABLE_AUTORIZADO
+            ACCOUNTS_SYNC_EXECUTABLE
         ));
     }
 
@@ -4851,11 +4933,11 @@ pub(crate) mod tests {
             "/usr/bin/vasak-accounts-sync.malicioso",
         ] {
             assert!(
-                !es_el_sincronizador(
+                !owns_name_and_executable(
                     DEL_SINCRONIZADOR,
                     Some(DEL_SINCRONIZADOR),
                     Some(otro),
-                    EJECUTABLE_AUTORIZADO
+                    ACCOUNTS_SYNC_EXECUTABLE
                 ),
                 "con el nombre del sincronizador y el ejecutable {otro} no se entra"
             );
@@ -4866,17 +4948,17 @@ pub(crate) mod tests {
     /// ser la que tiene tomado el nombre.
     #[test]
     fn el_binario_bueno_sin_el_nombre_no_entra() {
-        assert!(!es_el_sincronizador(
+        assert!(!owns_name_and_executable(
             DE_UN_IMPOSTOR,
             Some(DEL_SINCRONIZADOR),
-            Some(EJECUTABLE_AUTORIZADO),
-            EJECUTABLE_AUTORIZADO
+            Some(ACCOUNTS_SYNC_EXECUTABLE),
+            ACCOUNTS_SYNC_EXECUTABLE
         ));
-        assert!(!es_el_sincronizador(
+        assert!(!owns_name_and_executable(
             DE_UN_IMPOSTOR,
             None,
-            Some(EJECUTABLE_AUTORIZADO),
-            EJECUTABLE_AUTORIZADO
+            Some(ACCOUNTS_SYNC_EXECUTABLE),
+            ACCOUNTS_SYNC_EXECUTABLE
         ));
     }
 
@@ -4893,7 +4975,7 @@ pub(crate) mod tests {
 
         assert!(
             almacen.puerta(Some(DEL_SINCRONIZADOR)).await,
-            "el bus dice que {DEL_SINCRONIZADOR} tiene {NOMBRE_DEL_SINCRONIZADOR} y su ejecutable \
+            "el bus dice que {DEL_SINCRONIZADOR} tiene {ACCOUNTS_SYNC_BUS_NAME} y su ejecutable \
              es el esperado: tiene que entrar, o el almacén cifrado no lo abre nadie"
         );
     }
@@ -4911,8 +4993,8 @@ pub(crate) mod tests {
 
         let preguntados = almacen.preguntados().await;
         assert!(
-            !preguntados.is_empty() && preguntados.iter().all(|n| n == NOMBRE_DEL_SINCRONIZADOR),
-            "la puerta tiene que preguntar sólo por {NOMBRE_DEL_SINCRONIZADOR} y preguntó por \
+            !preguntados.is_empty() && preguntados.iter().all(|n| n == ACCOUNTS_SYNC_BUS_NAME),
+            "la puerta tiene que preguntar sólo por {ACCOUNTS_SYNC_BUS_NAME} y preguntó por \
              {preguntados:?}: con otro nombre se le abre a quien lo tenga y se le cierra al \
              sincronizador"
         );
@@ -4929,7 +5011,7 @@ pub(crate) mod tests {
         assert!(
             !almacen.puerta(Some(DEL_SINCRONIZADOR)).await,
             "no se puede leer el ejecutable de {DEL_SINCRONIZADOR}: tener \
-             {NOMBRE_DEL_SINCRONIZADOR} solo no alcanza"
+             {ACCOUNTS_SYNC_BUS_NAME} solo no alcanza"
         );
     }
 
@@ -4989,7 +5071,7 @@ pub(crate) mod tests {
     async fn un_nombre_sin_duena_es_una_respuesta_y_no_un_fallo() {
         let almacen = Almacen::nuevo(None, Some(pid_inexistente())).await;
 
-        let duenia = crate::portal_secret::dueno_de(&almacen.demonio, NOMBRE_DEL_SINCRONIZADOR)
+        let duenia = crate::portal_secret::dueno_de(&almacen.demonio, ACCOUNTS_SYNC_BUS_NAME)
             .await
             .expect("`NameHasNoOwner` es la respuesta del bus, no una pregunta que salió mal");
 
@@ -5081,9 +5163,9 @@ pub(crate) mod tests {
         // Y la pregunta que viajó por el bus fue por el nombre del sincronizador.
         let preguntados = almacen.preguntados().await;
         assert!(
-            !preguntados.is_empty() && preguntados.iter().all(|n| n == NOMBRE_DEL_SINCRONIZADOR),
+            !preguntados.is_empty() && preguntados.iter().all(|n| n == ACCOUNTS_SYNC_BUS_NAME),
             "en un `GetSecret` de verdad la puerta tiene que preguntar por \
-             {NOMBRE_DEL_SINCRONIZADOR}, y preguntó por {preguntados:?}"
+             {ACCOUNTS_SYNC_BUS_NAME}, y preguntó por {preguntados:?}"
         );
     }
 
@@ -5113,7 +5195,7 @@ pub(crate) mod tests {
         assert!(
             almacen.preguntados().await.is_empty(),
             "para un ítem que no es del almacén no hay que preguntarle al bus quién tiene \
-             {NOMBRE_DEL_SINCRONIZADOR}"
+             {ACCOUNTS_SYNC_BUS_NAME}"
         );
     }
 
@@ -5156,7 +5238,7 @@ pub(crate) mod tests {
         assert_eq!(secretos.len(), 1, "la contraseña común se entrega");
         assert!(
             almacen.preguntados().await.is_empty(),
-            "sin ítems del almacén en la lista no hay que preguntar por {NOMBRE_DEL_SINCRONIZADOR}"
+            "sin ítems del almacén en la lista no hay que preguntar por {ACCOUNTS_SYNC_BUS_NAME}"
         );
 
         let con_el_almacen = pedir(vec![ITEM_COMUN, ITEM]);
@@ -5190,7 +5272,10 @@ pub(crate) mod tests {
         let item = |protegido: bool| ItemInfo {
             label: "x".into(),
             attributes: if protegido {
-                HashMap::from([(ATRIBUTO_ESQUEMA.to_string(), ESQUEMA_PROTEGIDO.to_string())])
+                HashMap::from([(
+                    ATRIBUTO_ESQUEMA.to_string(),
+                    ACCOUNTS_STORE_SCHEMA.to_string(),
+                )])
             } else {
                 HashMap::new()
             },
@@ -5211,8 +5296,8 @@ pub(crate) mod tests {
             },
         );
         state.items.insert("/c/items/0".into(), item(false));
-        assert!(!coleccion_protegida(&state, "/c"));
-        assert!(!coleccion_protegida(&state, "/no-existe"));
+        assert!(collection_guards(&state, "/c").is_empty());
+        assert!(collection_guards(&state, "/no-existe").is_empty());
 
         // El sincronizador guarda su clave mientras la puerta iba al bus.
         state.items.insert("/c/items/1".into(), item(true));
@@ -5222,7 +5307,7 @@ pub(crate) mod tests {
             .expect("la colección")
             .items
             .push("/c/items/1".into());
-        assert!(coleccion_protegida(&state, "/c"));
+        assert!(!collection_guards(&state, "/c").is_empty());
     }
 
     /// Las pruebas no escriben nunca en el llavero de quien las corre.
@@ -5262,7 +5347,7 @@ pub(crate) mod tests {
     /// Las propiedades de un ítem que alguien pide crear, con el esquema del
     /// almacén o sin él.
     fn propiedades(protegido: bool) -> HashMap<String, Value<'static>> {
-        propiedades_con_esquema(protegido.then_some(ESQUEMA_PROTEGIDO))
+        propiedades_con_esquema(protegido.then_some(ACCOUNTS_STORE_SCHEMA))
     }
 
     /// Lo mismo, con el esquema que se quiera (o ninguno).
@@ -5850,7 +5935,7 @@ pub(crate) mod tests {
                 "xdg:schema".to_string(),
                 "org.gnome.portal.Secret".to_string(),
             )]),
-            HashMap::from([("xdg:schema".to_string(), ESQUEMA_PROTEGIDO.to_string())]),
+            HashMap::from([("xdg:schema".to_string(), ACCOUNTS_STORE_SCHEMA.to_string())]),
             // El nombre del esquema en otra clave no es el esquema.
             HashMap::from([("comentario".to_string(), PORTAL_SCHEMA.to_string())]),
             HashMap::from([("origin".to_string(), "portal-backend".to_string())]),
@@ -6611,7 +6696,7 @@ pub(crate) mod tests {
     /// usan, y para ésas se lee mejor que el bus no esté.
     async fn llavero_con_item_protegido() -> (zbus::Connection, zbus::Connection) {
         let (demonio, cliente, _) =
-            construir_llavero_con_item_protegido(EJECUTABLE_AUTORIZADO).await;
+            construir_llavero_con_item_protegido(ACCOUNTS_SYNC_EXECUTABLE).await;
         (demonio, cliente)
     }
 
@@ -6665,7 +6750,8 @@ pub(crate) mod tests {
         let state = Arc::new(Mutex::new(KeyringState::new()));
         {
             let mut s = state.lock().await;
-            s.ejecutable_del_sincronizador = esperado.to_owned();
+            s.executable_overrides
+                .insert(ACCOUNTS_SYNC_EXECUTABLE, esperado.to_owned());
             // Las tres rutas de abajo ya están tomadas: un ítem nuevo —el que
             // crea el portal en una prueba— no puede pisar ninguna.
             s.next_item = 3;
@@ -6691,7 +6777,7 @@ pub(crate) mod tests {
                     label: "la clave del almacen".into(),
                     attributes: HashMap::from([(
                         ATRIBUTO_ESQUEMA.to_string(),
-                        ESQUEMA_PROTEGIDO.to_string(),
+                        ACCOUNTS_STORE_SCHEMA.to_string(),
                     )]),
                     secret: b"la clave del almacen".to_vec(),
                     content_type: "text/plain".into(),
@@ -8242,5 +8328,799 @@ pub(crate) mod tests {
             save_turn().try_lock().is_ok(),
             "al terminar, el turno queda libre"
         );
+    }
+
+    // ── Una puerta por esquema (#55) ──
+    //
+    // `PROTECTED_SCHEMAS` es una tabla esquema -> puerta. Lo que se prueba acá es
+    // lo que ese cambio promete: quien pasa la puerta de un esquema no toca los
+    // ítems de otro. Hace falta un bus falso con **un dueño por nombre**: con
+    // uno solo para todos los nombres, el asistente pasaría también por la puerta
+    // del sincronizador y los casos cruzados no probarían nada.
+    //
+    // Los tres que llaman comparten pid y ejecutable (el de este proceso, que es
+    // el único que una prueba puede hacer pasar por el binario de producción), así
+    // que lo que los distingue es el nombre de bus que tienen tomado.
+
+    /// La conexión del asistente en el bus de la sesión.
+    const DEL_ASISTENTE: &str = ":1.77";
+    /// La clave S/MIME, como segundo ítem de la puerta del sincronizador.
+    const ITEM_SMIME_CRUZADO: &str = "/org/freedesktop/secrets/collection/login/items/10";
+    /// La clave del proveedor del asistente.
+    const ITEM_DEL_ASISTENTE: &str = "/org/freedesktop/secrets/collection/login/items/11";
+    const EMISORES: [&str; 3] = [DEL_SINCRONIZADOR, DEL_ASISTENTE, DE_UN_IMPOSTOR];
+    /// Almacén (sync), S/MIME (sync), asistente y uno común.
+    const ITEMS_CRUZADOS: [&str; 4] = [ITEM, ITEM_SMIME_CRUZADO, ITEM_DEL_ASISTENTE, ITEM_COMUN];
+
+    fn entrada_asistente(secret: &[u8]) -> ItemInfo {
+        ItemInfo {
+            attributes: HashMap::from([(
+                ATRIBUTO_ESQUEMA.to_string(),
+                ASSISTANT_SCHEMA.to_string(),
+            )]),
+            ..entrada(secret)
+        }
+    }
+
+    /// Si `emisor` puede tocar `item`: cada uno, lo de su puerta y lo común.
+    fn puede_tocar(emisor: &str, item: &str) -> bool {
+        match item {
+            ITEM_COMUN => true,
+            ITEM | ITEM_SMIME_CRUZADO => emisor == DEL_SINCRONIZADOR,
+            ITEM_DEL_ASISTENTE => emisor == DEL_ASISTENTE,
+            otro => panic!("la prueba no conoce el ítem {otro}"),
+        }
+    }
+
+    /// El llavero con las dos puertas y una mezcla de ítems, sin el secreto del
+    /// portal (que le pone a la colección su propia puerta, la de nadie).
+    async fn con_dos_puertas(esperado_sync: &str, esperado_asistente: &str) -> Almacen {
+        con_dos_puertas_y_pid(esperado_sync, esperado_asistente, Some(std::process::id())).await
+    }
+
+    async fn con_dos_puertas_y_pid(
+        esperado_sync: &str,
+        esperado_asistente: &str,
+        pid: Option<u32>,
+    ) -> Almacen {
+        let bus = BusFalso::con_duenios(
+            &[
+                (ACCOUNTS_SYNC_BUS_NAME, DEL_SINCRONIZADOR),
+                (ASSISTANT_GUARD.bus_name, DEL_ASISTENTE),
+            ],
+            pid,
+        );
+        let (demonio, cliente, preguntados, estado) =
+            llavero_con_item_protegido_y_bus(Some(bus), esperado_sync).await;
+        {
+            let mut s = estado.lock().await;
+            s.executable_overrides
+                .insert(ASSISTANT_GUARD.executable, esperado_asistente.to_owned());
+            s.items.remove(ITEM_DEL_PORTAL);
+            let col = s
+                .collections
+                .get_mut(COLECCION_DEL_LOGIN)
+                .expect("colección");
+            col.items.retain(|p| p != ITEM_DEL_PORTAL);
+            col.items.push(ITEM_SMIME_CRUZADO.to_string());
+            col.items.push(ITEM_DEL_ASISTENTE.to_string());
+            s.items.insert(
+                ITEM_SMIME_CRUZADO.to_string(),
+                ItemInfo {
+                    label: "la clave smime".into(),
+                    ..entrada_smime(b"la clave privada smime")
+                },
+            );
+            s.items.insert(
+                ITEM_DEL_ASISTENTE.to_string(),
+                ItemInfo {
+                    label: "la clave del proveedor".into(),
+                    ..entrada_asistente(b"la clave del proveedor")
+                },
+            );
+        }
+        for ruta in [ITEM_SMIME_CRUZADO, ITEM_DEL_ASISTENTE] {
+            demonio
+                .object_server()
+                .at(
+                    ruta,
+                    ItemInterface {
+                        state: Arc::clone(&estado),
+                        conn: demonio.clone(),
+                        path: ruta.to_string(),
+                    },
+                )
+                .await
+                .expect("no se pudo publicar el ítem");
+        }
+        Almacen {
+            demonio,
+            cliente,
+            preguntados,
+            esperado: esperado_sync.to_owned(),
+            estado,
+        }
+    }
+
+    /// El caso normal de las pruebas de abajo: este proceso hace de los dos
+    /// binarios.
+    async fn con_las_dos_puertas_abiertas() -> Almacen {
+        let propio = ejecutable_propio();
+        con_dos_puertas(&propio, &propio).await
+    }
+
+    fn rutas_ordenadas(rutas: Vec<OwnedObjectPath>) -> Vec<String> {
+        let mut rutas: Vec<String> = rutas.iter().map(|r| r.to_string()).collect();
+        rutas.sort();
+        rutas
+    }
+
+    fn esperadas_para(emisor: &str) -> Vec<String> {
+        let mut esperadas: Vec<String> = ITEMS_CRUZADOS
+            .iter()
+            .filter(|i| puede_tocar(emisor, i))
+            .map(|i| i.to_string())
+            .collect();
+        esperadas.sort();
+        esperadas
+    }
+
+    // ── La regla, sin bus ──
+
+    /// La tabla da una puerta propia al asistente y no la mezcla con la del
+    /// sincronizador: es lo que el cambio agrega.
+    #[test]
+    fn el_esquema_del_asistente_tiene_su_propia_puerta() {
+        assert_eq!(item_guard(&entrada_asistente(b"x")), Some(ASSISTANT_GUARD));
+        assert_eq!(
+            item_guard(&entrada_protegida(b"x")),
+            Some(ACCOUNTS_SYNC_GUARD)
+        );
+        assert_eq!(item_guard(&entrada_smime(b"x")), Some(ACCOUNTS_SYNC_GUARD));
+        assert_eq!(ASSISTANT_GUARD.executable, "/usr/bin/vasak-assistant");
+        assert_eq!(ASSISTANT_GUARD.bus_name, "ar.net.vasak.os.Assistant");
+        assert_ne!(ASSISTANT_GUARD, ACCOUNTS_SYNC_GUARD);
+    }
+
+    /// Un ítem del asistente sólo lo entrega su puerta: ni nadie, ni la del
+    /// sincronizador.
+    #[test]
+    fn un_item_del_asistente_solo_se_le_entrega_al_asistente() {
+        let item = entrada_asistente(b"la clave del proveedor");
+        assert!(!access_allowed(&item, &[]));
+        assert!(
+            !access_allowed(&item, &[ACCOUNTS_SYNC_GUARD]),
+            "pasar la puerta del sincronizador no abre la del asistente"
+        );
+        assert!(access_allowed(&item, &[ASSISTANT_GUARD]));
+        assert!(access_allowed(
+            &item,
+            &[ACCOUNTS_SYNC_GUARD, ASSISTANT_GUARD]
+        ));
+    }
+
+    /// El otro sentido: la puerta del asistente no abre ni el almacén ni S/MIME.
+    #[test]
+    fn el_asistente_no_lee_el_almacen_ni_la_clave_smime() {
+        for item in [entrada_protegida(b"almacen"), entrada_smime(b"smime")] {
+            assert!(
+                !access_allowed(&item, &[ASSISTANT_GUARD]),
+                "{:?} no es del asistente",
+                item.attributes
+            );
+            assert!(access_allowed(&item, &[ACCOUNTS_SYNC_GUARD]));
+        }
+    }
+
+    /// Igualdad exacta, también para el esquema nuevo: un prefijo, una variante
+    /// o un esquema vecino no son el protegido.
+    #[test]
+    fn un_esquema_que_solo_se_parece_al_del_asistente_no_queda_protegido() {
+        let parecidos = [
+            "ar.net.vasak.os.Assistant2",
+            "ar.net.vasak.os.AssistantX",
+            "ar.net.vasak.os.Assistant ",
+            "ar.net.vasak.os.assistant",
+            "ar.net.vasak.os.Assistan",
+            "ar.net.vasak.os.Assistant.Backup",
+            "ar.net.vasak.os",
+            "ar.net.vasak.os.Assistant ar.net.vasak.os.AccountsStore",
+            "",
+        ];
+        for esquema in parecidos {
+            let atributos = HashMap::from([(ATRIBUTO_ESQUEMA.to_string(), esquema.to_string())]);
+            assert_eq!(attributes_guard(&atributos), None, "`{esquema}`");
+            let item = ItemInfo {
+                attributes: atributos,
+                ..entrada(b"secreto")
+            };
+            assert!(
+                access_allowed(&item, &[]),
+                "`{esquema}` no puede quedar bloqueado"
+            );
+        }
+    }
+
+    /// El esquema en otro atributo no cuenta: sólo `xdg:schema` decide.
+    #[test]
+    fn el_nombre_del_esquema_en_otro_atributo_no_protege() {
+        let atributos = HashMap::from([("schema".to_string(), ASSISTANT_SCHEMA.to_string())]);
+        assert_eq!(attributes_guard(&atributos), None);
+    }
+
+    // ── Lectura, con el bus ──
+
+    /// `GetSecret` sobre cada ítem, desde cada uno de los que llaman: cada puerta
+    /// abre lo suyo y lo común, y nada más.
+    #[tokio::test]
+    async fn get_secret_respeta_la_puerta_de_cada_esquema() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let almacen = con_las_dos_puertas_abiertas().await;
+
+        for emisor in EMISORES {
+            for item in ITEMS_CRUZADOS {
+                let resultado = almacen.pedir_secreto_de(item, Some(emisor)).await;
+                if puede_tocar(emisor, item) {
+                    resultado.unwrap_or_else(|e| panic!("{emisor} lee {item}: {e}"));
+                } else {
+                    let error = resultado.expect_err(&format!("{emisor} no lee {item}"));
+                    assert_eq!(
+                        nombre_del_error(&error),
+                        "org.freedesktop.DBus.Error.AccessDenied",
+                        "GetSecret de {emisor} sobre {item}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Lo que entrega el asistente es la clave de verdad.
+    #[tokio::test]
+    async fn el_asistente_recibe_su_clave_por_dbus() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let almacen = con_las_dos_puertas_abiertas().await;
+
+        let respuesta = almacen
+            .pedir_secreto_de(ITEM_DEL_ASISTENTE, Some(DEL_ASISTENTE))
+            .await
+            .expect("el asistente lee su clave");
+        let (secreto,): (SecretStruct,) = respuesta.body().deserialize().expect("GetSecret");
+        assert_eq!(secreto.value, b"la clave del proveedor");
+    }
+
+    /// La puerta que se consulta es la del esquema del ítem, por su nombre de
+    /// bus: una errata en la tabla abre la del vecino.
+    #[tokio::test]
+    async fn cada_item_pregunta_al_bus_por_el_nombre_de_su_puerta() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let almacen = con_las_dos_puertas_abiertas().await;
+
+        almacen
+            .pedir_secreto_de(ITEM_DEL_ASISTENTE, Some(DEL_ASISTENTE))
+            .await
+            .expect("el asistente lee su clave");
+        let preguntados = almacen.preguntados().await;
+        assert!(
+            !preguntados.is_empty() && preguntados.iter().all(|n| n == "ar.net.vasak.os.Assistant"),
+            "preguntó por {preguntados:?}"
+        );
+
+        almacen.preguntados.lock().await.clear();
+        almacen
+            .pedir_secreto_de(ITEM_SMIME_CRUZADO, Some(DEL_SINCRONIZADOR))
+            .await
+            .expect("el sincronizador lee la clave S/MIME");
+        let preguntados = almacen.preguntados().await;
+        assert!(
+            !preguntados.is_empty() && preguntados.iter().all(|n| n == ACCOUNTS_SYNC_BUS_NAME),
+            "preguntó por {preguntados:?}"
+        );
+    }
+
+    /// `SearchItems` de la colección y del servicio filtra ítem por ítem.
+    #[tokio::test]
+    async fn search_items_filtra_por_la_puerta_de_cada_esquema() {
+        let almacen = con_las_dos_puertas_abiertas().await;
+        let todos: HashMap<String, String> = HashMap::new();
+
+        for emisor in EMISORES {
+            let respuesta = almacen
+                .llamar_como(
+                    emisor,
+                    COLECCION_DEL_LOGIN,
+                    IFACE_COLECCION,
+                    "SearchItems",
+                    &(&todos,),
+                )
+                .await
+                .expect("Collection.SearchItems");
+            let rutas: Vec<OwnedObjectPath> = respuesta.body().deserialize().expect("rutas");
+            assert_eq!(
+                rutas_ordenadas(rutas),
+                esperadas_para(emisor),
+                "Collection.SearchItems de {emisor}"
+            );
+
+            let respuesta = almacen
+                .llamar_como(emisor, SERVICIO, IFACE_SERVICIO, "SearchItems", &(&todos,))
+                .await
+                .expect("Service.SearchItems");
+            let (abiertos, cerrados): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) =
+                respuesta.body().deserialize().expect("rutas");
+            let todas = abiertos.into_iter().chain(cerrados).collect();
+            assert_eq!(
+                rutas_ordenadas(todas),
+                esperadas_para(emisor),
+                "Service.SearchItems de {emisor}"
+            );
+        }
+    }
+
+    /// Buscar por el esquema ajeno no lo encuentra, y por el propio sí.
+    #[tokio::test]
+    async fn buscar_por_el_esquema_ajeno_no_encuentra_nada() {
+        let almacen = con_las_dos_puertas_abiertas().await;
+
+        for (emisor, esquema, item) in [
+            (DEL_SINCRONIZADOR, ASSISTANT_SCHEMA, ITEM_DEL_ASISTENTE),
+            (DEL_ASISTENTE, ACCOUNTS_STORE_SCHEMA, ITEM),
+            (DEL_ASISTENTE, SMIME_SCHEMA, ITEM_SMIME_CRUZADO),
+        ] {
+            let buscado: HashMap<String, String> =
+                HashMap::from([(ATRIBUTO_ESQUEMA.to_string(), esquema.to_string())]);
+            let respuesta = almacen
+                .llamar_como(
+                    emisor,
+                    COLECCION_DEL_LOGIN,
+                    IFACE_COLECCION,
+                    "SearchItems",
+                    &(&buscado,),
+                )
+                .await
+                .expect("Collection.SearchItems");
+            let rutas: Vec<OwnedObjectPath> = respuesta.body().deserialize().expect("rutas");
+            assert!(
+                rutas.iter().all(|r| r.as_str() != item),
+                "{emisor} no encuentra {item} buscando `{esquema}`"
+            );
+        }
+
+        let buscado: HashMap<String, String> =
+            HashMap::from([(ATRIBUTO_ESQUEMA.to_string(), ASSISTANT_SCHEMA.to_string())]);
+        let respuesta = almacen
+            .llamar_como(
+                DEL_ASISTENTE,
+                COLECCION_DEL_LOGIN,
+                IFACE_COLECCION,
+                "SearchItems",
+                &(&buscado,),
+            )
+            .await
+            .expect("Collection.SearchItems");
+        let rutas: Vec<OwnedObjectPath> = respuesta.body().deserialize().expect("rutas");
+        assert_eq!(rutas_ordenadas(rutas), vec![ITEM_DEL_ASISTENTE.to_string()]);
+    }
+
+    /// `GetSecrets` devuelve la parte que cada uno puede leer de una lista mixta.
+    #[tokio::test]
+    async fn get_secrets_devuelve_solo_lo_de_la_puerta_de_cada_uno() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let almacen = con_las_dos_puertas_abiertas().await;
+        let sesion = OwnedObjectPath::try_from(SESION).expect("la sesión de la prueba");
+        let pedidos: Vec<OwnedObjectPath> = ITEMS_CRUZADOS
+            .iter()
+            .map(|i| OwnedObjectPath::try_from(*i).expect("ruta"))
+            .collect();
+
+        for emisor in EMISORES {
+            let respuesta = almacen
+                .llamar_como(
+                    emisor,
+                    SERVICIO,
+                    IFACE_SERVICIO,
+                    "GetSecrets",
+                    &(&pedidos, &sesion),
+                )
+                .await
+                .expect("GetSecrets devuelve la parte que se puede leer");
+            let mapa: HashMap<OwnedObjectPath, SecretStruct> =
+                respuesta.body().deserialize().expect("GetSecrets");
+            assert_eq!(
+                rutas_ordenadas(mapa.keys().cloned().collect()),
+                esperadas_para(emisor),
+                "GetSecrets de {emisor}"
+            );
+        }
+    }
+
+    /// Describir un ítem (`Attributes`, `Label`, `GetAll`) también es de su puerta.
+    #[tokio::test]
+    async fn describir_un_item_es_de_su_puerta() {
+        let almacen = con_las_dos_puertas_abiertas().await;
+
+        for emisor in EMISORES {
+            for item in ITEMS_CRUZADOS {
+                for propiedad in ["Attributes", "Label"] {
+                    let resultado = almacen
+                        .llamar_como(
+                            emisor,
+                            item,
+                            IFACE_PROPIEDADES,
+                            "Get",
+                            &(IFACE_ITEM, propiedad),
+                        )
+                        .await;
+                    if puede_tocar(emisor, item) {
+                        resultado.unwrap_or_else(|e| panic!("{emisor} describe {item}: {e}"));
+                    } else {
+                        let error = resultado.expect_err(&format!("{emisor} no describe {item}"));
+                        assert_eq!(
+                            nombre_del_error(&error),
+                            "org.freedesktop.DBus.Error.AccessDenied",
+                            "{propiedad} de {item} para {emisor}"
+                        );
+                    }
+                }
+
+                let respuesta = almacen
+                    .llamar_como(emisor, item, IFACE_PROPIEDADES, "GetAll", &(IFACE_ITEM,))
+                    .await
+                    .expect("GetAll");
+                let todas: HashMap<String, OwnedValue> =
+                    respuesta.body().deserialize().expect("GetAll");
+                assert_eq!(
+                    todas.contains_key("Attributes"),
+                    puede_tocar(emisor, item),
+                    "GetAll de {item} para {emisor}"
+                );
+            }
+        }
+    }
+
+    // ── Escritura, con el bus ──
+
+    /// Crear un ítem con el esquema de una puerta es de esa puerta, y sólo de
+    /// ella. Con la sesión cerrada: quien pasa recibe `IsLocked` y no escribe
+    /// nada; quien no, `AccessDenied`.
+    #[tokio::test]
+    async fn create_item_con_un_esquema_protegido_es_solo_de_su_puerta() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _cerrada = sesion_cerrada();
+        let almacen = con_las_dos_puertas_abiertas().await;
+
+        let dueno_de = |esquema: &str| match esquema {
+            ASSISTANT_SCHEMA => DEL_ASISTENTE,
+            _ => DEL_SINCRONIZADOR,
+        };
+        for esquema in [ACCOUNTS_STORE_SCHEMA, SMIME_SCHEMA, ASSISTANT_SCHEMA] {
+            for emisor in EMISORES {
+                for replace in [true, false] {
+                    let error = almacen
+                        .llamar_como(
+                            emisor,
+                            COLECCION_DEL_LOGIN,
+                            IFACE_COLECCION,
+                            "CreateItem",
+                            &(
+                                propiedades_con_esquema(Some(esquema)),
+                                secreto("elegida por quien llama"),
+                                replace,
+                            ),
+                        )
+                        .await
+                        .expect_err("con la sesión cerrada no se escribe");
+                    let espera = if emisor == dueno_de(esquema) {
+                        "org.freedesktop.Secret.Error.IsLocked"
+                    } else {
+                        "org.freedesktop.DBus.Error.AccessDenied"
+                    };
+                    assert_eq!(
+                        nombre_del_error(&error),
+                        espera,
+                        "CreateItem `{esquema}` de {emisor} con replace={replace}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Un esquema que sólo se parece al del asistente se crea sin pasar por
+    /// ninguna puerta, y ni se le pregunta al bus.
+    #[tokio::test]
+    async fn crear_con_un_esquema_parecido_al_del_asistente_no_pasa_por_la_puerta() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _cerrada = sesion_cerrada();
+        let almacen = con_las_dos_puertas_abiertas().await;
+
+        for esquema in [
+            "ar.net.vasak.os.Assistant2",
+            "ar.net.vasak.os.Assistant.Backup",
+        ] {
+            let error = almacen
+                .llamar_como(
+                    DE_UN_IMPOSTOR,
+                    COLECCION_DEL_LOGIN,
+                    IFACE_COLECCION,
+                    "CreateItem",
+                    &(
+                        propiedades_con_esquema(Some(esquema)),
+                        secreto("lo que sea"),
+                        true,
+                    ),
+                )
+                .await
+                .expect_err("con la sesión cerrada no se escribe");
+            assert_eq!(
+                nombre_del_error(&error),
+                "org.freedesktop.Secret.Error.IsLocked",
+                "`{esquema}`"
+            );
+        }
+        assert!(almacen.preguntados().await.is_empty());
+    }
+
+    /// `SetSecret` sobre cada ítem, desde cada uno.
+    #[tokio::test]
+    async fn set_secret_respeta_la_puerta_de_cada_esquema() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _cerrada = sesion_cerrada();
+        let almacen = con_las_dos_puertas_abiertas().await;
+
+        for emisor in EMISORES {
+            for item in ITEMS_CRUZADOS {
+                let error = almacen
+                    .llamar_como(emisor, item, IFACE_ITEM, "SetSecret", &(secreto("otra"),))
+                    .await
+                    .expect_err("con la sesión cerrada no se escribe");
+                let espera = if puede_tocar(emisor, item) {
+                    "org.freedesktop.Secret.Error.IsLocked"
+                } else {
+                    "org.freedesktop.DBus.Error.AccessDenied"
+                };
+                assert_eq!(
+                    nombre_del_error(&error),
+                    espera,
+                    "SetSecret de {emisor} sobre {item}"
+                );
+            }
+        }
+    }
+
+    /// `Item.Delete`: los cruzados se niegan y el ítem sigue ahí.
+    #[tokio::test]
+    async fn item_delete_no_cruza_de_un_esquema_a_otro() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        la_base_es_la_de_las_pruebas();
+        let almacen = con_las_dos_puertas_abiertas().await;
+
+        for emisor in EMISORES {
+            for item in [ITEM, ITEM_SMIME_CRUZADO, ITEM_DEL_ASISTENTE] {
+                if puede_tocar(emisor, item) {
+                    continue;
+                }
+                let error = almacen
+                    .llamar_como(emisor, item, IFACE_ITEM, "Delete", &())
+                    .await
+                    .expect_err("no se borra lo de otra puerta");
+                assert_eq!(
+                    nombre_del_error(&error),
+                    "org.freedesktop.DBus.Error.AccessDenied",
+                    "Delete de {emisor} sobre {item}"
+                );
+            }
+        }
+        assert_eq!(
+            almacen.estado.lock().await.items.len(),
+            4,
+            "ningún ítem se borró"
+        );
+    }
+
+    /// Y el dueño sí borra lo suyo, sin llevarse lo del vecino.
+    #[tokio::test]
+    async fn el_asistente_borra_su_clave_y_nada_mas() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        la_base_es_la_de_las_pruebas();
+        let almacen = con_las_dos_puertas_abiertas().await;
+
+        almacen
+            .llamar_como(DEL_ASISTENTE, ITEM_DEL_ASISTENTE, IFACE_ITEM, "Delete", &())
+            .await
+            .expect("el asistente borra su clave");
+
+        let estado = almacen.estado.lock().await;
+        assert!(!estado.items.contains_key(ITEM_DEL_ASISTENTE));
+        assert_eq!(estado.items.len(), 3, "los otros tres siguen");
+    }
+
+    /// `Collection.Delete` con una mezcla: nadie tiene todas las puertas, así que
+    /// ninguno la borra y no se pierde un solo ítem.
+    #[tokio::test]
+    async fn una_coleccion_con_items_de_dos_puertas_no_la_borra_ninguna() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        la_base_es_la_de_las_pruebas();
+        let almacen = con_las_dos_puertas_abiertas().await;
+
+        for emisor in EMISORES {
+            let error = almacen
+                .llamar_como(emisor, COLECCION_DEL_LOGIN, IFACE_COLECCION, "Delete", &())
+                .await
+                .expect_err("ninguno pasa las dos puertas");
+            assert_eq!(
+                nombre_del_error(&error),
+                "org.freedesktop.DBus.Error.AccessDenied",
+                "Collection.Delete de {emisor}"
+            );
+        }
+        let estado = almacen.estado.lock().await;
+        assert!(estado.collections.contains_key(COLECCION_DEL_LOGIN));
+        assert_eq!(estado.items.len(), 4);
+    }
+
+    /// Con sólo ítems de una puerta, la borra esa puerta y no la otra.
+    #[tokio::test]
+    async fn una_coleccion_con_items_de_una_sola_puerta_la_borra_esa_puerta() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        la_base_es_la_de_las_pruebas();
+
+        // Sólo ítems del asistente (y el común).
+        let almacen = con_las_dos_puertas_abiertas().await;
+        {
+            let mut s = almacen.estado.lock().await;
+            for ruta in [ITEM, ITEM_SMIME_CRUZADO] {
+                s.items.remove(ruta);
+                s.collections
+                    .get_mut(COLECCION_DEL_LOGIN)
+                    .expect("colección")
+                    .items
+                    .retain(|p| p != ruta);
+            }
+        }
+        for emisor in [DEL_SINCRONIZADOR, DE_UN_IMPOSTOR] {
+            let error = almacen
+                .llamar_como(emisor, COLECCION_DEL_LOGIN, IFACE_COLECCION, "Delete", &())
+                .await
+                .expect_err("la colección guarda la clave del asistente");
+            assert_eq!(
+                nombre_del_error(&error),
+                "org.freedesktop.DBus.Error.AccessDenied",
+                "Collection.Delete de {emisor}"
+            );
+        }
+        assert!(almacen
+            .estado
+            .lock()
+            .await
+            .collections
+            .contains_key(COLECCION_DEL_LOGIN));
+        almacen
+            .llamar_como(
+                DEL_ASISTENTE,
+                COLECCION_DEL_LOGIN,
+                IFACE_COLECCION,
+                "Delete",
+                &(),
+            )
+            .await
+            .expect("el asistente borra la colección que sólo guarda lo suyo");
+        assert!(!almacen
+            .estado
+            .lock()
+            .await
+            .collections
+            .contains_key(COLECCION_DEL_LOGIN));
+
+        // Sólo ítems del sincronizador (y el común): el asistente no la borra.
+        let almacen = con_las_dos_puertas_abiertas().await;
+        {
+            let mut s = almacen.estado.lock().await;
+            s.items.remove(ITEM_DEL_ASISTENTE);
+            s.collections
+                .get_mut(COLECCION_DEL_LOGIN)
+                .expect("colección")
+                .items
+                .retain(|p| p != ITEM_DEL_ASISTENTE);
+        }
+        for emisor in [DEL_ASISTENTE, DE_UN_IMPOSTOR] {
+            let error = almacen
+                .llamar_como(emisor, COLECCION_DEL_LOGIN, IFACE_COLECCION, "Delete", &())
+                .await
+                .expect_err("la colección guarda la clave del almacén");
+            assert_eq!(
+                nombre_del_error(&error),
+                "org.freedesktop.DBus.Error.AccessDenied",
+                "Collection.Delete de {emisor}"
+            );
+        }
+        almacen
+            .llamar_como(
+                DEL_SINCRONIZADOR,
+                COLECCION_DEL_LOGIN,
+                IFACE_COLECCION,
+                "Delete",
+                &(),
+            )
+            .await
+            .expect("el sincronizador borra la colección que sólo guarda lo suyo");
+    }
+
+    // ── El ejecutable, con el bus ──
+
+    /// Tener el nombre del asistente y ejecutar otra cosa no alcanza.
+    #[tokio::test]
+    async fn el_duenio_del_nombre_del_asistente_con_otro_ejecutable_se_niega() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let almacen = con_dos_puertas(&ejecutable_propio(), "/usr/bin/vasak-assistant-falso").await;
+
+        let error = almacen
+            .pedir_secreto_de(ITEM_DEL_ASISTENTE, Some(DEL_ASISTENTE))
+            .await
+            .expect_err("el ejecutable no es el del asistente");
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.DBus.Error.AccessDenied"
+        );
+        // La puerta del sincronizador no se rompió por eso.
+        almacen
+            .pedir_secreto_de(ITEM, Some(DEL_SINCRONIZADOR))
+            .await
+            .expect("el sincronizador sigue entrando");
+    }
+
+    /// Y al revés: el ejecutable del asistente no abre la puerta del sincronizador.
+    #[tokio::test]
+    async fn el_duenio_del_nombre_del_sincronizador_con_otro_ejecutable_se_niega() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let almacen =
+            con_dos_puertas("/usr/bin/vasak-accounts-sync-falso", &ejecutable_propio()).await;
+
+        let error = almacen
+            .pedir_secreto_de(ITEM, Some(DEL_SINCRONIZADOR))
+            .await
+            .expect_err("el ejecutable no es el del sincronizador");
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.DBus.Error.AccessDenied"
+        );
+        almacen
+            .pedir_secreto_de(ITEM_DEL_ASISTENTE, Some(DEL_ASISTENTE))
+            .await
+            .expect("el asistente sigue entrando");
+    }
+
+    /// Un ejecutable que no se puede leer es un no, para las dos puertas; lo
+    /// común sigue entregándose.
+    #[tokio::test]
+    async fn con_el_ejecutable_ilegible_no_entra_nadie_a_lo_protegido() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        let propio = ejecutable_propio();
+        let almacen = con_dos_puertas_y_pid(&propio, &propio, Some(pid_inexistente())).await;
+
+        for emisor in EMISORES {
+            for item in ITEMS_CRUZADOS {
+                let resultado = almacen.pedir_secreto_de(item, Some(emisor)).await;
+                if item == ITEM_COMUN {
+                    resultado.unwrap_or_else(|e| panic!("{emisor} lee la común: {e}"));
+                } else {
+                    let error = resultado.expect_err(&format!("{emisor} no lee {item}"));
+                    assert_eq!(
+                        nombre_del_error(&error),
+                        "org.freedesktop.DBus.Error.AccessDenied",
+                        "GetSecret de {emisor} sobre {item}"
+                    );
+                }
+            }
+        }
     }
 }

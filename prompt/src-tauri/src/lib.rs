@@ -31,6 +31,7 @@ const KEYRING_INTERFACE: &str = "org.vasak.Keyring";
 const UNLOCK_METHOD: &str = "Unlock";
 const RESET_METHOD: &str = "Reset";
 const LOGIN_REJECTED_PROPERTY: &str = "LoginPasswordRejected";
+const MISMATCHED_MACHINE_ID_PROPERTY: &str = "MismatchedMachineId";
 
 /// Hands the password to the daemon.
 ///
@@ -52,19 +53,41 @@ async fn unlock(password: String) -> Result<bool, String> {
         .await
         .map_err(|error| format!("{error}"))?;
 
+    if enviar_maestra(&connection, &maestra).await? {
+        return Ok(true);
+    }
+
+    // La maestra de ahora no abrió la base. Si `/etc/machine-id` cambió —disco
+    // clonado, reinstalación, contenedor—, la base está cifrada con la maestra de
+    // la sal de antes, y ninguna contraseña que se teclee la forma: lo que cambió
+    // es la sal, no la contraseña. El demonio dice con qué `machine-id` se cifró;
+    // se re-deriva con esa sal y, si abre, el demonio la re-cifra con la del
+    // inicio de sesión de ahora (vasak-keyring#38). Vacío = nada que recuperar.
+    let viejo = machine_id_desajustado(&connection).await;
+    if viejo.is_empty() {
+        return Ok(false);
+    }
+    let maestra_vieja = vasak_keyring_derivacion::derivar_con_sal(
+        &password,
+        &vasak_keyring_derivacion::sal_desde(&viejo),
+    )?;
+    enviar_maestra(&connection, &maestra_vieja).await
+}
+
+/// Entrega una maestra derivada por el método `Unlock` del demonio y devuelve si
+/// abrió la base. Un error de D-Bus con mensaje se propaga tal cual: el demonio
+/// lo escribe para que se lea (p. ej. cuánto falta tras tres intentos).
+async fn enviar_maestra(connection: &zbus::Connection, maestra: &str) -> Result<bool, String> {
     let reply = connection
         .call_method(
             Some(KEYRING_SERVICE),
             KEYRING_PATH,
             Some(KEYRING_INTERFACE),
             UNLOCK_METHOD,
-            &(maestra.as_str(),),
+            &(maestra,),
         )
         .await
         .map_err(|error| match error {
-            // What the daemon says is meant to be read: after three wrong
-            // passwords it answers with how long the wait is, and putting
-            // "the keyring did not answer" in front of that would be a lie.
             zbus::Error::MethodError(_, Some(message), _) => message,
             other => format!("{other}"),
         })?;
@@ -73,6 +96,21 @@ async fn unlock(password: String) -> Result<bool, String> {
         .body()
         .deserialize::<bool>()
         .map_err(|error| format!("{error}"))
+}
+
+/// El `machine-id` con el que se cifró la base si difiere del de ahora; vacío si
+/// no hay nada que recuperar o si no se pudo preguntar. Ante cualquier error,
+/// vacío: el flujo normal del diálogo sigue sirviendo (vasak-keyring#38).
+async fn machine_id_desajustado(connection: &zbus::Connection) -> String {
+    let Ok(proxy) =
+        zbus::Proxy::new(connection, KEYRING_SERVICE, KEYRING_PATH, KEYRING_INTERFACE).await
+    else {
+        return String::new();
+    };
+    proxy
+        .get_property::<String>(MISMATCHED_MACHINE_ID_PROPERTY)
+        .await
+        .unwrap_or_default()
 }
 
 /// Si la contraseña con la que se inició sesión no abrió el llavero
@@ -485,5 +523,62 @@ mod tests {
         for label in [WINDOW_LABEL, SSH_WINDOW_LABEL] {
             assert!(windows.contains(&label.to_string()), "falta «{label}»");
         }
+    }
+
+    /// El diálogo re-deriva con la sal del `machine-id` guardado: esa maestra tiene
+    /// que ser distinta de la de ahora, o reenviarla sería repetir el intento que
+    /// ya falló (vasak-keyring#38).
+    #[test]
+    fn con_la_sal_del_machine_id_viejo_la_maestra_es_otra() {
+        let ahora = vasak_keyring_derivacion::derivar_maestra("la-contraseña").unwrap();
+        let sal_vieja = vasak_keyring_derivacion::sal_desde("el-machine-id-de-antes");
+        let vieja = vasak_keyring_derivacion::derivar_con_sal("la-contraseña", &sal_vieja).unwrap();
+
+        assert_ne!(*ahora, *vieja);
+        // Y es la misma que daría la derivación de aquel entonces: la que abre la
+        // base cifrada antes del cambio.
+        let otra_vez = vasak_keyring_derivacion::derivar_con_sal(
+            "la-contraseña",
+            &vasak_keyring_derivacion::sal_desde("el-machine-id-de-antes"),
+        )
+        .unwrap();
+        assert_eq!(*vieja, *otra_vez);
+    }
+
+    /// Una conexión punto a punto con el demonio del otro lado.
+    async fn conexion_sin_demonio() -> (zbus::Connection, zbus::Connection) {
+        let (a, b) = tokio::net::UnixStream::pair().unwrap();
+        let servidor = zbus::connection::Builder::unix_stream(a)
+            .server(zbus::Guid::generate())
+            .unwrap()
+            .p2p()
+            .build();
+        let cliente = zbus::connection::Builder::unix_stream(b).p2p().build();
+        let (servidor, cliente) = tokio::join!(servidor, cliente);
+        (cliente.unwrap(), servidor.unwrap())
+    }
+
+    /// Ante cualquier error, vacío: el diálogo no inventa una recuperación y el
+    /// flujo de siempre sigue sirviendo.
+    #[tokio::test]
+    async fn si_el_demonio_no_contesta_no_hay_machine_id_desajustado() {
+        let (cliente, servidor) = conexion_sin_demonio().await;
+        // El demonio se cayó: la conexión se cierra del otro lado. Con el tope,
+        // una regresión cuelga la prueba con un mensaje y no la corrida entera.
+        drop(servidor);
+
+        let respuesta = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            machine_id_desajustado(&cliente),
+        )
+        .await
+        .expect("preguntarle a un demonio caído no puede colgar el diálogo");
+        assert_eq!(respuesta, "");
+    }
+
+    /// La propiedad que lee el diálogo se llama como la que publica el demonio.
+    #[test]
+    fn la_propiedad_del_machine_id_se_llama_como_la_del_demonio() {
+        assert_eq!(MISMATCHED_MACHINE_ID_PROPERTY, "MismatchedMachineId");
     }
 }

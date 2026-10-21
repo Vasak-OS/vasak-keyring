@@ -67,11 +67,24 @@ const CARRILES: u32 = 1;
 /// dejar el llavero sin abrir: un contenedor o un sistema recién instalado puede
 /// no tener `machine-id` todavía.
 pub fn sal() -> Vec<u8> {
-    let identificador = std::fs::read_to_string(RUTA_MACHINE_ID)
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+    sal_desde(&machine_id())
+}
 
-    sal_desde(&identificador)
+/// El identificador de la máquina, crudo y recortado, o cadena vacía si no se
+/// puede leer.
+///
+/// Es la fuente de la sal, expuesta aparte porque el demonio **también** lo
+/// guarda al lado de la base: si `/etc/machine-id` cambia —disco clonado,
+/// reinstalación, contenedor—, la sal cambia y la maestra derivada ya no abre la
+/// base. Teniendo el identificador con el que se cifró, la maestra se puede
+/// volver a derivar con la sal vieja y re-cifrar con la nueva, sin que nadie
+/// tenga que tipear nada (vasak-keyring#38). Una sola fuente para la sal y para
+/// esa marca, por lo mismo que la derivación vive en un crate propio: si
+/// divergieran, la marca apuntaría a una sal que no es la que se usó.
+pub fn machine_id() -> String {
+    std::fs::read_to_string(RUTA_MACHINE_ID)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// La sal para un identificador dado. Separado para poder probarlo.
@@ -182,6 +195,48 @@ mod tests {
         assert_ne!(
             *derivar_con_sal("contraseña", &sal).unwrap(),
             *derivar_con_sal("contrasena", &sal).unwrap()
+        );
+    }
+
+    #[test]
+    fn la_sal_de_siempre_es_la_del_machine_id() {
+        // Una sola fuente: el demonio guarda `machine_id()` al lado de la base y,
+        // si la sal saliera de otro lado, la marca apuntaría a una sal que no es
+        // la que se usó (vasak-keyring#38).
+        assert_eq!(sal(), sal_desde(&machine_id()));
+    }
+
+    #[test]
+    fn el_machine_id_sale_recortado_o_vacio_si_no_se_lee() {
+        let crudo = std::fs::read_to_string(RUTA_MACHINE_ID).unwrap_or_default();
+
+        assert_eq!(machine_id(), crudo.trim());
+        assert!(!machine_id().contains(char::is_whitespace));
+    }
+
+    #[test]
+    fn otro_machine_id_da_otra_sal_y_otra_maestra() {
+        // El síntoma de #38: la misma contraseña, otro `/etc/machine-id`, y la
+        // maestra ya no es la que cifró la base.
+        let antes = sal_desde("machine-id-de-antes");
+        let ahora = sal_desde("machine-id-de-ahora");
+        assert_ne!(antes, ahora);
+
+        let con_la_de_antes = derivar_con_sal("la misma contraseña", &antes).unwrap();
+        let con_la_de_ahora = derivar_con_sal("la misma contraseña", &ahora).unwrap();
+        assert_ne!(*con_la_de_antes, *con_la_de_ahora);
+
+        // Y volver a la sal de antes devuelve la maestra de antes: es lo que
+        // permite recuperar la base sin tipear otra contraseña.
+        let otra_vez = derivar_con_sal("la misma contraseña", &sal_desde("machine-id-de-antes"));
+        assert_eq!(*con_la_de_antes, *otra_vez.unwrap());
+    }
+
+    #[test]
+    fn derivar_la_maestra_usa_la_sal_de_esta_maquina() {
+        assert_eq!(
+            *derivar_maestra("una contraseña").unwrap(),
+            *derivar_con_sal("una contraseña", &sal_desde(&machine_id())).unwrap()
         );
     }
 }

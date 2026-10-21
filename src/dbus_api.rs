@@ -8305,22 +8305,16 @@ pub(crate) mod tests {
         (desbloqueo, estado, demonio, cliente)
     }
 
-    /// Deja correr a las tareas lanzadas hasta que `aplicar` haya abierto la base
-    /// y llegado al re-cifrado: lo marca que olvida la contraseña rechazada, que
-    /// es lo último que hace antes de pedir el turno.
-    async fn hasta_el_re_cifrado() {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while rejected_login().is_some() {
-                tokio::task::yield_now().await;
-            }
-            // Unas vueltas más, por si el desbloqueo se quedó sin presupuesto del
-            // runtime justo ahí: sin turno, en estas vueltas re-cifraría.
-            for _ in 0..50 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("el desbloqueo con la contraseña anterior no llegó al re-cifrado");
+    /// Deja correr a las tareas lanzadas unas cuantas vueltas del runtime.
+    ///
+    /// Con el turno de guardado tomado por la prueba, `aplicar` se queda esperándolo
+    /// **antes** de publicar la base, así que no hay una señal de estado que
+    /// anuncie que llegó ahí: lo que se puede afirmar es que, por muchas vueltas
+    /// que se le den, no avanza ni escribe.
+    async fn unas_vueltas() {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
     }
 
     /// El re-cifrado no escribe mientras un guardado tiene el turno: es lo que
@@ -8334,7 +8328,7 @@ pub(crate) mod tests {
 
         let turno = save_turn().lock().await;
         let migracion = tokio::spawn(async move { desbloqueo.aplicar("la-vieja").await });
-        hasta_el_re_cifrado().await;
+        unas_vueltas().await;
 
         assert!(
             !migracion.is_finished(),
@@ -8360,14 +8354,14 @@ pub(crate) mod tests {
         );
     }
 
-    /// `aplicar` con re-cifrado y un guardado de la colección que llegan a la vez
-    /// no se traban, y la base termina con la contraseña del login y con todo:
+    /// El re-cifrado y los guardados de la colección que vienen después no se
+    /// traban entre sí, y la base termina con la contraseña del login y con todo:
     /// lo que había y lo que agregó el guardado.
     ///
-    /// El orden es el que más castiga un candado mal ordenado: el re-cifrado
-    /// espera el turno primero y el guardado después, así que al soltarlo el
-    /// re-cifrado lo recibe y va por el candado del estado. Si el guardado tomara
-    /// el estado antes que el turno, los dos quedarían esperándose para siempre.
+    /// Con el turno tomado desde antes de publicar, ningún guardado puede
+    /// colarse: antes de que `aplicar` publique, las escrituras están bloqueadas.
+    /// El guardado llega por eso después, y tiene que encontrar el turno libre
+    /// —sin que el re-cifrado haya dejado un candado tomado— y la maestra de ahora.
     #[tokio::test]
     async fn el_re_cifrado_y_un_guardado_a_la_vez_no_se_traban() {
         let _sesion = estado_de_la_sesion().lock().await;
@@ -8383,29 +8377,18 @@ pub(crate) mod tests {
 
         let turno = save_turn().lock().await;
         let migracion = tokio::spawn(async move { desbloqueo.aplicar("la-vieja").await });
-        hasta_el_re_cifrado().await;
-
-        // Lo que agregaría una aplicación con el llavero ya abierto.
-        agregar(&estado, "/prueba/items/nueva", b"la de la aplicacion").await;
-        let guardado = tokio::spawn(async move { coleccion.persist().await });
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
+        unas_vueltas().await;
+        assert!(!migracion.is_finished());
         assert_eq!(
             secretos_de_la_base("la-vieja"),
             vec![b"el secreto de la persona".to_vec()],
-            "con el turno tomado, ni el re-cifrado ni el guardado escriben"
+            "con el turno tomado, el re-cifrado no escribe"
         );
 
         drop(turno);
-        let (abierto, guardado) =
-            tokio::time::timeout(plazo, async { tokio::join!(migracion, guardado) })
-                .await
-                .expect("el re-cifrado y el guardado se trabaron entre sí");
-        assert!(abierto
-            .unwrap()
-            .expect("la contraseña anterior abre la base"));
-        guardado
+        let abierto = tokio::time::timeout(plazo, migracion)
+            .await
+            .expect("el re-cifrado se trabó")
             .unwrap()
             .expect("el guardado de la colección tiene que poder escribir");
 
@@ -8426,6 +8409,14 @@ pub(crate) mod tests {
     // ── Una puerta por esquema (#55) ──
     //
     // `PROTECTED_SCHEMAS` es una tabla esquema -> puerta. Lo que se prueba acá es
+            .expect("la contraseña anterior abre la base");
+        assert!(abierto);
+
+        // Lo que agregaría una aplicación con el llavero ya abierto.
+        agregar(&estado, "/prueba/items/nueva", b"la de la aplicacion").await;
+        tokio::time::timeout(plazo, coleccion.persist())
+            .await
+            .expect("el guardado se trabó contra el re-cifrado")
     // lo que ese cambio promete: quien pasa la puerta de un esquema no toca los
     // ítems de otro. Hace falta un bus falso con **un dueño por nombre**: con
     // uno solo para todos los nombres, el asistente pasaría también por la puerta
@@ -8442,6 +8433,69 @@ pub(crate) mod tests {
     /// La clave del proveedor del asistente.
     const ITEM_DEL_ASISTENTE: &str = "/org/freedesktop/secrets/collection/login/items/11";
     const EMISORES: [&str; 3] = [DEL_SINCRONIZADOR, DEL_ASISTENTE, DE_UN_IMPOSTOR];
+    /// F1: entre abrir la base con la maestra de la sal vieja y re-cifrarla, no se
+    /// puede colar ninguna escritura. Un guardado externo en esa ventana escribiría
+    /// la base con la maestra vieja y, en el mismo `write_to`, sellaría la marca
+    /// con el `machine-id` de ahora; si el demonio muriera ahí, quedaría una base
+    /// de la sal vieja con una marca que dice la de ahora y la recuperación se
+    /// perdería para siempre (vasak-keyring#38).
+    ///
+    /// Con el turno de guardado tomado, la recuperación no publica ni escribe nada:
+    /// ni la base ni la marca se mueven, y la maestra vieja no llega a la memoria.
+    /// Al soltarlo, re-cifra con la de ahora y recién entonces sella la marca.
+    #[tokio::test]
+    async fn la_recuperacion_espera_el_turno_antes_de_publicar_y_no_sella_la_marca_antes() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        let (desbloqueo, estado, _demonio, _cliente) = base_por_migrar().await;
+        marca_a_mano(MACHINE_ID_VIEJO);
+        let original = std::fs::read(base_de_las_pruebas()).unwrap();
+
+        let turno = save_turn().lock().await;
+        let migracion = tokio::spawn(async move { desbloqueo.aplicar("la-vieja").await });
+        unas_vueltas().await;
+
+        assert!(!migracion.is_finished(), "espera el turno de guardado");
+        assert!(
+            estado.lock().await.items.is_empty(),
+            "sin el turno no se publica: la colección abierta con la maestra de la sal \
+             vieja no llega a estar a la vista de un guardado externo"
+        );
+        assert_eq!(
+            rejected_login().as_deref().map(String::as_str),
+            Some("la-nueva"),
+            "la maestra del login sigue esperando"
+        );
+        assert_eq!(
+            std::fs::read(base_de_las_pruebas()).unwrap(),
+            original,
+            "la base no se tocó"
+        );
+        assert_eq!(
+            marca_en_disco().as_deref(),
+            Some(MACHINE_ID_VIEJO),
+            "la marca sigue diciendo el machine-id viejo mientras la base es de la sal vieja"
+        );
+
+        drop(turno);
+        let abierto = tokio::time::timeout(std::time::Duration::from_secs(10), migracion)
+            .await
+            .expect("al soltar el turno, la recuperación tiene que terminar")
+            .unwrap()
+            .expect("la contraseña anterior abre la base");
+        assert!(abierto);
+        assert_eq!(
+            secretos_de_la_base("la-nueva"),
+            vec![b"el secreto de la persona".to_vec()]
+        );
+        assert_eq!(
+            marca_en_disco(),
+            Some(machine_id_de_ahora()),
+            "re-cifrada con la de ahora, recién ahora la marca es la de ahora"
+        );
+        assert_eq!(mismatched_machine_id(), "");
+    }
+
     /// Almacén (sync), S/MIME (sync), asistente y uno común.
     const ITEMS_CRUZADOS: [&str; 4] = [ITEM, ITEM_SMIME_CRUZADO, ITEM_DEL_ASISTENTE, ITEM_COMUN];
 

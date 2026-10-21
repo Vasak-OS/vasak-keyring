@@ -22,6 +22,11 @@ use zeroize::Zeroizing;
 const PAM_SUCCESS: c_int = 0;
 const PAM_IGNORE: c_int = 25;
 const PAM_AUTHTOK: c_int = 6;
+/// Item de PAM con la contraseña **anterior**, la que se está cambiando.
+const PAM_OLDAUTHTOK: c_int = 7;
+/// Bandera de `pam_sm_chauthtok` en la fase que de verdad cambia la contraseña.
+/// La otra, `PAM_PRELIM_CHECK`, sólo comprueba; ahí la nueva todavía no está.
+const PAM_UPDATE_AUTHTOK: c_int = 0x2000;
 const LOG_AUTH: c_int = 4;
 
 /// Lo que contesta `pam_set_data` cuando no hay lugar para guardar el dato, y lo
@@ -367,7 +372,7 @@ fn target_uid(pamh: *mut pam_handle_t) -> Option<u32> {
 /// ventana es de microsegundos y ganarla ya no sirve para llevarse la contraseña
 /// de la cuenta, sólo la maestra del llavero, que un proceso del usuario ya podía
 /// obtener pidiéndole los secretos al Secret Service.
-fn ruta_sin_desviar(uid: u32) -> Result<(), std::io::Error> {
+fn ruta_sin_desviar(uid: u32, socket: &CStr) -> Result<(), std::io::Error> {
     use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
     fn abrir_directorio(base: Option<&OwnedFd>, nombre: &CStr) -> Result<OwnedFd, std::io::Error> {
@@ -417,7 +422,7 @@ fn ruta_sin_desviar(uid: u32) -> Result<(), std::io::Error> {
     let hecho = unsafe {
         libc::fstatat(
             dir_llavero.as_raw_fd(),
-            c"unlock.sock".as_ptr(),
+            socket.as_ptr(),
             &mut datos,
             libc::AT_SYMLINK_NOFOLLOW,
         )
@@ -428,13 +433,16 @@ fn ruta_sin_desviar(uid: u32) -> Result<(), std::io::Error> {
     if datos.st_mode & libc::S_IFMT != libc::S_IFSOCK {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "unlock.sock no es un socket",
+            format!("{} no es un socket", socket.to_string_lossy()),
         ));
     }
     if datos.st_uid != uid {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "unlock.sock no es del usuario del inicio de sesión",
+            format!(
+                "{} no es del usuario del inicio de sesión",
+                socket.to_string_lossy()
+            ),
         ));
     }
 
@@ -467,7 +475,7 @@ fn entregar(uid: u32, password: &str) -> Entrega {
     for intento in 0..INTENTOS {
         // Antes de cada intento, no una sola vez: entre reintentos pasan
         // doscientos milisegundos y el socket puede aparecer desviado.
-        if let Err(e) = ruta_sin_desviar(uid) {
+        if let Err(e) = ruta_sin_desviar(uid, c"unlock.sock") {
             if todavia_arrancando(e.kind()) && intento + 1 < INTENTOS {
                 ultimo = e;
                 std::thread::sleep(ESPERA_ENTRE_INTENTOS);
@@ -493,6 +501,63 @@ fn entregar(uid: u32, password: &str) -> Entrega {
     }
 
     Entrega::SinDemonio(ultimo)
+}
+
+// ── Rekey al cambiar la contraseña (vasak-keyring#38) ──────
+
+/// La ruta del socket de rekey, armada igual que la del demonio.
+fn ruta_del_socket_rekey(uid: u32) -> String {
+    format!("/run/user/{uid}/vasak-keyring/rekey.sock")
+}
+
+/// Lee un token del handle de PAM (`PAM_AUTHTOK` o `PAM_OLDAUTHTOK`) como cadena
+/// propia y zeroizable. `None` si no hay nada bajo ese item.
+fn leer_authtok(pamh: *mut pam_handle_t, item: c_int) -> Option<Zeroizing<String>> {
+    let mut authtok: *const c_char = std::ptr::null();
+    let ret = unsafe { pam_get_authtok(pamh, item, &mut authtok, std::ptr::null()) };
+    if ret != PAM_SUCCESS || authtok.is_null() {
+        return None;
+    }
+    let token = unsafe { CStr::from_ptr(authtok) };
+    Some(Zeroizing::new(token.to_string_lossy().into_owned()))
+}
+
+/// Arma el marco de rekey: los dos secretos largo-prefijados (u32 LE), la
+/// maestra vieja y la nueva, en ese orden.
+///
+/// En un `Zeroizing<Vec<u8>>` porque lleva las maestras derivadas: aunque valen
+/// menos que la contraseña de la cuenta, no tienen por qué quedar en el montón
+/// más de lo necesario.
+fn marco_rekey(vieja: &str, nueva: &str) -> Zeroizing<Vec<u8>> {
+    let mut marco = Zeroizing::new(Vec::with_capacity(8 + vieja.len() + nueva.len()));
+    for secreto in [vieja, nueva] {
+        marco.extend_from_slice(&(secreto.len() as u32).to_le_bytes());
+        marco.extend_from_slice(secreto.as_bytes());
+    }
+    marco
+}
+
+/// Entrega el marco de rekey al demonio y devuelve si re-cifró la base.
+///
+/// Un solo intento, sin la espera de arranque del desbloqueo: el cambio de
+/// contraseña pasa con la sesión abierta, así que el demonio ya está corriendo.
+/// La comprobación de que la ruta no esté desviada es la misma del desbloqueo.
+fn entregar_rekey(uid: u32, vieja: &str, nueva: &str) -> Result<bool, std::io::Error> {
+    ruta_sin_desviar(uid, c"rekey.sock")?;
+
+    let ruta = ruta_del_socket_rekey(uid);
+    let mut flujo = UnixStream::connect(&ruta)?;
+    flujo.set_write_timeout(Some(PLAZO))?;
+    flujo.set_read_timeout(Some(PLAZO))?;
+
+    let marco = marco_rekey(vieja, nueva);
+    flujo.write_all(&marco)?;
+    // El demonio lee hasta el fin del flujo, igual que en el desbloqueo.
+    flujo.shutdown(std::net::Shutdown::Write)?;
+
+    let mut respuesta = [0u8; 1];
+    flujo.read_exact(&mut respuesta)?;
+    Ok(respuesta[0] == b'1')
 }
 
 // ════════════════════════════════════════════════════════════
@@ -642,6 +707,95 @@ pub extern "C" fn pam_sm_open_session(
     }
 
     // password zeroized automatically on drop (Zeroizing)
+
+    PAM_SUCCESS
+}
+
+/// Called during the password-change phase (`passwd` y cualquier cambio por PAM).
+///
+/// Re-cifra la base del llavero con la contraseña nueva de la cuenta para que el
+/// próximo inicio de sesión la abra sin pedir la anterior (vasak-keyring#38). El
+/// demonio lo hace de forma no destructiva: si la base no abre con la vieja, no
+/// toca nada, y lo que acá no se cubra lo recupera el flujo del próximo login.
+///
+/// PAM lo llama dos veces: con `PAM_PRELIM_CHECK` y con `PAM_UPDATE_AUTHTOK`.
+/// Sólo la fase de actualización —después de que la contraseña cambió— tiene la
+/// nueva puesta, así que la preliminar no hace nada.
+///
+/// Siempre devuelve `PAM_SUCCESS`: un llavero que no se puede re-cifrar no debe
+/// trabar el cambio de contraseña, y lo que viaja es la maestra derivada, nunca
+/// la contraseña de la cuenta —el socket vive en `/run/user/<uid>`, del usuario,
+/// igual que el de desbloqueo—.
+#[no_mangle]
+pub extern "C" fn pam_sm_chauthtok(
+    pamh: *mut pam_handle_t,
+    flags: c_int,
+    _argc: c_int,
+    _argv: *mut *const c_char,
+) -> c_int {
+    if flags & PAM_UPDATE_AUTHTOK == 0 {
+        // Fase preliminar: la contraseña nueva todavía no está puesta.
+        return PAM_SUCCESS;
+    }
+
+    let (Some(vieja), Some(nueva)) = (
+        leer_authtok(pamh, PAM_OLDAUTHTOK),
+        leer_authtok(pamh, PAM_AUTHTOK),
+    ) else {
+        log(
+            pamh,
+            "pam_vasak_keyring: sin contraseña anterior o nueva en chauthtok; no se re-cifra",
+        );
+        return PAM_SUCCESS;
+    };
+
+    // Una contraseña vacía no es la que cifra la base; dejarla pasar derivaría una
+    // maestra para nada. Igual que en `pam_sm_open_session`.
+    if vieja.is_empty() || nueva.is_empty() {
+        return PAM_SUCCESS;
+    }
+
+    let Some(uid) = target_uid(pamh) else {
+        log(
+            pamh,
+            "pam_vasak_keyring: no se pudo resolver el usuario del cambio de contraseña",
+        );
+        return PAM_SUCCESS;
+    };
+
+    let maestra_vieja = match vasak_keyring_derivacion::derivar_maestra(&vieja) {
+        Ok(m) => m,
+        Err(e) => {
+            log(pamh, &format!("pam_vasak_keyring: {e}"));
+            return PAM_SUCCESS;
+        }
+    };
+    let maestra_nueva = match vasak_keyring_derivacion::derivar_maestra(&nueva) {
+        Ok(m) => m,
+        Err(e) => {
+            log(pamh, &format!("pam_vasak_keyring: {e}"));
+            return PAM_SUCCESS;
+        }
+    };
+
+    match entregar_rekey(uid, &maestra_vieja, &maestra_nueva) {
+        Ok(true) => log(
+            pamh,
+            "pam_vasak_keyring: el llavero se re-cifró con la contraseña nueva",
+        ),
+        Ok(false) => log(
+            pamh,
+            "pam_vasak_keyring: el demonio no re-cifró el llavero; \
+             se pedirá la contraseña anterior en el próximo inicio de sesión",
+        ),
+        Err(e) => log(
+            pamh,
+            &format!(
+                "pam_vasak_keyring: no se pudo entregar el rekey al demonio ({e}); \
+                 se pedirá la contraseña anterior en el próximo inicio de sesión"
+            ),
+        ),
+    }
 
     PAM_SUCCESS
 }
@@ -807,7 +961,7 @@ mod tests_ruta {
     #[test]
     fn sin_directorio_de_runtime_no_hay_entrega() {
         // 61234 no tiene sesión; su /run/user no existe.
-        let error = ruta_sin_desviar(61234).expect_err("no debería haber ruta");
+        let error = ruta_sin_desviar(61234, c"unlock.sock").expect_err("no debería haber ruta");
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         // Y eso cuenta como «todavía no arrancó», así que se reintenta en lugar
         // de darse por vencido al primer intento del inicio de sesión.

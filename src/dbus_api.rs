@@ -3282,6 +3282,83 @@ fn reencrypt(
     write_to(path, items).inspect_err(|_| set_master_password(anterior))
 }
 
+/// Resultado de re-cifrar la base al cambiar la contraseña de la cuenta.
+///
+/// Cada variante es una respuesta distinta para el socket de rekey y una línea
+/// distinta en el diario. `NoAbre` no es un error: es la regla no destructiva en
+/// acción —la base está cifrada con otra contraseña y no se toca—, y de eso se
+/// encarga el flujo de recuperación del próximo inicio de sesión.
+pub enum RekeyResultado {
+    /// Se re-cifró con la maestra nueva, o no había base todavía: nada que perder.
+    Hecho,
+    /// La base existe pero la maestra vieja no la abre. No se re-cifra nada.
+    NoAbre,
+    /// No se pudo leer o escribir la base.
+    Error(String),
+}
+
+/// Re-cifra la base del disco con `nueva`, descifrándola con `vieja`.
+///
+/// Es el camino proactivo de vasak-keyring#38: el módulo de PAM lo dispara con
+/// `pam_sm_chauthtok` al cambiar la contraseña de la cuenta, antes de que el
+/// próximo inicio de sesión se tope con una base que su contraseña ya no abre.
+/// Resuelve la ruta como `aplicar`, desde el entorno del demonio.
+pub async fn rekey_contrasena(vieja: &str, nueva: &str) -> RekeyResultado {
+    let Some(path) = keyring_path() else {
+        return RekeyResultado::Error("no se pudo determinar la ruta del llavero".to_string());
+    };
+    rekey_en(&path, vieja, nueva).await
+}
+
+/// [`rekey_contrasena`] con la ruta explícita, para poder probarla sin el entorno.
+///
+/// **No destructivo**: si la base no abre con `vieja`, no se escribe nada. Puede
+/// pasar si se cifró con una contraseña aún más vieja que nunca se recuperó; en
+/// ese caso queda para el flujo de recuperación del diálogo, que ya existe.
+async fn rekey_en(path: &std::path::Path, vieja: &str, nueva: &str) -> RekeyResultado {
+    // El mismo orden de candados que el resto de lo que cambia con qué maestra se
+    // abre la base —primero el turno de desbloqueo, después el de guardado— para
+    // que un guardado en curso no escriba su foto encima del re-cifrado y un
+    // desbloqueo no corra a la vez.
+    let _desbloqueo = unlock_turn().lock().await;
+    let _guardado = save_turn().lock().await;
+
+    let raw = match leer_base(path).await {
+        Ok(Some(raw)) => raw,
+        // Máquina nueva, sin base todavía: nada que re-cifrar. La contraseña de la
+        // cuenta nueva será la maestra de la base que se cree al primer guardado.
+        Ok(None) => return RekeyResultado::Hecho,
+        Err(e) => return RekeyResultado::Error(e.to_string()),
+    };
+
+    let db = match crypto::decrypt_database(&raw, vieja) {
+        Ok(db) => db,
+        // Regla no destructiva: la base está cifrada con otra. No se toca.
+        Err(_) => return RekeyResultado::NoAbre,
+    };
+
+    let data = match crypto::encrypt_database(&db, nueva) {
+        Ok(d) => d,
+        Err(e) => return RekeyResultado::Error(e),
+    };
+    if let Err(e) = write_atomically(path, &data) {
+        return RekeyResultado::Error(format!("no se pudo escribir {}: {e}", path.display()));
+    }
+
+    // Si esta sesión tenía la vieja en memoria, seguirla a la nueva: el disco ya
+    // quedó con la nueva, y un guardado posterior con la vieja volvería a cifrar la
+    // base con una contraseña que el próximo inicio de sesión no forma. Con el
+    // llavero cerrado no se toca la memoria: el próximo login con la nueva lo abre.
+    if master_password()
+        .map(|m| m.as_str() == vieja)
+        .unwrap_or(false)
+    {
+        set_master_password(nueva);
+    }
+
+    RekeyResultado::Hecho
+}
+
 /// Renombra la base a `keyring.db.apartada-<segundos>` y devuelve la ruta nueva.
 ///
 /// Con `rename` y no copiando: es el mismo directorio, así que es atómico y no

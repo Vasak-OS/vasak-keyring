@@ -62,6 +62,53 @@ pub fn ruta_del_socket(uid: u32) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("/run/user/{uid}/vasak-keyring")).join("unlock.sock")
 }
 
+/// Tope de cada secreto del marco de rekey. Una maestra derivada son 64 dígitos
+/// hex; 256 deja margen sin dejar que nadie infle la memoria del demonio.
+const MAXIMO_SECRETO: usize = 256;
+/// Tope del marco de rekey entero: dos largos de 4 bytes y dos secretos.
+const MAXIMO_REKEY: u64 = (4 + MAXIMO_SECRETO + 4 + MAXIMO_SECRETO) as u64;
+
+/// La ruta del socket de rekey para un uid, al lado del de desbloqueo. La misma
+/// que arma el módulo de PAM.
+pub fn ruta_del_socket_rekey(uid: u32) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("/run/user/{uid}/vasak-keyring")).join("rekey.sock")
+}
+
+/// Interpreta un marco de rekey: dos secretos largo-prefijados (u32 LE), la
+/// maestra **vieja** y la **nueva**, en ese orden.
+///
+/// Largo-prefijado y no delimitado por un byte, al revés que el socket de
+/// desbloqueo: ahí el payload entero es una sola contraseña y un `\n` final se
+/// recorta; acá hay **dos** secretos y cualquiera podría contener cualquier byte,
+/// así que un separador se confundiría con contenido. El largo no deja ambigüedad.
+pub fn interpretar_rekey(bytes: &[u8]) -> Result<(String, String), &'static str> {
+    fn tomar(resto: &[u8]) -> Result<(&[u8], &[u8]), &'static str> {
+        let (largo, resto) = resto
+            .split_first_chunk::<4>()
+            .ok_or("marco incompleto: falta el largo de un secreto")?;
+        let largo = u32::from_le_bytes(*largo) as usize;
+        if largo == 0 {
+            return Err("un secreto del marco llegó vacío");
+        }
+        if largo > MAXIMO_SECRETO {
+            return Err("un secreto del marco es demasiado largo");
+        }
+        if resto.len() < largo {
+            return Err("marco incompleto: faltan bytes de un secreto");
+        }
+        Ok(resto.split_at(largo))
+    }
+
+    let (vieja, resto) = tomar(bytes)?;
+    let (nueva, resto) = tomar(resto)?;
+    if !resto.is_empty() {
+        return Err("sobran bytes después del marco de rekey");
+    }
+    let vieja = std::str::from_utf8(vieja).map_err(|_| "la maestra vieja no es UTF-8 válido")?;
+    let nueva = std::str::from_utf8(nueva).map_err(|_| "la maestra nueva no es UTF-8 válido")?;
+    Ok((vieja.to_string(), nueva.to_string()))
+}
+
 /// Quién puede entregar una contraseña por este socket: sólo root.
 ///
 /// Root, porque es quien acaba de autenticar a la persona y tiene la contraseña
@@ -131,7 +178,20 @@ async fn preparar_ruta(ruta: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Deja el socket escuchando y devuelve la tarea que lo atiende.
+/// Deja un socket listo para escuchar: prepara el directorio, hace el `bind` y
+/// fija el 0600. El 0600 va después del `bind`, que es quien crea el archivo.
+async fn abrir_socket(ruta: &std::path::Path) -> std::io::Result<UnixListener> {
+    preparar_ruta(ruta).await?;
+    let listener = UnixListener::bind(ruta)?;
+    fijar_permisos(ruta, 0o600).await?;
+    Ok(listener)
+}
+
+/// Deja los sockets escuchando y devuelve las tareas que los atienden.
+///
+/// Son dos, en el mismo directorio `/run/user/<uid>/vasak-keyring`: el de
+/// desbloqueo (la contraseña al iniciar sesión) y el de rekey (re-cifrar la base
+/// al cambiar la contraseña de la cuenta, vasak-keyring#38).
 ///
 /// Se llama **después** de reclamar el nombre de D-Bus: recién ahí se sabe que
 /// este proceso es el único demonio, y por lo tanto que un socket que haya
@@ -142,17 +202,13 @@ pub async fn escuchar(
     conn: zbus::Connection,
 ) -> std::io::Result<()> {
     let uid_propio = unsafe { libc::geteuid() };
-    let ruta = ruta_del_socket(uid_propio);
 
-    preparar_ruta(&ruta).await?;
-
-    let listener = UnixListener::bind(&ruta)?;
-    // 0600 después del bind, no antes: el archivo lo crea el bind.
-    fijar_permisos(&ruta, 0o600).await?;
+    let desbloqueo = abrir_socket(&ruta_del_socket(uid_propio)).await?;
+    let rekey = abrir_socket(&ruta_del_socket_rekey(uid_propio)).await?;
 
     tokio::spawn(async move {
         loop {
-            let (stream, _) = match listener.accept().await {
+            let (stream, _) = match desbloqueo.accept().await {
                 Ok(par) => par,
                 // Un accept que falla no es motivo para dejar de escuchar el
                 // resto de la sesión: sin este socket no hay desbloqueo.
@@ -175,7 +231,116 @@ pub async fn escuchar(
         }
     });
 
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match rekey.accept().await {
+                Ok(par) => par,
+                Err(e) => {
+                    eprintln!("vasak-keyring: accept falló en el socket de rekey: {e}");
+                    tokio::time::sleep(REPOSO_TRAS_FALLO).await;
+                    continue;
+                }
+            };
+
+            tokio::spawn(async move {
+                atender_rekey(stream, uid_propio).await;
+            });
+        }
+    });
+
     Ok(())
+}
+
+/// Un rekey: verifica que llame root, lee el marco, re-cifra, contesta un byte.
+///
+/// Sólo root, por lo mismo que el socket de desbloqueo: quien cambió la
+/// contraseña y validó las dos es `pam_sm_chauthtok`, que corre como root. Un
+/// proceso de la sesión no puede usar esto para elegir con qué maestra se cifra.
+async fn atender_rekey(mut stream: UnixStream, uid_propio: u32) {
+    match stream.peer_cred() {
+        Ok(cred) if cred.uid() == 0 => {}
+        Ok(cred) if par_autorizado(cred.uid(), uid_propio) => {
+            // El dueño del llavero pasa `par_autorizado`, pero un rekey no: sólo
+            // root acaba de validar las dos contraseñas contra la cuenta.
+            eprintln!(
+                "vasak-keyring: se rechaza un rekey del uid {} (sólo root)",
+                cred.uid()
+            );
+            return;
+        }
+        Ok(cred) => {
+            eprintln!(
+                "vasak-keyring: se rechaza un rekey del uid {} en el socket de rekey",
+                cred.uid()
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("vasak-keyring: no se pudo identificar al par del socket de rekey: {e}");
+            return;
+        }
+    }
+
+    let mut buffer = Vec::new();
+    let leido = tokio::time::timeout(
+        PLAZO_LECTURA,
+        (&mut stream).take(MAXIMO_REKEY + 1).read_to_end(&mut buffer),
+    )
+    .await;
+
+    let ok = match leido {
+        Ok(Ok(leidos)) if leidos as u64 > MAXIMO_REKEY => {
+            eprintln!("vasak-keyring: el marco de rekey supera {MAXIMO_REKEY} bytes; se descarta");
+            false
+        }
+        Ok(Ok(_)) => match interpretar_rekey(&buffer) {
+            Ok((mut vieja, mut nueva)) => {
+                let resultado = crate::dbus_api::rekey_contrasena(&vieja, &nueva).await;
+                vieja.zeroize();
+                nueva.zeroize();
+                match resultado {
+                    crate::dbus_api::RekeyResultado::Hecho => {
+                        println!(
+                            "vasak-keyring: el llavero se re-cifró con la contraseña nueva de la \
+                             cuenta"
+                        );
+                        true
+                    }
+                    crate::dbus_api::RekeyResultado::NoAbre => {
+                        // No es un error: la base está cifrada con otra. Lo
+                        // recupera el flujo del próximo inicio de sesión.
+                        eprintln!(
+                            "vasak-keyring: la contraseña anterior no abre la base; no se re-cifra \
+                             (se recupera en el próximo inicio de sesión)"
+                        );
+                        false
+                    }
+                    crate::dbus_api::RekeyResultado::Error(e) => {
+                        eprintln!("vasak-keyring: no se pudo re-cifrar el llavero: {e}");
+                        false
+                    }
+                }
+            }
+            Err(motivo) => {
+                eprintln!("vasak-keyring: marco de rekey descartado: {motivo}");
+                false
+            }
+        },
+        Ok(Err(e)) => {
+            eprintln!("vasak-keyring: error leyendo del socket de rekey: {e}");
+            false
+        }
+        Err(_) => {
+            eprintln!("vasak-keyring: el cliente del socket de rekey no mandó nada en el plazo");
+            false
+        }
+    };
+
+    buffer.zeroize();
+
+    let byte = if ok { b"1" } else { b"0" };
+    let _ = stream.write_all(byte).await;
+    let _ = stream.flush().await;
 }
 
 /// Una entrega: verifica quién llama, lee la contraseña, contesta si abrió.

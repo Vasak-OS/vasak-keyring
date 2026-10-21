@@ -7511,6 +7511,7 @@ pub(crate) mod tests {
                 let _ = std::fs::remove_file(apartada);
             }
             let _ = std::fs::remove_file(base_de_las_pruebas());
+            let _ = std::fs::remove_file(machine_sidecar_path(&base_de_las_pruebas()));
         }
     }
 
@@ -9214,5 +9215,337 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    // ── El cambio de /etc/machine-id (vasak-keyring#38) ──
+    //
+    // La sal de la maestra sale de `/etc/machine-id`. Si cambia, la maestra que
+    // entrega el inicio de sesión ya no abre la base y no hay contraseña vieja que
+    // tipear. El demonio deja al lado de la base con qué `machine-id` se cifró, y
+    // el diálogo lo usa para re-derivar con la sal de antes.
+
+    /// Un `machine-id` que no es el de esta máquina.
+    const MACHINE_ID_VIEJO: &str = "0000000000000000000000000000dead-el-de-antes";
+
+    /// El `machine-id` de esta máquina. Sin él no hay qué comparar: mejor fallar
+    /// diciéndolo que pasar en vacío.
+    fn machine_id_de_ahora() -> String {
+        let id = vasak_keyring_derivacion::machine_id();
+        assert!(
+            !id.is_empty(),
+            "estas pruebas necesitan un /etc/machine-id legible"
+        );
+        id
+    }
+
+    /// Deja una marca con `id` al lado de la base de las pruebas, a mano y sin
+    /// pasar por el código que se prueba.
+    fn marca_a_mano(id: &str) {
+        std::fs::write(machine_sidecar_path(&base_de_las_pruebas()), id)
+            .expect("no se pudo escribir la marca");
+    }
+
+    fn marca_en_disco() -> Option<String> {
+        std::fs::read_to_string(machine_sidecar_path(&base_de_las_pruebas())).ok()
+    }
+
+    #[test]
+    fn la_marca_se_llama_como_la_base_con_machine_al_final() {
+        let base = std::path::Path::new("/algun/lado/keyring.db");
+
+        assert_eq!(
+            machine_sidecar_path(base),
+            PathBuf::from("/algun/lado/keyring.db.machine")
+        );
+    }
+
+    #[test]
+    fn la_marca_guarda_el_machine_id_de_ahora_y_no_la_lee_nadie_mas_que_el_dueno() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = DirDePrueba::nuevo("marca-escribir");
+        let base = dir.ruta().join("keyring.db");
+
+        write_machine_sidecar(&base);
+
+        let marca = machine_sidecar_path(&base);
+        assert_eq!(
+            std::fs::read_to_string(&marca).expect("la marca quedó escrita"),
+            machine_id_de_ahora(),
+            "la marca es exactamente el machine-id de la sal, sin nada más"
+        );
+        assert_eq!(
+            std::fs::metadata(&marca).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "no hay motivo para que la marca sea más abierta que la base"
+        );
+    }
+
+    #[test]
+    fn leer_la_marca_devuelve_lo_escrito_sin_los_espacios_de_los_bordes() {
+        let dir = DirDePrueba::nuevo("marca-leer");
+        let base = dir.ruta().join("keyring.db");
+
+        std::fs::write(machine_sidecar_path(&base), format!("{MACHINE_ID_VIEJO}\n")).unwrap();
+
+        assert_eq!(
+            read_machine_sidecar(&base).as_deref(),
+            Some(MACHINE_ID_VIEJO)
+        );
+    }
+
+    #[test]
+    fn una_marca_que_falta_o_esta_vacia_es_no_tener_marca() {
+        let dir = DirDePrueba::nuevo("marca-ausente");
+        let base = dir.ruta().join("keyring.db");
+        assert_eq!(read_machine_sidecar(&base), None, "no hay archivo");
+
+        for vacia in ["", "   ", "\n", " \t\n"] {
+            std::fs::write(machine_sidecar_path(&base), vacia).unwrap();
+            assert_eq!(
+                read_machine_sidecar(&base),
+                None,
+                "{vacia:?} no es un machine-id: re-derivar con la sal vacía sería inventar"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn guardar_la_base_deja_la_marca_con_el_machine_id_de_ahora() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        set_master_password("la-de-la-prueba");
+        let base = base_de_las_pruebas();
+        std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+        assert_eq!(marca_en_disco(), None, "parte sin marca");
+
+        write_to(&base, &[entrada(b"algo")]).expect("con la sesión abierta se guarda");
+
+        assert_eq!(marca_en_disco(), Some(machine_id_de_ahora()));
+    }
+
+    #[tokio::test]
+    async fn guardar_la_base_reemplaza_una_marca_vieja_porque_ahora_esta_cifrada_con_la_de_ahora() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        set_master_password("la-de-la-prueba");
+        let base = base_de_las_pruebas();
+        std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+        marca_a_mano(MACHINE_ID_VIEJO);
+
+        write_to(&base, &[entrada(b"algo")]).expect("con la sesión abierta se guarda");
+
+        assert_eq!(
+            marca_en_disco(),
+            Some(machine_id_de_ahora()),
+            "una marca que dijera «viejo» sobre una base ya re-cifrada mandaría al \
+             diálogo a re-derivar con una sal que no es la que se usó"
+        );
+    }
+
+    #[tokio::test]
+    async fn sin_marca_o_con_la_de_ahora_no_hay_machine_id_desajustado() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        base_cifrada_con("la-vieja").await;
+
+        assert_eq!(mismatched_machine_id(), "", "una base de antes: sin marca");
+
+        marca_a_mano(&machine_id_de_ahora());
+        assert_eq!(mismatched_machine_id(), "", "coincide: nada que recuperar");
+    }
+
+    #[tokio::test]
+    async fn una_marca_distinta_de_la_de_ahora_se_informa() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        base_cifrada_con("la-vieja").await;
+
+        marca_a_mano(MACHINE_ID_VIEJO);
+
+        assert_eq!(mismatched_machine_id(), MACHINE_ID_VIEJO);
+    }
+
+    /// El contrato con el diálogo: la propiedad que lee por el bus, con ese
+    /// nombre. Si cambia, el diálogo deja de enterarse y la base sigue sin abrir.
+    #[tokio::test]
+    async fn el_dialogo_lee_por_el_bus_con_que_machine_id_se_cifro_la_base() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        base_cifrada_con("la-vieja").await;
+        let (desbloqueo, _estado, demonio, cliente) = desbloqueo().await;
+        demonio
+            .object_server()
+            .at(RUTA_DEL_DESBLOQUEO, desbloqueo)
+            .await
+            .expect("no se pudo publicar el desbloqueo");
+
+        assert_eq!(machine_id_desajustado_por_el_bus(&cliente).await, "");
+        marca_a_mano(MACHINE_ID_VIEJO);
+        assert_eq!(
+            machine_id_desajustado_por_el_bus(&cliente).await,
+            MACHINE_ID_VIEJO
+        );
+        marca_a_mano(&machine_id_de_ahora());
+        assert_eq!(machine_id_desajustado_por_el_bus(&cliente).await, "");
+    }
+
+    async fn machine_id_desajustado_por_el_bus(cliente: &zbus::Connection) -> String {
+        let respuesta = llamar(
+            cliente,
+            RUTA_DEL_DESBLOQUEO,
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            &(IFACE_DEL_DESBLOQUEO, "MismatchedMachineId"),
+        )
+        .await
+        .expect("la propiedad MismatchedMachineId existe");
+        let valor: OwnedValue = respuesta.body().deserialize().expect("un valor");
+        String::try_from(valor).expect("una cadena")
+    }
+
+    /// Lo central: la recuperación no es destructiva. Una base con la marca de
+    /// otra máquina y una maestra que no la abre no se toca, no se re-cifra y no
+    /// pierde la marca: es lo único que permite que el diálogo la recupere
+    /// después.
+    #[tokio::test]
+    async fn una_maestra_que_no_abre_una_base_de_otro_machine_id_no_la_toca_ni_borra_la_marca() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        let original = base_cifrada_con("la-vieja").await;
+        marca_a_mano(MACHINE_ID_VIEJO);
+        remember_rejected_login("la-nueva");
+        let (desbloqueo, estado, _demonio, _cliente) = desbloqueo().await;
+
+        let abierto = desbloqueo
+            .aplicar_sin_turno("una-que-no-abre")
+            .await
+            .expect("una maestra que no abre no es un error");
+
+        assert!(!abierto);
+        assert_eq!(
+            std::fs::read(base_de_las_pruebas()).unwrap(),
+            original,
+            "la base queda byte a byte como estaba: no se re-cifra con lo que no abrió"
+        );
+        assert_eq!(
+            marca_en_disco().as_deref(),
+            Some(MACHINE_ID_VIEJO),
+            "la marca sigue diciendo con qué machine-id se cifró"
+        );
+        assert_eq!(mismatched_machine_id(), MACHINE_ID_VIEJO);
+        assert_eq!(
+            rejected_login().as_deref().map(String::as_str),
+            Some("la-nueva"),
+            "la maestra del login sigue esperando a que la base abra"
+        );
+        assert_eq!(maestra_en_memoria(), None, "no se adopta lo que no abrió");
+        assert!(
+            estado.lock().await.items.is_empty(),
+            "no se cargó nada de una base que no se abrió"
+        );
+    }
+
+    /// El camino de la recuperación entera, del lado del demonio: el diálogo
+    /// re-deriva con la sal vieja y entrega la maestra que abre la base; el
+    /// demonio la re-cifra con la de ahora y la marca pasa a ser la de ahora.
+    #[tokio::test]
+    async fn recuperada_con_la_maestra_vieja_la_base_pasa_a_la_de_ahora_sin_perder_nada() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        base_cifrada_con("la-vieja").await;
+        marca_a_mano(MACHINE_ID_VIEJO);
+        remember_rejected_login("la-nueva");
+        let (desbloqueo, estado, _demonio, _cliente) = desbloqueo().await;
+
+        let abierto = desbloqueo
+            .aplicar_sin_turno("la-vieja")
+            .await
+            .expect("la maestra de antes abre la base");
+
+        assert!(abierto);
+        let crudo = std::fs::read(base_de_las_pruebas()).unwrap();
+        let recifrada = crypto::decrypt_database(&crudo, "la-nueva")
+            .expect("la base tiene que abrir con la maestra de ahora");
+        assert_eq!(recifrada.items.len(), 1, "no se pierde la entrada");
+        assert_eq!(recifrada.items[0].secret, b"el secreto de la persona");
+        assert!(crypto::decrypt_database(&crudo, "la-vieja").is_err());
+        assert_eq!(
+            marca_en_disco(),
+            Some(machine_id_de_ahora()),
+            "re-cifrada con la de ahora: la marca es la de ahora"
+        );
+        assert_eq!(mismatched_machine_id(), "", "ya no hay nada que recuperar");
+        assert_eq!(maestra_en_memoria().as_deref(), Some("la-nueva"));
+        assert!(rejected_login().is_none());
+        assert_eq!(estado.lock().await.items.len(), 1);
+    }
+
+    /// Abrir una base por la maestra de antes, sin que el inicio de sesión haya
+    /// dejado otra para re-cifrar, no es motivo para tocar la marca: la base
+    /// sigue cifrada con la sal del identificador viejo.
+    #[tokio::test]
+    async fn abrir_una_base_de_otro_machine_id_sin_login_rechazado_no_pisa_la_marca() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        let original = base_cifrada_con("la-vieja").await;
+        marca_a_mano(MACHINE_ID_VIEJO);
+        let (desbloqueo, _estado, _demonio, _cliente) = desbloqueo().await;
+
+        assert!(desbloqueo.aplicar_sin_turno("la-vieja").await.unwrap());
+
+        assert_eq!(
+            marca_en_disco().as_deref(),
+            Some(MACHINE_ID_VIEJO),
+            "el backfill es sólo para bases sin marca: no corrige una que ya la tiene"
+        );
+        assert_eq!(std::fs::read(base_de_las_pruebas()).unwrap(), original);
+    }
+
+    /// Una base de antes de este cambio: al abrir, queda registrada con el
+    /// `machine-id` de ahora —es la maestra de ahora la que la abrió— y un cambio
+    /// posterior ya se puede recuperar sin esperar al primer guardado.
+    #[tokio::test]
+    async fn abrir_una_base_sin_marca_la_registra_con_el_machine_id_de_ahora() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        let original = base_cifrada_con("la-vieja").await;
+        assert_eq!(marca_en_disco(), None, "parte sin marca");
+        let (desbloqueo, _estado, _demonio, _cliente) = desbloqueo().await;
+
+        assert!(desbloqueo.aplicar_sin_turno("la-vieja").await.unwrap());
+
+        assert_eq!(marca_en_disco(), Some(machine_id_de_ahora()));
+        assert_eq!(
+            std::fs::read(base_de_las_pruebas()).unwrap(),
+            original,
+            "registrar la marca no re-escribe la base"
+        );
+    }
+
+    #[tokio::test]
+    async fn una_maestra_que_no_abre_no_registra_marca() {
+        // Registrar el machine-id de ahora sobre una base que no se abrió sería
+        // afirmar algo que no se sabe.
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        base_cifrada_con("la-vieja").await;
+        let (desbloqueo, _estado, _demonio, _cliente) = desbloqueo().await;
+
+        assert!(!desbloqueo.aplicar_sin_turno("equivocada").await.unwrap());
+
+        assert_eq!(marca_en_disco(), None);
+    }
+
+    #[tokio::test]
+    async fn sin_base_no_se_registra_una_marca() {
+        // Una marca sin base mandaría al diálogo a re-derivar contra una base que
+        // todavía no existe.
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        let (desbloqueo, _estado, _demonio, _cliente) = desbloqueo().await;
+
+        assert!(desbloqueo.aplicar_sin_turno("la-primera").await.unwrap());
+
+        assert_eq!(marca_en_disco(), None);
     }
 }

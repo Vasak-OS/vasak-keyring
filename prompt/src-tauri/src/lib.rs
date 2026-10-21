@@ -524,4 +524,61 @@ mod tests {
             assert!(windows.contains(&label.to_string()), "falta «{label}»");
         }
     }
+
+    /// El diálogo re-deriva con la sal del `machine-id` guardado: esa maestra tiene
+    /// que ser distinta de la de ahora, o reenviarla sería repetir el intento que
+    /// ya falló (vasak-keyring#38).
+    #[test]
+    fn con_la_sal_del_machine_id_viejo_la_maestra_es_otra() {
+        let ahora = vasak_keyring_derivacion::derivar_maestra("la-contraseña").unwrap();
+        let sal_vieja = vasak_keyring_derivacion::sal_desde("el-machine-id-de-antes");
+        let vieja = vasak_keyring_derivacion::derivar_con_sal("la-contraseña", &sal_vieja).unwrap();
+
+        assert_ne!(*ahora, *vieja);
+        // Y es la misma que daría la derivación de aquel entonces: la que abre la
+        // base cifrada antes del cambio.
+        let otra_vez = vasak_keyring_derivacion::derivar_con_sal(
+            "la-contraseña",
+            &vasak_keyring_derivacion::sal_desde("el-machine-id-de-antes"),
+        )
+        .unwrap();
+        assert_eq!(*vieja, *otra_vez);
+    }
+
+    /// Una conexión punto a punto con el demonio del otro lado.
+    async fn conexion_sin_demonio() -> (zbus::Connection, zbus::Connection) {
+        let (a, b) = tokio::net::UnixStream::pair().unwrap();
+        let servidor = zbus::connection::Builder::unix_stream(a)
+            .server(zbus::Guid::generate())
+            .unwrap()
+            .p2p()
+            .build();
+        let cliente = zbus::connection::Builder::unix_stream(b).p2p().build();
+        let (servidor, cliente) = tokio::join!(servidor, cliente);
+        (cliente.unwrap(), servidor.unwrap())
+    }
+
+    /// Ante cualquier error, vacío: el diálogo no inventa una recuperación y el
+    /// flujo de siempre sigue sirviendo.
+    #[tokio::test]
+    async fn si_el_demonio_no_contesta_no_hay_machine_id_desajustado() {
+        let (cliente, servidor) = conexion_sin_demonio().await;
+        // El demonio se cayó: la conexión se cierra del otro lado. Con el tope,
+        // una regresión cuelga la prueba con un mensaje y no la corrida entera.
+        drop(servidor);
+
+        let respuesta = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            machine_id_desajustado(&cliente),
+        )
+        .await
+        .expect("preguntarle a un demonio caído no puede colgar el diálogo");
+        assert_eq!(respuesta, "");
+    }
+
+    /// La propiedad que lee el diálogo se llama como la que publica el demonio.
+    #[test]
+    fn la_propiedad_del_machine_id_se_llama_como_la_del_demonio() {
+        assert_eq!(MISMATCHED_MACHINE_ID_PROPERTY, "MismatchedMachineId");
+    }
 }

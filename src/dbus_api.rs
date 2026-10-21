@@ -3136,6 +3136,29 @@ impl PamUnlockInterface {
             return Ok(false);
         };
 
+        // Si el inicio de sesión entregó una maestra que no abrió la base
+        // (`rejected_login`) y ésta sí abre, la base se re-cifra con la del login.
+        // El turno de guardado se toma **antes** de publicar y se sostiene hasta
+        // el re-cifrado: entre publicar —que habilita las escrituras— y el
+        // reencrypt, la maestra en memoria es la que acaba de abrir (la de la sal
+        // vieja, en un cambio de machine-id), y un guardado externo que se colara
+        // ahí escribiría la base con ella y sellaría la marca con el machine-id de
+        // ahora. Si el demonio muriera en esa ventana, en disco quedaría una base
+        // de la sal vieja con una marca que dice la de ahora, y el diálogo ya no
+        // podría ofrecer la recuperación (vasak-keyring#38). Con el turno tomado
+        // desde antes, ningún guardado se cuela: todos lo toman antes de
+        // fotografiar y escribir.
+        let login_rechazado = rejected_login();
+        let hay_que_recifrar = login_rechazado
+            .as_ref()
+            .map(|login| login.as_str() != password)
+            .unwrap_or(false);
+        let _turno = if hay_que_recifrar {
+            Some(save_turn().lock().await)
+        } else {
+            None
+        };
+
         self.publicar(db).await?;
 
         // Backfill para bases escritas antes de este cambio: si la base abrió y
@@ -3149,13 +3172,9 @@ impl PamUnlockInterface {
             write_machine_sidecar(&path);
         }
 
-        if let Some(login) = rejected_login() {
+        if let Some(login) = login_rechazado {
             forget_rejected_login();
-            if login.as_str() != password {
-                // Con el turno de guardado desde la foto hasta la escritura: un
-                // guardado común que hubiera tomado su foto antes no puede
-                // escribirla después, encima de la base migrada.
-                let _turno = save_turn().lock().await;
+            if hay_que_recifrar {
                 let items: Vec<ItemInfo> = {
                     let state = self.state.lock().await;
                     state.items.values().cloned().collect()
@@ -8390,6 +8409,14 @@ pub(crate) mod tests {
             .await
             .expect("el re-cifrado se trabó")
             .unwrap()
+            .expect("la contraseña anterior abre la base");
+        assert!(abierto);
+
+        // Lo que agregaría una aplicación con el llavero ya abierto.
+        agregar(&estado, "/prueba/items/nueva", b"la de la aplicacion").await;
+        tokio::time::timeout(plazo, coleccion.persist())
+            .await
+            .expect("el guardado se trabó contra el re-cifrado")
             .expect("el guardado de la colección tiene que poder escribir");
 
         assert_eq!(
@@ -8406,33 +8433,6 @@ pub(crate) mod tests {
         );
     }
 
-    // ── Una puerta por esquema (#55) ──
-    //
-    // `PROTECTED_SCHEMAS` es una tabla esquema -> puerta. Lo que se prueba acá es
-            .expect("la contraseña anterior abre la base");
-        assert!(abierto);
-
-        // Lo que agregaría una aplicación con el llavero ya abierto.
-        agregar(&estado, "/prueba/items/nueva", b"la de la aplicacion").await;
-        tokio::time::timeout(plazo, coleccion.persist())
-            .await
-            .expect("el guardado se trabó contra el re-cifrado")
-    // lo que ese cambio promete: quien pasa la puerta de un esquema no toca los
-    // ítems de otro. Hace falta un bus falso con **un dueño por nombre**: con
-    // uno solo para todos los nombres, el asistente pasaría también por la puerta
-    // del sincronizador y los casos cruzados no probarían nada.
-    //
-    // Los tres que llaman comparten pid y ejecutable (el de este proceso, que es
-    // el único que una prueba puede hacer pasar por el binario de producción), así
-    // que lo que los distingue es el nombre de bus que tienen tomado.
-
-    /// La conexión del asistente en el bus de la sesión.
-    const DEL_ASISTENTE: &str = ":1.77";
-    /// La clave S/MIME, como segundo ítem de la puerta del sincronizador.
-    const ITEM_SMIME_CRUZADO: &str = "/org/freedesktop/secrets/collection/login/items/10";
-    /// La clave del proveedor del asistente.
-    const ITEM_DEL_ASISTENTE: &str = "/org/freedesktop/secrets/collection/login/items/11";
-    const EMISORES: [&str; 3] = [DEL_SINCRONIZADOR, DEL_ASISTENTE, DE_UN_IMPOSTOR];
     /// F1: entre abrir la base con la maestra de la sal vieja y re-cifrarla, no se
     /// puede colar ninguna escritura. Un guardado externo en esa ventana escribiría
     /// la base con la maestra vieja y, en el mismo `write_to`, sellaría la marca
@@ -8496,6 +8496,25 @@ pub(crate) mod tests {
         assert_eq!(mismatched_machine_id(), "");
     }
 
+    // ── Una puerta por esquema (#55) ──
+    //
+    // `PROTECTED_SCHEMAS` es una tabla esquema -> puerta. Lo que se prueba acá es
+    // lo que ese cambio promete: quien pasa la puerta de un esquema no toca los
+    // ítems de otro. Hace falta un bus falso con **un dueño por nombre**: con
+    // uno solo para todos los nombres, el asistente pasaría también por la puerta
+    // del sincronizador y los casos cruzados no probarían nada.
+    //
+    // Los tres que llaman comparten pid y ejecutable (el de este proceso, que es
+    // el único que una prueba puede hacer pasar por el binario de producción), así
+    // que lo que los distingue es el nombre de bus que tienen tomado.
+
+    /// La conexión del asistente en el bus de la sesión.
+    const DEL_ASISTENTE: &str = ":1.77";
+    /// La clave S/MIME, como segundo ítem de la puerta del sincronizador.
+    const ITEM_SMIME_CRUZADO: &str = "/org/freedesktop/secrets/collection/login/items/10";
+    /// La clave del proveedor del asistente.
+    const ITEM_DEL_ASISTENTE: &str = "/org/freedesktop/secrets/collection/login/items/11";
+    const EMISORES: [&str; 3] = [DEL_SINCRONIZADOR, DEL_ASISTENTE, DE_UN_IMPOSTOR];
     /// Almacén (sync), S/MIME (sync), asistente y uno común.
     const ITEMS_CRUZADOS: [&str; 4] = [ITEM, ITEM_SMIME_CRUZADO, ITEM_DEL_ASISTENTE, ITEM_COMUN];
 

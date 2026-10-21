@@ -203,8 +203,23 @@ pub async fn escuchar(
 ) -> std::io::Result<()> {
     let uid_propio = unsafe { libc::geteuid() };
 
+    // El de desbloqueo es crítico: sin él el llavero no se abre en toda la sesión.
     let desbloqueo = abrir_socket(&ruta_del_socket(uid_propio)).await?;
-    let rekey = abrir_socket(&ruta_del_socket_rekey(uid_propio)).await?;
+
+    // El de rekey no lo es: si no se puede abrir, el re-cifrado al cambiar la
+    // contraseña queda deshabilitado, pero el desbloqueo —que es lo que mantiene el
+    // llavero usable— no puede caerse con él. Antes un `?` acá se llevaba puesto el
+    // socket de desbloqueo cuando fallaba el de rekey (vasak-keyring#60).
+    let rekey = match abrir_socket(&ruta_del_socket_rekey(uid_propio)).await {
+        Ok(listener) => Some(listener),
+        Err(e) => {
+            eprintln!(
+                "vasak-keyring: no se pudo abrir el socket de rekey ({e}); el re-cifrado al \
+                 cambiar la contraseña queda deshabilitado, pero el desbloqueo sigue"
+            );
+            None
+        }
+    };
 
     tokio::spawn(async move {
         loop {
@@ -231,22 +246,24 @@ pub async fn escuchar(
         }
     });
 
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = match rekey.accept().await {
-                Ok(par) => par,
-                Err(e) => {
-                    eprintln!("vasak-keyring: accept falló en el socket de rekey: {e}");
-                    tokio::time::sleep(REPOSO_TRAS_FALLO).await;
-                    continue;
-                }
-            };
+    if let Some(rekey) = rekey {
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match rekey.accept().await {
+                    Ok(par) => par,
+                    Err(e) => {
+                        eprintln!("vasak-keyring: accept falló en el socket de rekey: {e}");
+                        tokio::time::sleep(REPOSO_TRAS_FALLO).await;
+                        continue;
+                    }
+                };
 
-            tokio::spawn(async move {
-                atender_rekey(stream, uid_propio).await;
-            });
-        }
-    });
+                tokio::spawn(async move {
+                    atender_rekey(stream, uid_propio).await;
+                });
+            }
+        });
+    }
 
     Ok(())
 }
@@ -295,39 +312,7 @@ async fn atender_rekey(mut stream: UnixStream, uid_propio: u32) {
             eprintln!("vasak-keyring: el marco de rekey supera {MAXIMO_REKEY} bytes; se descarta");
             false
         }
-        Ok(Ok(_)) => match interpretar_rekey(&buffer) {
-            Ok((mut vieja, mut nueva)) => {
-                let resultado = crate::dbus_api::rekey_contrasena(&vieja, &nueva).await;
-                vieja.zeroize();
-                nueva.zeroize();
-                match resultado {
-                    crate::dbus_api::RekeyResultado::Hecho => {
-                        println!(
-                            "vasak-keyring: el llavero se re-cifró con la contraseña nueva de la \
-                             cuenta"
-                        );
-                        true
-                    }
-                    crate::dbus_api::RekeyResultado::NoAbre => {
-                        // No es un error: la base está cifrada con otra. Lo
-                        // recupera el flujo del próximo inicio de sesión.
-                        eprintln!(
-                            "vasak-keyring: la contraseña anterior no abre la base; no se re-cifra \
-                             (se recupera en el próximo inicio de sesión)"
-                        );
-                        false
-                    }
-                    crate::dbus_api::RekeyResultado::Error(e) => {
-                        eprintln!("vasak-keyring: no se pudo re-cifrar el llavero: {e}");
-                        false
-                    }
-                }
-            }
-            Err(motivo) => {
-                eprintln!("vasak-keyring: marco de rekey descartado: {motivo}");
-                false
-            }
-        },
+        Ok(Ok(_)) => procesar_marco_de_rekey(&buffer).await,
         Ok(Err(e)) => {
             eprintln!("vasak-keyring: error leyendo del socket de rekey: {e}");
             false
@@ -343,6 +328,46 @@ async fn atender_rekey(mut stream: UnixStream, uid_propio: u32) {
     let byte = if ok { b"1" } else { b"0" };
     let _ = stream.write_all(byte).await;
     let _ = stream.flush().await;
+}
+
+/// Interpreta un marco de rekey ya leído, re-cifra, y devuelve si quedó
+/// re-cifrado (el byte que `atender_rekey` le contesta a PAM).
+///
+/// Separado de `atender_rekey` —que además verifica al par y habla por el
+/// socket— para poder probar el camino entero (interpretar → re-cifrar → mapear
+/// el resultado) sin ser root ni levantar un socket.
+async fn procesar_marco_de_rekey(buffer: &[u8]) -> bool {
+    let (mut vieja, mut nueva) = match interpretar_rekey(buffer) {
+        Ok(par) => par,
+        Err(motivo) => {
+            eprintln!("vasak-keyring: marco de rekey descartado: {motivo}");
+            return false;
+        }
+    };
+
+    let resultado = crate::dbus_api::rekey_contrasena(&vieja, &nueva).await;
+    vieja.zeroize();
+    nueva.zeroize();
+
+    match resultado {
+        crate::dbus_api::RekeyResultado::Hecho => {
+            println!("vasak-keyring: el llavero se re-cifró con la contraseña nueva de la cuenta");
+            true
+        }
+        crate::dbus_api::RekeyResultado::NoAbre => {
+            // No es un error: la base está cifrada con otra. Lo recupera el flujo
+            // del próximo inicio de sesión.
+            eprintln!(
+                "vasak-keyring: la contraseña anterior no abre la base; no se re-cifra \
+                 (se recupera en el próximo inicio de sesión)"
+            );
+            false
+        }
+        crate::dbus_api::RekeyResultado::Error(e) => {
+            eprintln!("vasak-keyring: no se pudo re-cifrar el llavero: {e}");
+            false
+        }
+    }
 }
 
 /// Una entrega: verifica quién llama, lee la contraseña, contesta si abrió.
@@ -892,5 +917,29 @@ mod tests {
         let (vieja, nueva) = interpretar_rekey(de_pam).unwrap();
 
         assert_eq!((vieja.as_str(), nueva.as_str()), ("vieja", "nueva!"));
+    }
+
+    #[tokio::test]
+    async fn abrir_socket_crea_el_socket_en_0600_bajo_un_directorio_en_0700() {
+        // El mismo camino que usa `escuchar` para los dos sockets: prepara el
+        // directorio, hace el bind y fija los modos. Se prueba fuera de
+        // /run/user, con una ruta propia.
+        let dir = DirDePrueba::nuevo("abrir");
+        let ruta = dir.ruta().join("vasak-keyring").join("x.sock");
+
+        let listener = abrir_socket(&ruta).await.expect("tiene que abrir");
+        drop(listener);
+
+        assert_eq!(modo(&ruta), 0o600, "el socket queda en 0600");
+        assert_eq!(modo(ruta.parent().unwrap()), 0o700, "el directorio en 0700");
+    }
+
+    #[tokio::test]
+    async fn un_marco_de_rekey_ilegible_no_re_cifra_nada() {
+        // Un marco que `interpretar_rekey` rechaza no llega a tocar la base: la
+        // respuesta a PAM es «no». Cubre el camino de descarte de
+        // `procesar_marco_de_rekey` sin tocar el disco.
+        assert!(!procesar_marco_de_rekey(b"xx").await);
+        assert!(!procesar_marco_de_rekey(b"").await);
     }
 }

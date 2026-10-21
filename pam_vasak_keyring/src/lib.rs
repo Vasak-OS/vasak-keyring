@@ -66,6 +66,17 @@ extern "C" {
         data: *mut *mut std::ffi::c_void,
     ) -> c_int;
 
+    // A diferencia de `pam_get_authtok`, **no** inicia una conversación si el item
+    // no está puesto: devuelve lo que haya o nada. En `pam_sm_chauthtok` eso es lo
+    // que se quiere —leer lo que `system-auth` ya recogió, sin agregar un segundo
+    // «Contraseña actual:»—; con `pam_get_authtok`, un `passwd <otro>` de root,
+    // que no pide la anterior, dispararía ese prompt de más.
+    fn pam_get_item(
+        pamh: *const pam_handle_t,
+        item_type: c_int,
+        item: *mut *const std::ffi::c_void,
+    ) -> c_int;
+
     fn pam_syslog(pamh: *mut pam_handle_t, priority: c_int, format: *const c_char, ...) -> c_int;
 
     fn pam_get_user(
@@ -510,15 +521,24 @@ fn ruta_del_socket_rekey(uid: u32) -> String {
     format!("/run/user/{uid}/vasak-keyring/rekey.sock")
 }
 
-/// Lee un token del handle de PAM (`PAM_AUTHTOK` o `PAM_OLDAUTHTOK`) como cadena
-/// propia y zeroizable. `None` si no hay nada bajo ese item.
-fn leer_authtok(pamh: *mut pam_handle_t, item: c_int) -> Option<Zeroizing<String>> {
-    let mut authtok: *const c_char = std::ptr::null();
-    let ret = unsafe { pam_get_authtok(pamh, item, &mut authtok, std::ptr::null()) };
-    if ret != PAM_SUCCESS || authtok.is_null() {
+/// Lee un item de contraseña del handle de PAM (`PAM_AUTHTOK` o `PAM_OLDAUTHTOK`)
+/// como cadena propia y zeroizable. `None` si no hay nada bajo ese item.
+///
+/// Con `pam_get_item` y **no** `pam_get_authtok`: en `pam_sm_chauthtok` sólo se
+/// quiere leer lo que `system-auth` ya recogió, nunca pedirlo. `pam_get_authtok`
+/// inicia una conversación cuando el item no está puesto —el caso de un
+/// `passwd <otro>` de root, que no pide la contraseña anterior— y agregaría un
+/// «Contraseña actual:» de más después del cambio real.
+///
+/// El puntero lo escribe PAM y el manual lo trata como constante; se lee, no se
+/// libera. `None` cuando el item no está, que es un camino normal y no un error.
+fn leer_item_de_contrasena(pamh: *mut pam_handle_t, item: c_int) -> Option<Zeroizing<String>> {
+    let mut crudo: *const std::ffi::c_void = std::ptr::null();
+    let ret = unsafe { pam_get_item(pamh, item, &mut crudo) };
+    if ret != PAM_SUCCESS || crudo.is_null() {
         return None;
     }
-    let token = unsafe { CStr::from_ptr(authtok) };
+    let token = unsafe { CStr::from_ptr(crudo as *const c_char) };
     Some(Zeroizing::new(token.to_string_lossy().into_owned()))
 }
 
@@ -711,6 +731,30 @@ pub extern "C" fn pam_sm_open_session(
     PAM_SUCCESS
 }
 
+/// Si el flag de `pam_sm_chauthtok` dice que es la fase que de verdad cambia la
+/// contraseña (`PAM_UPDATE_AUTHTOK`) y no la preliminar.
+fn es_fase_de_actualizacion(flags: c_int) -> bool {
+    flags & PAM_UPDATE_AUTHTOK != 0
+}
+
+/// Deriva las maestras vieja y nueva para el rekey.
+///
+/// `Ok(None)` si alguna contraseña está vacía —no es la que cifra la base y
+/// derivarla no sirve—; `Err` si la derivación falla. Separado de
+/// `pam_sm_chauthtok` para poder probar la derivación sin un handle de PAM real.
+#[allow(clippy::type_complexity)]
+fn maestras_de(
+    vieja: &str,
+    nueva: &str,
+) -> Result<Option<(Zeroizing<String>, Zeroizing<String>)>, String> {
+    if vieja.is_empty() || nueva.is_empty() {
+        return Ok(None);
+    }
+    let maestra_vieja = vasak_keyring_derivacion::derivar_maestra(vieja)?;
+    let maestra_nueva = vasak_keyring_derivacion::derivar_maestra(nueva)?;
+    Ok(Some((maestra_vieja, maestra_nueva)))
+}
+
 /// Called during the password-change phase (`passwd` y cualquier cambio por PAM).
 ///
 /// Re-cifra la base del llavero con la contraseña nueva de la cuenta para que el
@@ -741,14 +785,14 @@ pub extern "C" fn pam_sm_chauthtok(
     _argc: c_int,
     _argv: *mut *const c_char,
 ) -> c_int {
-    if flags & PAM_UPDATE_AUTHTOK == 0 {
+    if !es_fase_de_actualizacion(flags) {
         // Fase preliminar: la contraseña nueva todavía no está puesta.
         return PAM_SUCCESS;
     }
 
     let (Some(vieja), Some(nueva)) = (
-        leer_authtok(pamh, PAM_OLDAUTHTOK),
-        leer_authtok(pamh, PAM_AUTHTOK),
+        leer_item_de_contrasena(pamh, PAM_OLDAUTHTOK),
+        leer_item_de_contrasena(pamh, PAM_AUTHTOK),
     ) else {
         log(
             pamh,
@@ -756,12 +800,6 @@ pub extern "C" fn pam_sm_chauthtok(
         );
         return PAM_SUCCESS;
     };
-
-    // Una contraseña vacía no es la que cifra la base; dejarla pasar derivaría una
-    // maestra para nada. Igual que en `pam_sm_open_session`.
-    if vieja.is_empty() || nueva.is_empty() {
-        return PAM_SUCCESS;
-    }
 
     let Some(uid) = target_uid(pamh) else {
         log(
@@ -771,15 +809,10 @@ pub extern "C" fn pam_sm_chauthtok(
         return PAM_SUCCESS;
     };
 
-    let maestra_vieja = match vasak_keyring_derivacion::derivar_maestra(&vieja) {
-        Ok(m) => m,
-        Err(e) => {
-            log(pamh, &format!("pam_vasak_keyring: {e}"));
-            return PAM_SUCCESS;
-        }
-    };
-    let maestra_nueva = match vasak_keyring_derivacion::derivar_maestra(&nueva) {
-        Ok(m) => m,
+    let (maestra_vieja, maestra_nueva) = match maestras_de(&vieja, &nueva) {
+        // Alguna contraseña vacía: no es la que cifra la base, no hay nada que hacer.
+        Ok(None) => return PAM_SUCCESS,
+        Ok(Some(par)) => par,
         Err(e) => {
             log(pamh, &format!("pam_vasak_keyring: {e}"));
             return PAM_SUCCESS;
@@ -1317,5 +1350,38 @@ mod tests_rekey {
         let error = ruta_sin_desviar(61234, c"rekey.sock").expect_err("no debería haber ruta");
 
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// El rekey sólo actúa en la fase de actualización, no en la preliminar:
+    /// ahí la contraseña nueva todavía no está puesta.
+    #[test]
+    fn el_rekey_solo_actua_en_la_fase_de_actualizacion() {
+        assert!(es_fase_de_actualizacion(PAM_UPDATE_AUTHTOK));
+        assert!(es_fase_de_actualizacion(PAM_UPDATE_AUTHTOK | 0x4000));
+        // PAM_PRELIM_CHECK (0x4000) sola no es la fase de actualización.
+        assert!(!es_fase_de_actualizacion(0x4000));
+        assert!(!es_fase_de_actualizacion(0));
+    }
+
+    /// Una contraseña vacía no deriva nada: no es la que cifra la base.
+    #[test]
+    fn una_contrasena_vacia_no_deriva_maestra() {
+        assert!(maestras_de("", "nueva").expect("sin error").is_none());
+        assert!(maestras_de("vieja", "").expect("sin error").is_none());
+        assert!(maestras_de("", "").expect("sin error").is_none());
+    }
+
+    /// Con las dos puestas, deriva las dos, y son distintas entre sí y de las
+    /// contraseñas de origen (lo que viaja no es la contraseña de la cuenta).
+    #[test]
+    fn maestras_de_deriva_las_dos_distintas() {
+        let (vieja, nueva) = maestras_de("MiVieja1", "MiNueva2")
+            .expect("sin error")
+            .expect("las dos puestas dan Some");
+        assert_eq!(vieja.len(), 64, "hexadecimal de 32 bytes");
+        assert_eq!(nueva.len(), 64);
+        assert_ne!(*vieja, *nueva);
+        assert_ne!(*vieja, "MiVieja1");
+        assert!(!vieja.contains("Vieja"));
     }
 }

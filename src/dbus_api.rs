@@ -9200,4 +9200,204 @@ pub(crate) mod tests {
             }
         }
     }
+    // ── Re-cifrar al cambiar la contraseña de la cuenta (#38) ──
+    //
+    // `rekey_en` recibe la ruta, así que estas pruebas no tocan la base de
+    // `keyring_path()` y cada una trabaja en su propio directorio. Lo que sí es
+    // del proceso entero es la maestra en memoria: van en fila con
+    // [`estado_de_la_sesion`] y [`sesion`] la deja como estaba al terminar.
+
+    /// Lo que hay cifrado en `raw` con `password`, o `None` si no abre.
+    fn abrir(raw: &[u8], password: &str) -> Option<crypto::KeyringDatabase> {
+        crypto::decrypt_database(raw, password).ok()
+    }
+
+    #[tokio::test]
+    async fn al_cambiar_la_contrasena_la_base_abre_con_la_nueva_y_ya_no_con_la_vieja() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _cerrada = sesion_cerrada();
+        let dir = DirDePrueba::nuevo("rekey-feliz");
+        let ruta = dir.ruta().join("keyring.db");
+        base_con_una_entrada(&ruta, "la-vieja").await;
+
+        let resultado = rekey_en(&ruta, "la-vieja", "la-nueva").await;
+
+        assert!(matches!(resultado, RekeyResultado::Hecho));
+        let raw = std::fs::read(&ruta).expect("la base tiene que seguir en el disco");
+        assert!(
+            abrir(&raw, "la-vieja").is_none(),
+            "después del cambio la contraseña anterior no tiene que abrir la base"
+        );
+        let db = abrir(&raw, "la-nueva").expect("la base tiene que abrir con la contraseña nueva");
+        assert_eq!(
+            db.items.len(),
+            1,
+            "no se pierde ni se duplica ninguna entrada"
+        );
+        assert_eq!(db.items[0].label, "la que estaba");
+        assert_eq!(db.items[0].secret, b"el secreto de la persona");
+        assert_eq!(
+            db.items[0].attributes.get("app").map(String::as_str),
+            Some("de-prueba")
+        );
+    }
+
+    #[tokio::test]
+    async fn el_rekey_deja_la_base_en_0600_y_sin_temporales() {
+        // La base es la única copia de todos los secretos: re-cifrarla no puede
+        // dejarla legible por otros ni un `.tmp` con el cifrado nuevo al lado.
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _cerrada = sesion_cerrada();
+        let dir = DirDePrueba::nuevo("rekey-modo");
+        let ruta = dir.ruta().join("keyring.db");
+        base_con_una_entrada(&ruta, "la-vieja").await;
+        std::fs::set_permissions(&ruta, PermissionsExt::from_mode(0o644)).unwrap();
+
+        let resultado = rekey_en(&ruta, "la-vieja", "la-nueva").await;
+
+        assert!(matches!(resultado, RekeyResultado::Hecho));
+        let modo = std::fs::metadata(&ruta).unwrap().permissions().mode() & 0o777;
+        assert_eq!(modo, 0o600, "la base re-cifrada tiene que quedar en 0600");
+        let sobrantes: Vec<_> = std::fs::read_dir(dir.ruta())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .filter(|n| n != "keyring.db")
+            .collect();
+        assert!(
+            sobrantes.is_empty(),
+            "quedaron archivos de más: {sobrantes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn si_la_vieja_no_abre_la_base_el_archivo_no_se_toca() {
+        // La regla no destructiva, que es lo central de este arreglo: una base
+        // cifrada con una contraseña aún más vieja no se puede abrir, y la única
+        // forma de no perderla es no escribir nada. Se compara el disco entero,
+        // byte a byte, y no sólo que «siga abriendo»: un re-cifrado con la
+        // nueva la dejaría ilegible con la contraseña que sí sirve.
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _cerrada = sesion_cerrada();
+        let dir = DirDePrueba::nuevo("rekey-no-abre");
+        let ruta = dir.ruta().join("keyring.db");
+        base_con_una_entrada(&ruta, "aún-más-vieja").await;
+        let antes = std::fs::read(&ruta).unwrap();
+
+        let resultado = rekey_en(&ruta, "la-vieja", "la-nueva").await;
+
+        assert!(matches!(resultado, RekeyResultado::NoAbre));
+        assert_eq!(
+            std::fs::read(&ruta).unwrap(),
+            antes,
+            "una base que la vieja no abre no se puede tocar, ni un byte"
+        );
+        assert!(
+            abrir(&antes, "aún-más-vieja").is_some(),
+            "y sigue abriendo con la contraseña con la que estaba"
+        );
+    }
+
+    #[tokio::test]
+    async fn sin_base_en_el_disco_no_hay_nada_que_re_cifrar_y_no_se_crea_una() {
+        // Una máquina nueva: la maestra de la base que se cree al primer guardado
+        // será la de ahora. Crear un archivo acá la dejaría con un contenido que
+        // nadie pidió.
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _cerrada = sesion_cerrada();
+        let dir = DirDePrueba::nuevo("rekey-sin-base");
+        let ruta = dir.ruta().join("keyring.db");
+
+        let resultado = rekey_en(&ruta, "la-vieja", "la-nueva").await;
+
+        assert!(matches!(resultado, RekeyResultado::Hecho));
+        assert!(!ruta.exists(), "no tiene que aparecer una base de la nada");
+        assert_eq!(
+            std::fs::read_dir(dir.ruta()).unwrap().count(),
+            0,
+            "tampoco un temporal"
+        );
+    }
+
+    #[tokio::test]
+    async fn una_base_que_no_se_puede_leer_es_un_error_y_no_un_hecho() {
+        // Distinto de «no hay base»: acá hay algo en la ruta que no se puede leer.
+        // Darlo por hecho le diría a PAM que el llavero quedó al día.
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _cerrada = sesion_cerrada();
+        let dir = DirDePrueba::nuevo("rekey-ilegible");
+        let ruta = dir.ruta().join("keyring.db");
+        std::fs::create_dir(&ruta).unwrap();
+
+        let resultado = rekey_en(&ruta, "la-vieja", "la-nueva").await;
+
+        assert!(matches!(resultado, RekeyResultado::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn si_la_sesion_tenia_la_vieja_en_memoria_pasa_a_la_nueva() {
+        // Si se quedara con la vieja, el próximo guardado volvería a cifrar la
+        // base con una contraseña que el inicio de sesión ya no forma, y el
+        // rekey se deshacería solo.
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion(Some("la-vieja"));
+        let dir = DirDePrueba::nuevo("rekey-memoria");
+        let ruta = dir.ruta().join("keyring.db");
+        base_con_una_entrada(&ruta, "la-vieja").await;
+
+        let resultado = rekey_en(&ruta, "la-vieja", "la-nueva").await;
+
+        assert!(matches!(resultado, RekeyResultado::Hecho));
+        assert_eq!(maestra_en_memoria().as_deref(), Some("la-nueva"));
+    }
+
+    #[tokio::test]
+    async fn con_el_llavero_cerrado_el_rekey_no_abre_la_sesion() {
+        // Sin maestra en memoria no hay sesión que seguir: el próximo inicio de
+        // sesión, con la nueva, abre la base. Poner la nueva en memoria acá sería
+        // abrir el llavero sin que nadie haya iniciado sesión. Se mira la
+        // memoria y no `master_password()`, que cae a `VASAK_KEYRING_PASSWORD`.
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _cerrada = sesion_cerrada();
+        let dir = DirDePrueba::nuevo("rekey-cerrado");
+        let ruta = dir.ruta().join("keyring.db");
+        base_con_una_entrada(&ruta, "la-vieja").await;
+
+        let resultado = rekey_en(&ruta, "la-vieja", "la-nueva").await;
+
+        assert!(matches!(resultado, RekeyResultado::Hecho));
+        assert_eq!(maestra_en_memoria(), None);
+    }
+
+    #[tokio::test]
+    async fn una_maestra_en_memoria_que_no_es_la_vieja_no_se_pisa() {
+        // El rekey sólo sigue a la sesión si tenía exactamente la vieja. Si tenía
+        // otra (la sesión abrió con otra cosa), no es quién para cambiarla.
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion(Some("otra-distinta"));
+        let dir = DirDePrueba::nuevo("rekey-otra-memoria");
+        let ruta = dir.ruta().join("keyring.db");
+        base_con_una_entrada(&ruta, "la-vieja").await;
+
+        let resultado = rekey_en(&ruta, "la-vieja", "la-nueva").await;
+
+        assert!(matches!(resultado, RekeyResultado::Hecho));
+        assert_eq!(maestra_en_memoria().as_deref(), Some("otra-distinta"));
+    }
+
+    #[tokio::test]
+    async fn si_no_abre_la_maestra_en_memoria_tampoco_cambia() {
+        // Con la base sin tocar, seguir a la sesión a la nueva la dejaría con una
+        // contraseña que no abre nada del disco.
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion(Some("la-vieja"));
+        let dir = DirDePrueba::nuevo("rekey-no-abre-memoria");
+        let ruta = dir.ruta().join("keyring.db");
+        base_con_una_entrada(&ruta, "aún-más-vieja").await;
+
+        let resultado = rekey_en(&ruta, "la-vieja", "la-nueva").await;
+
+        assert!(matches!(resultado, RekeyResultado::NoAbre));
+        assert_eq!(maestra_en_memoria().as_deref(), Some("la-vieja"));
+    }
 }

@@ -16,6 +16,7 @@ qué falta. Esto es lo que agrega, y lo que hay que poner a mano en ese caso:
 
 ```
 auth       optional   pam_vasak_keyring.so     ← después del "auth include system-auth"
+password   optional   pam_vasak_keyring.so     ← después del "password include system-auth"
 session    optional   pam_vasak_keyring.so     ← al final, después de pam_systemd
 ```
 
@@ -23,13 +24,21 @@ session    optional   pam_vasak_keyring.so     ← al final, después de pam_sys
 `system-local-login`) y los inicios por consola, o sea todas las formas de
 entrar al sistema.
 
-## Por qué las dos líneas
+## Por qué las tres líneas
 
-Hacen falta ambas y en ese orden:
+Hacen falta las tres y en ese orden:
 
 - `auth` corre durante la autenticación y toma con `pam_get_authtok` la
   contraseña que el usuario acaba de escribir, guardándola en el contexto de PAM.
   Va después de `system-auth` porque para entonces la contraseña ya se pidió.
+- `password` corre al cambiar la contraseña de la cuenta y re-cifra la base del
+  llavero con la nueva, por un segundo socket,
+  `/run/user/<uid>/vasak-keyring/rekey.sock`, así el próximo inicio de sesión la
+  abre solo y no hay que abrir el llavero con la anterior (vasak-keyring#38). Va
+  después de `password include system-auth`, para que corra con la contraseña ya
+  cambiada. Lo hace de forma no destructiva: si la base no abre con la anterior,
+  no toca nada, y queda para el flujo de recuperación del diálogo. Si el demonio
+  del usuario no corre en ese momento, tampoco; no se pierde nada.
 - `session` corre al abrir la sesión, recupera esa contraseña del contexto y se
   la pasa al demonio por un socket unix propio,
   `/run/user/<uid>/vasak-keyring/unlock.sock`. Va **al final**, después de
@@ -90,8 +99,14 @@ acá no debe dejar a nadie afuera del sistema.
 
 La primera vez que se desbloquea, **la contraseña que reciba el demonio pasa a
 ser la contraseña maestra** de una base nueva. De ahí en más tiene que coincidir
-en cada inicio de sesión, así que si se cambia la contraseña del usuario por
-fuera de PAM la base anterior deja de abrirse.
+en cada inicio de sesión.
+
+Si se cambia la contraseña **con** la línea `password` puesta, el llavero se
+re-cifra en el momento y sigue andando. Si se cambia **por fuera de PAM** —o con
+el demonio del usuario sin correr— la base queda cifrada con la anterior; el
+próximo inicio de sesión lo detecta y el diálogo pide la contraseña anterior
+para migrarla (ver vasak-keyring#38). Cambiar `/etc/machine-id` cambia la sal y
+también deja la base sin abrir; eso todavía no se cubre.
 
 ## Verificación
 

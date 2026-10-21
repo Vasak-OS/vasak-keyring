@@ -726,6 +726,14 @@ pub extern "C" fn pam_sm_open_session(
 /// trabar el cambio de contraseña, y lo que viaja es la maestra derivada, nunca
 /// la contraseña de la cuenta —el socket vive en `/run/user/<uid>`, del usuario,
 /// igual que el de desbloqueo—.
+///
+/// En la fase de actualización el re-cifrado no espera a que el cambio de
+/// contraseña *commitee*: si otro módulo del stack lo aborta después, la cuenta
+/// se queda con la vieja y la base cifrada con la nueva, y el próximo login cae
+/// al diálogo de recuperación. No se pierde nada —la base sigue abriéndose con lo
+/// que se tecleó como nueva— y el caso común está a salvo porque esta línea va
+/// `optional` y **después** de `password include system-auth`, que es quien de
+/// verdad cambia la contraseña.
 #[no_mangle]
 pub extern "C" fn pam_sm_chauthtok(
     pamh: *mut pam_handle_t,
@@ -1229,5 +1237,85 @@ mod tests_datos {
             antes,
             "un puntero nulo no es una reserva: no hay nada que soltar"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_rekey {
+    use super::*;
+
+    /// El contrato con el demonio, igual que el de `unlock.sock`: los dos lados
+    /// arman la cadena por separado y si dejan de coincidir el rekey falla sin
+    /// que nada lo diga. El demonio afirma la misma en `unlock_socket`.
+    #[test]
+    fn la_ruta_del_socket_de_rekey_es_la_que_el_demonio_publica() {
+        assert_eq!(
+            ruta_del_socket_rekey(1000),
+            "/run/user/1000/vasak-keyring/rekey.sock"
+        );
+        assert_ne!(ruta_del_socket_rekey(1000), ruta_del_socket(1000));
+    }
+
+    /// El otro lado del contrato, el que `interpretar_rekey` del demonio parsea.
+    /// Este crate es un `cdylib` y no puede depender del binario del demonio, así
+    /// que el marco se afirma byte a byte acá y el demonio parsea esos mismos
+    /// bytes en `un_marco_de_rekey_armado_por_el_modulo_de_pam_se_interpreta`.
+    #[test]
+    fn el_marco_de_rekey_son_dos_secretos_con_su_largo_u32_little_endian() {
+        let marco = marco_rekey("vieja", "nueva!");
+
+        let mut esperado = Vec::new();
+        esperado.extend_from_slice(&[5, 0, 0, 0]);
+        esperado.extend_from_slice(b"vieja");
+        esperado.extend_from_slice(&[6, 0, 0, 0]);
+        esperado.extend_from_slice(b"nueva!");
+        assert_eq!(&marco[..], &esperado[..]);
+    }
+
+    #[test]
+    fn el_marco_de_rekey_lleva_la_vieja_primero_y_el_largo_cuenta_bytes_y_no_letras() {
+        // «ñ» son dos bytes: si el largo contara caracteres, el demonio leería de
+        // menos y se desfasaría todo lo que viene después.
+        let marco = marco_rekey("ñ", "b");
+
+        assert_eq!(&marco[..4], &2u32.to_le_bytes());
+        assert_eq!(&marco[4..6], "ñ".as_bytes());
+        assert_eq!(&marco[6..10], &1u32.to_le_bytes());
+        assert_eq!(&marco[10..], b"b");
+        assert_eq!(marco.len(), 11);
+    }
+
+    #[test]
+    fn el_marco_de_una_maestra_derivada_cabe_en_el_tope_del_demonio() {
+        // El demonio corta en 4 + 256 + 4 + 256 bytes. Una maestra son 64 dígitos
+        // hex: si la derivación creciera, el rekey dejaría de llegar.
+        let maestra = vasak_keyring_derivacion::derivar_maestra("una contraseña")
+            .expect("la derivación no puede fallar");
+
+        let marco = marco_rekey(&maestra, &maestra);
+
+        assert!(
+            maestra.len() <= 256,
+            "una maestra mide {} bytes",
+            maestra.len()
+        );
+        assert_eq!(marco.len(), 8 + 2 * maestra.len());
+    }
+
+    /// Sin `/run/user/<uid>` no hay a quién entregarle nada: tiene que volver un
+    /// error —que `pam_sm_chauthtok` registra y sigue— y no un «re-cifrado».
+    #[test]
+    fn sin_directorio_de_runtime_el_rekey_no_se_entrega() {
+        // 61234 no tiene sesión; su /run/user no existe.
+        let error = entregar_rekey(61234, "vieja", "nueva").expect_err("no debería entregarse");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn la_comprobacion_de_ruta_del_rekey_mira_su_propio_socket() {
+        let error = ruta_sin_desviar(61234, c"rekey.sock").expect_err("no debería haber ruta");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 }

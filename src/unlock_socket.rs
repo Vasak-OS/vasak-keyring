@@ -284,7 +284,9 @@ async fn atender_rekey(mut stream: UnixStream, uid_propio: u32) {
     let mut buffer = Vec::new();
     let leido = tokio::time::timeout(
         PLAZO_LECTURA,
-        (&mut stream).take(MAXIMO_REKEY + 1).read_to_end(&mut buffer),
+        (&mut stream)
+            .take(MAXIMO_REKEY + 1)
+            .read_to_end(&mut buffer),
     )
     .await;
 
@@ -686,5 +688,209 @@ mod tests {
             "contraseña ñandú"
         );
         assert!(interpretar_peticion(&[0xff, 0xfe]).is_err());
+    }
+    // ── Rekey al cambiar la contraseña de la cuenta (#38) ──
+
+    /// El marco de rekey armado a mano, sin pasar por el módulo de PAM: dos
+    /// secretos con su largo `u32` little-endian por delante.
+    fn marco(vieja: &[u8], nueva: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for secreto in [vieja, nueva] {
+            bytes.extend_from_slice(&(secreto.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(secreto);
+        }
+        bytes
+    }
+
+    #[test]
+    fn la_ruta_del_socket_de_rekey_esta_al_lado_del_de_desbloqueo() {
+        assert_eq!(
+            ruta_del_socket_rekey(1000),
+            std::path::PathBuf::from("/run/user/1000/vasak-keyring/rekey.sock")
+        );
+        // El módulo de PAM arma esta misma cadena por su cuenta: el formato es
+        // parte del contrato entre los dos.
+        assert_eq!(
+            ruta_del_socket_rekey(1000).parent(),
+            ruta_del_socket(1000).parent(),
+            "los dos sockets viven en el mismo directorio 0700"
+        );
+        assert_ne!(ruta_del_socket_rekey(1000), ruta_del_socket(1000));
+    }
+
+    #[test]
+    fn el_marco_de_rekey_devuelve_vieja_y_nueva_en_ese_orden() {
+        let (vieja, nueva) = interpretar_rekey(&marco(b"maestra-vieja", b"maestra-nueva")).unwrap();
+
+        assert_eq!(vieja, "maestra-vieja");
+        assert_eq!(nueva, "maestra-nueva");
+    }
+
+    #[test]
+    fn un_secreto_con_saltos_de_linea_y_acentos_sobrevive_al_marco() {
+        // Por eso el marco va largo-prefijado: cualquier byte es contenido y un
+        // separador se confundiría con él.
+        let rara = "con\nsalto\0y ñandú";
+        let (vieja, nueva) = interpretar_rekey(&marco(rara.as_bytes(), b"\n")).unwrap();
+
+        assert_eq!(vieja, rara);
+        assert_eq!(
+            nueva, "\n",
+            "ni siquiera se recorta un salto de línea final"
+        );
+    }
+
+    #[test]
+    fn un_marco_de_rekey_truncado_se_descarta() {
+        let entero = marco(b"vieja", b"nueva");
+        // Cortado en cualquier punto antes del final: falta el largo de un
+        // secreto o faltan bytes de uno. Nunca puede dar un par.
+        for corte in 0..entero.len() {
+            assert!(
+                interpretar_rekey(&entero[..corte]).is_err(),
+                "un marco cortado en {corte} de {} no puede interpretarse",
+                entero.len()
+            );
+        }
+    }
+
+    #[test]
+    fn un_marco_de_rekey_con_un_secreto_vacio_se_descarta() {
+        // Una contraseña vacía no cifra nada: derivaría una maestra para nada.
+        assert!(interpretar_rekey(&marco(b"", b"nueva")).is_err());
+        assert!(interpretar_rekey(&marco(b"vieja", b"")).is_err());
+        assert!(interpretar_rekey(&marco(b"", b"")).is_err());
+    }
+
+    #[test]
+    fn el_tope_de_un_secreto_de_rekey_es_exacto() {
+        let justo = vec![b'a'; MAXIMO_SECRETO];
+        let de_mas = vec![b'a'; MAXIMO_SECRETO + 1];
+
+        let (vieja, nueva) = interpretar_rekey(&marco(&justo, &justo)).unwrap();
+        assert_eq!((vieja.len(), nueva.len()), (MAXIMO_SECRETO, MAXIMO_SECRETO));
+        assert!(
+            interpretar_rekey(&marco(&de_mas, b"nueva")).is_err(),
+            "una vieja de {} bytes no entra",
+            MAXIMO_SECRETO + 1
+        );
+        assert!(
+            interpretar_rekey(&marco(b"vieja", &de_mas)).is_err(),
+            "una nueva de {} bytes no entra",
+            MAXIMO_SECRETO + 1
+        );
+    }
+
+    #[test]
+    fn el_tope_del_marco_deja_pasar_al_marco_legal_mas_grande() {
+        // Si el tope de lectura de `atender_rekey` quedara por debajo de lo que
+        // `interpretar_rekey` acepta, un par de maestras legales se cortaría.
+        let justo = vec![b'a'; MAXIMO_SECRETO];
+
+        assert!(marco(&justo, &justo).len() as u64 <= MAXIMO_REKEY);
+    }
+
+    #[test]
+    fn un_largo_declarado_enorme_se_descarta_sin_reservar_memoria() {
+        // Un par que declara 4 GiB no puede llevar al demonio a esperar ni a
+        // reservar esos bytes: se corta por el largo, antes de mirar el resto.
+        let mut bytes = u32::MAX.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"vieja");
+
+        assert!(interpretar_rekey(&bytes).is_err());
+    }
+
+    #[test]
+    fn un_marco_de_rekey_con_bytes_de_sobra_se_descarta() {
+        let mut bytes = marco(b"vieja", b"nueva");
+        bytes.push(b'x');
+
+        assert!(
+            interpretar_rekey(&bytes).is_err(),
+            "un tercer secreto, o basura al final, no es un marco válido"
+        );
+        // Ni siquiera un tercer secreto bien formado.
+        let mut tres = marco(b"vieja", b"nueva");
+        tres.extend_from_slice(&marco(b"otra", b"mas")[..8]);
+        assert!(interpretar_rekey(&tres).is_err());
+    }
+
+    #[test]
+    fn un_secreto_de_rekey_que_no_es_utf8_se_descarta() {
+        assert!(interpretar_rekey(&marco(&[0xff, 0xfe], b"nueva")).is_err());
+        assert!(interpretar_rekey(&marco(b"vieja", &[0xc3, 0x28])).is_err());
+    }
+
+    /// Un programa de la sesión —mismo uid que el demonio— que manda un rekey
+    /// perfectamente formado. Sólo root puede: quien validó las dos contraseñas
+    /// contra la cuenta es `pam_sm_chauthtok`. Si el programa pudiera, elegiría
+    /// con qué maestra se cifra la base de la persona, o la dejaría ilegible.
+    ///
+    /// Va contra `atender_rekey` y no contra `escuchar`, por lo mismo que la
+    /// prueba del desbloqueo: `escuchar` arma la ruta en `/run/user/<uid>`.
+    #[tokio::test]
+    async fn un_programa_de_la_sesion_no_puede_re_cifrar_la_base() {
+        use crate::dbus_api::tests::{base_de_las_pruebas, estado_de_la_sesion, EstadoDelLogin};
+
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        let ruta = base_de_las_pruebas();
+        std::fs::create_dir_all(ruta.parent().unwrap()).unwrap();
+        let db = crate::crypto::KeyringDatabase {
+            format: crate::dbus_api::PORTAL_NAMESPACE_FORMAT,
+            items: vec![],
+        };
+        std::fs::write(
+            &ruta,
+            crate::crypto::encrypt_database(&db, "la-vieja").unwrap(),
+        )
+        .unwrap();
+        let antes = std::fs::read(&ruta).unwrap();
+
+        let (servidor, mut intruso) = UnixStream::pair().unwrap();
+        assert_ne!(
+            servidor.peer_cred().unwrap().uid(),
+            0,
+            "la prueba tiene que correr sin ser root: el par es el propio usuario"
+        );
+        let atencion = tokio::spawn(atender_rekey(servidor, unsafe { libc::geteuid() }));
+
+        let _ = intruso
+            .write_all(&marco(b"la-vieja", b"la-del-intruso"))
+            .await;
+        let _ = intruso.shutdown().await;
+        let mut respuesta = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            intruso.read_to_end(&mut respuesta),
+        )
+        .await
+        .expect("el demonio no contestó ni cortó");
+        atencion
+            .await
+            .expect("la atención de la conexión no terminó");
+
+        assert_eq!(
+            std::fs::read(&ruta).unwrap(),
+            antes,
+            "un rekey que no viene de root no puede tocar la base"
+        );
+        assert_ne!(
+            respuesta, b"1",
+            "el demonio no puede decirle al propio usuario que re-cifró"
+        );
+    }
+    #[test]
+    fn un_marco_de_rekey_armado_por_el_modulo_de_pam_se_interpreta() {
+        // Los bytes de `marco_rekey("vieja", "nueva!")` del módulo de PAM, tal
+        // como los afirma `el_marco_de_rekey_son_dos_secretos_con_su_largo_u32_
+        // little_endian` allá. El módulo es un `cdylib` y el demonio un binario:
+        // no se pueden llamar entre sí, así que el contrato es esta cadena de
+        // bytes, la misma de los dos lados.
+        let de_pam: &[u8] = b"\x05\0\0\0vieja\x06\0\0\0nueva!";
+
+        let (vieja, nueva) = interpretar_rekey(de_pam).unwrap();
+
+        assert_eq!((vieja.as_str(), nueva.as_str()), ("vieja", "nueva!"));
     }
 }

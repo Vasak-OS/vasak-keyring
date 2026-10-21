@@ -224,6 +224,72 @@ fn keyring_path_under(base: Option<std::path::PathBuf>) -> Option<std::path::Pat
     Some(base.join("vasak-keyring").join("keyring.db"))
 }
 
+/// La marca con qué `machine-id` se cifró la base, al lado de ella:
+/// `keyring.db.machine`.
+///
+/// El `machine-id` sale de la sal de la maestra (`derivacion::machine_id`). Si
+/// `/etc/machine-id` cambia —disco clonado, reinstalación, contenedor—, la sal
+/// cambia y la maestra que entrega el inicio de sesión ya no abre la base: el
+/// mismo síntoma que un cambio de contraseña, pero sin contraseña vieja que
+/// tipear, porque lo que cambió es la sal. Guardando acá el identificador con el
+/// que se cifró, el diálogo puede re-derivar la maestra con la sal de antes y
+/// recuperar la base (vasak-keyring#38). No es secreto —`/etc/machine-id` lo lee
+/// cualquiera—, así que tenerlo en claro no debilita el cifrado.
+fn machine_sidecar_path(base: &std::path::Path) -> std::path::PathBuf {
+    let name = base
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "keyring.db".to_string());
+    base.with_file_name(format!("{name}.machine"))
+}
+
+/// El `machine-id` guardado en la marca, o `None` si no hay (una base de antes
+/// de este cambio, o ninguna base) o si la marca llegó vacía.
+fn read_machine_sidecar(base: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(machine_sidecar_path(base))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Deja en la marca el `machine-id` de ahora, que es el de la maestra que cifra
+/// la base cada vez que ésta se escribe.
+///
+/// Mejor esfuerzo: si falla, la base igual quedó escrita y es la que vale; lo
+/// único que se pierde es la recuperación automática ante un cambio de
+/// `machine-id`. Por eso no corta el guardado. Atómico y 0600 como la base, con
+/// el mismo ayudante: no es secreto, pero no hay motivo para que sea más abierto
+/// que ella. Si no hay `machine-id` legible no se escribe nada: una marca vacía
+/// sería indistinguible de no tener marca y haría re-derivar con la sal vacía.
+fn write_machine_sidecar(base: &std::path::Path) {
+    let id = vasak_keyring_derivacion::machine_id();
+    if id.is_empty() {
+        return;
+    }
+    let sidecar = machine_sidecar_path(base);
+    if let Err(e) = write_atomically(&sidecar, id.as_bytes()) {
+        eprintln!(
+            "vasak-keyring: no se pudo guardar la marca de machine-id en {}: {e}",
+            sidecar.display()
+        );
+    }
+}
+
+/// El `machine-id` con el que se cifró la base, **sólo si difiere del de ahora**.
+///
+/// Vacío cuando no hay marca o cuando coincide: en ambos casos no hay nada que
+/// recuperar por cambio de `machine-id`. Cuando no está vacío, el diálogo
+/// re-deriva la maestra con la sal de ese identificador (vasak-keyring#38).
+fn mismatched_machine_id() -> String {
+    let Some(path) = keyring_path() else {
+        return String::new();
+    };
+    match read_machine_sidecar(&path) {
+        Some(viejo) if viejo != vasak_keyring_derivacion::machine_id() => viejo,
+        _ => String::new(),
+    }
+}
+
 /// In-memory master password (used to derive the DB key via Argon2). It is set
 /// at login by `pam_vasak_keyring` through the PAM unlock interface and is
 /// NEVER written to disk.
@@ -1109,7 +1175,12 @@ fn write_to(path: &std::path::Path, items: &[ItemInfo]) -> Result<(), String> {
         .map_err(|e| format!("no se pudo cifrar el llavero: {e}"))?;
 
     write_atomically(path, &data)
-        .map_err(|e| format!("no se pudo escribir {}: {e}", path.display()))
+        .map_err(|e| format!("no se pudo escribir {}: {e}", path.display()))?;
+
+    // La base quedó cifrada con la maestra de ahora; deja al lado con qué
+    // `machine-id` fue, para poder recuperarla si cambia (vasak-keyring#38).
+    write_machine_sidecar(path);
+    Ok(())
 }
 
 /// Replaces the database in one step, so an interrupted write can never leave a
@@ -3067,6 +3138,17 @@ impl PamUnlockInterface {
 
         self.publicar(db).await?;
 
+        // Backfill para bases escritas antes de este cambio: si la base abrió y
+        // no hay marca, la maestra que la abrió es la del `machine-id` de ahora
+        // —si fuera la de otro no habría abierto, porque la recuperación por
+        // cambio de `machine-id` sólo corre cuando la marca ya existe—. Dejarla
+        // registrada hace que un cambio posterior se pueda recuperar sin esperar
+        // al primer guardado (vasak-keyring#38). Sólo con base en disco: una
+        // marca sin base re-derivaría contra una base que todavía no existe.
+        if path.exists() && read_machine_sidecar(&path).is_none() {
+            write_machine_sidecar(&path);
+        }
+
         if let Some(login) = rejected_login() {
             forget_rejected_login();
             if login.as_str() != password {
@@ -3344,6 +3426,16 @@ impl PamUnlockInterface {
     #[zbus(property)]
     async fn login_password_rejected(&self) -> bool {
         rejected_login().is_some()
+    }
+
+    /// El `machine-id` con el que se cifró la base, si difiere del de ahora;
+    /// vacío si no. El diálogo lo lee para re-derivar la maestra con la sal de
+    /// antes y recuperar una base que un cambio de `/etc/machine-id` dejó sin
+    /// abrir (vasak-keyring#38). No es secreto: `/etc/machine-id` lo lee
+    /// cualquier proceso de la sesión.
+    #[zbus(property)]
+    async fn mismatched_machine_id(&self) -> String {
+        mismatched_machine_id()
     }
 }
 

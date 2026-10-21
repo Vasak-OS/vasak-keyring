@@ -67,11 +67,24 @@ const CARRILES: u32 = 1;
 /// dejar el llavero sin abrir: un contenedor o un sistema recién instalado puede
 /// no tener `machine-id` todavía.
 pub fn sal() -> Vec<u8> {
-    let identificador = std::fs::read_to_string(RUTA_MACHINE_ID)
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+    sal_desde(&machine_id())
+}
 
-    sal_desde(&identificador)
+/// El identificador de la máquina, crudo y recortado, o cadena vacía si no se
+/// puede leer.
+///
+/// Es la fuente de la sal, expuesta aparte porque el demonio **también** lo
+/// guarda al lado de la base: si `/etc/machine-id` cambia —disco clonado,
+/// reinstalación, contenedor—, la sal cambia y la maestra derivada ya no abre la
+/// base. Teniendo el identificador con el que se cifró, la maestra se puede
+/// volver a derivar con la sal vieja y re-cifrar con la nueva, sin que nadie
+/// tenga que tipear nada (vasak-keyring#38). Una sola fuente para la sal y para
+/// esa marca, por lo mismo que la derivación vive en un crate propio: si
+/// divergieran, la marca apuntaría a una sal que no es la que se usó.
+pub fn machine_id() -> String {
+    std::fs::read_to_string(RUTA_MACHINE_ID)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// La sal para un identificador dado. Separado para poder probarlo.

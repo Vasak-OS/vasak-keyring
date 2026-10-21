@@ -4,10 +4,15 @@ resolver = "2"
 
 [package]
 name = "vasak-keyring"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 
 [dependencies]
+# La derivación de la maestra, sólo por `machine_id()`: el demonio no deriva
+# —recibe la maestra ya derivada por PAM o el diálogo— pero sí guarda al lado de
+# la base con qué `machine-id` se cifró, de la misma fuente que la sal, para
+# poder recuperarla si `/etc/machine-id` cambia (vasak-keyring#38).
+vasak-keyring-derivacion = { path = "derivacion" }
 # The XDG base directories, so the rule that a relative or empty variable is
 # ignored lives in one place and not in a copy per program. See `keyring_path`.
 dirs = "7"

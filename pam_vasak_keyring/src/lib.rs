@@ -22,6 +22,11 @@ use zeroize::Zeroizing;
 const PAM_SUCCESS: c_int = 0;
 const PAM_IGNORE: c_int = 25;
 const PAM_AUTHTOK: c_int = 6;
+/// Item de PAM con la contraseña **anterior**, la que se está cambiando.
+const PAM_OLDAUTHTOK: c_int = 7;
+/// Bandera de `pam_sm_chauthtok` en la fase que de verdad cambia la contraseña.
+/// La otra, `PAM_PRELIM_CHECK`, sólo comprueba; ahí la nueva todavía no está.
+const PAM_UPDATE_AUTHTOK: c_int = 0x2000;
 const LOG_AUTH: c_int = 4;
 
 /// Lo que contesta `pam_set_data` cuando no hay lugar para guardar el dato, y lo
@@ -59,6 +64,17 @@ extern "C" {
         pamh: *mut pam_handle_t,
         module_data_name: *const c_char,
         data: *mut *mut std::ffi::c_void,
+    ) -> c_int;
+
+    // A diferencia de `pam_get_authtok`, **no** inicia una conversación si el item
+    // no está puesto: devuelve lo que haya o nada. En `pam_sm_chauthtok` eso es lo
+    // que se quiere —leer lo que `system-auth` ya recogió, sin agregar un segundo
+    // «Contraseña actual:»—; con `pam_get_authtok`, un `passwd <otro>` de root,
+    // que no pide la anterior, dispararía ese prompt de más.
+    fn pam_get_item(
+        pamh: *const pam_handle_t,
+        item_type: c_int,
+        item: *mut *const std::ffi::c_void,
     ) -> c_int;
 
     fn pam_syslog(pamh: *mut pam_handle_t, priority: c_int, format: *const c_char, ...) -> c_int;
@@ -367,7 +383,7 @@ fn target_uid(pamh: *mut pam_handle_t) -> Option<u32> {
 /// ventana es de microsegundos y ganarla ya no sirve para llevarse la contraseña
 /// de la cuenta, sólo la maestra del llavero, que un proceso del usuario ya podía
 /// obtener pidiéndole los secretos al Secret Service.
-fn ruta_sin_desviar(uid: u32) -> Result<(), std::io::Error> {
+fn ruta_sin_desviar(uid: u32, socket: &CStr) -> Result<(), std::io::Error> {
     use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
     fn abrir_directorio(base: Option<&OwnedFd>, nombre: &CStr) -> Result<OwnedFd, std::io::Error> {
@@ -417,7 +433,7 @@ fn ruta_sin_desviar(uid: u32) -> Result<(), std::io::Error> {
     let hecho = unsafe {
         libc::fstatat(
             dir_llavero.as_raw_fd(),
-            c"unlock.sock".as_ptr(),
+            socket.as_ptr(),
             &mut datos,
             libc::AT_SYMLINK_NOFOLLOW,
         )
@@ -428,13 +444,16 @@ fn ruta_sin_desviar(uid: u32) -> Result<(), std::io::Error> {
     if datos.st_mode & libc::S_IFMT != libc::S_IFSOCK {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "unlock.sock no es un socket",
+            format!("{} no es un socket", socket.to_string_lossy()),
         ));
     }
     if datos.st_uid != uid {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "unlock.sock no es del usuario del inicio de sesión",
+            format!(
+                "{} no es del usuario del inicio de sesión",
+                socket.to_string_lossy()
+            ),
         ));
     }
 
@@ -467,7 +486,7 @@ fn entregar(uid: u32, password: &str) -> Entrega {
     for intento in 0..INTENTOS {
         // Antes de cada intento, no una sola vez: entre reintentos pasan
         // doscientos milisegundos y el socket puede aparecer desviado.
-        if let Err(e) = ruta_sin_desviar(uid) {
+        if let Err(e) = ruta_sin_desviar(uid, c"unlock.sock") {
             if todavia_arrancando(e.kind()) && intento + 1 < INTENTOS {
                 ultimo = e;
                 std::thread::sleep(ESPERA_ENTRE_INTENTOS);
@@ -493,6 +512,72 @@ fn entregar(uid: u32, password: &str) -> Entrega {
     }
 
     Entrega::SinDemonio(ultimo)
+}
+
+// ── Rekey al cambiar la contraseña (vasak-keyring#38) ──────
+
+/// La ruta del socket de rekey, armada igual que la del demonio.
+fn ruta_del_socket_rekey(uid: u32) -> String {
+    format!("/run/user/{uid}/vasak-keyring/rekey.sock")
+}
+
+/// Lee un item de contraseña del handle de PAM (`PAM_AUTHTOK` o `PAM_OLDAUTHTOK`)
+/// como cadena propia y zeroizable. `None` si no hay nada bajo ese item.
+///
+/// Con `pam_get_item` y **no** `pam_get_authtok`: en `pam_sm_chauthtok` sólo se
+/// quiere leer lo que `system-auth` ya recogió, nunca pedirlo. `pam_get_authtok`
+/// inicia una conversación cuando el item no está puesto —el caso de un
+/// `passwd <otro>` de root, que no pide la contraseña anterior— y agregaría un
+/// «Contraseña actual:» de más después del cambio real.
+///
+/// El puntero lo escribe PAM y el manual lo trata como constante; se lee, no se
+/// libera. `None` cuando el item no está, que es un camino normal y no un error.
+fn leer_item_de_contrasena(pamh: *mut pam_handle_t, item: c_int) -> Option<Zeroizing<String>> {
+    let mut crudo: *const std::ffi::c_void = std::ptr::null();
+    let ret = unsafe { pam_get_item(pamh, item, &mut crudo) };
+    if ret != PAM_SUCCESS || crudo.is_null() {
+        return None;
+    }
+    let token = unsafe { CStr::from_ptr(crudo as *const c_char) };
+    Some(Zeroizing::new(token.to_string_lossy().into_owned()))
+}
+
+/// Arma el marco de rekey: los dos secretos largo-prefijados (u32 LE), la
+/// maestra vieja y la nueva, en ese orden.
+///
+/// En un `Zeroizing<Vec<u8>>` porque lleva las maestras derivadas: aunque valen
+/// menos que la contraseña de la cuenta, no tienen por qué quedar en el montón
+/// más de lo necesario.
+fn marco_rekey(vieja: &str, nueva: &str) -> Zeroizing<Vec<u8>> {
+    let mut marco = Zeroizing::new(Vec::with_capacity(8 + vieja.len() + nueva.len()));
+    for secreto in [vieja, nueva] {
+        marco.extend_from_slice(&(secreto.len() as u32).to_le_bytes());
+        marco.extend_from_slice(secreto.as_bytes());
+    }
+    marco
+}
+
+/// Entrega el marco de rekey al demonio y devuelve si re-cifró la base.
+///
+/// Un solo intento, sin la espera de arranque del desbloqueo: el cambio de
+/// contraseña pasa con la sesión abierta, así que el demonio ya está corriendo.
+/// La comprobación de que la ruta no esté desviada es la misma del desbloqueo.
+fn entregar_rekey(uid: u32, vieja: &str, nueva: &str) -> Result<bool, std::io::Error> {
+    ruta_sin_desviar(uid, c"rekey.sock")?;
+
+    let ruta = ruta_del_socket_rekey(uid);
+    let mut flujo = UnixStream::connect(&ruta)?;
+    flujo.set_write_timeout(Some(PLAZO))?;
+    flujo.set_read_timeout(Some(PLAZO))?;
+
+    let marco = marco_rekey(vieja, nueva);
+    flujo.write_all(&marco)?;
+    // El demonio lee hasta el fin del flujo, igual que en el desbloqueo.
+    flujo.shutdown(std::net::Shutdown::Write)?;
+
+    let mut respuesta = [0u8; 1];
+    flujo.read_exact(&mut respuesta)?;
+    Ok(respuesta[0] == b'1')
 }
 
 // ════════════════════════════════════════════════════════════
@@ -642,6 +727,116 @@ pub extern "C" fn pam_sm_open_session(
     }
 
     // password zeroized automatically on drop (Zeroizing)
+
+    PAM_SUCCESS
+}
+
+/// Si el flag de `pam_sm_chauthtok` dice que es la fase que de verdad cambia la
+/// contraseña (`PAM_UPDATE_AUTHTOK`) y no la preliminar.
+fn es_fase_de_actualizacion(flags: c_int) -> bool {
+    flags & PAM_UPDATE_AUTHTOK != 0
+}
+
+/// Deriva las maestras vieja y nueva para el rekey.
+///
+/// `Ok(None)` si alguna contraseña está vacía —no es la que cifra la base y
+/// derivarla no sirve—; `Err` si la derivación falla. Separado de
+/// `pam_sm_chauthtok` para poder probar la derivación sin un handle de PAM real.
+#[allow(clippy::type_complexity)]
+fn maestras_de(
+    vieja: &str,
+    nueva: &str,
+) -> Result<Option<(Zeroizing<String>, Zeroizing<String>)>, String> {
+    if vieja.is_empty() || nueva.is_empty() {
+        return Ok(None);
+    }
+    let maestra_vieja = vasak_keyring_derivacion::derivar_maestra(vieja)?;
+    let maestra_nueva = vasak_keyring_derivacion::derivar_maestra(nueva)?;
+    Ok(Some((maestra_vieja, maestra_nueva)))
+}
+
+/// Called during the password-change phase (`passwd` y cualquier cambio por PAM).
+///
+/// Re-cifra la base del llavero con la contraseña nueva de la cuenta para que el
+/// próximo inicio de sesión la abra sin pedir la anterior (vasak-keyring#38). El
+/// demonio lo hace de forma no destructiva: si la base no abre con la vieja, no
+/// toca nada, y lo que acá no se cubra lo recupera el flujo del próximo login.
+///
+/// PAM lo llama dos veces: con `PAM_PRELIM_CHECK` y con `PAM_UPDATE_AUTHTOK`.
+/// Sólo la fase de actualización —después de que la contraseña cambió— tiene la
+/// nueva puesta, así que la preliminar no hace nada.
+///
+/// Siempre devuelve `PAM_SUCCESS`: un llavero que no se puede re-cifrar no debe
+/// trabar el cambio de contraseña, y lo que viaja es la maestra derivada, nunca
+/// la contraseña de la cuenta —el socket vive en `/run/user/<uid>`, del usuario,
+/// igual que el de desbloqueo—.
+///
+/// En la fase de actualización el re-cifrado no espera a que el cambio de
+/// contraseña *commitee*: si otro módulo del stack lo aborta después, la cuenta
+/// se queda con la vieja y la base cifrada con la nueva, y el próximo login cae
+/// al diálogo de recuperación. No se pierde nada —la base sigue abriéndose con lo
+/// que se tecleó como nueva— y el caso común está a salvo porque esta línea va
+/// `optional` y **después** de `password include system-auth`, que es quien de
+/// verdad cambia la contraseña.
+#[no_mangle]
+pub extern "C" fn pam_sm_chauthtok(
+    pamh: *mut pam_handle_t,
+    flags: c_int,
+    _argc: c_int,
+    _argv: *mut *const c_char,
+) -> c_int {
+    if !es_fase_de_actualizacion(flags) {
+        // Fase preliminar: la contraseña nueva todavía no está puesta.
+        return PAM_SUCCESS;
+    }
+
+    let (Some(vieja), Some(nueva)) = (
+        leer_item_de_contrasena(pamh, PAM_OLDAUTHTOK),
+        leer_item_de_contrasena(pamh, PAM_AUTHTOK),
+    ) else {
+        log(
+            pamh,
+            "pam_vasak_keyring: sin contraseña anterior o nueva en chauthtok; no se re-cifra",
+        );
+        return PAM_SUCCESS;
+    };
+
+    let Some(uid) = target_uid(pamh) else {
+        log(
+            pamh,
+            "pam_vasak_keyring: no se pudo resolver el usuario del cambio de contraseña",
+        );
+        return PAM_SUCCESS;
+    };
+
+    let (maestra_vieja, maestra_nueva) = match maestras_de(&vieja, &nueva) {
+        // Alguna contraseña vacía: no es la que cifra la base, no hay nada que hacer.
+        Ok(None) => return PAM_SUCCESS,
+        Ok(Some(par)) => par,
+        Err(e) => {
+            log(pamh, &format!("pam_vasak_keyring: {e}"));
+            return PAM_SUCCESS;
+        }
+    };
+
+    match entregar_rekey(uid, &maestra_vieja, &maestra_nueva) {
+        Ok(true) => log(
+            pamh,
+            "pam_vasak_keyring: el llavero se re-cifró con la contraseña nueva",
+        ),
+        Ok(false) => log(
+            pamh,
+            "pam_vasak_keyring: el demonio no re-cifró el llavero; \
+             se pedirá la contraseña anterior en el próximo inicio de sesión",
+        ),
+        Err(e) => log(
+            pamh,
+            &format!(
+                "pam_vasak_keyring: no se pudo entregar el rekey al demonio ({e}); \
+                 se pedirá la contraseña anterior en el próximo inicio de sesión"
+            ),
+        ),
+    }
 
     PAM_SUCCESS
 }
@@ -807,7 +1002,7 @@ mod tests_ruta {
     #[test]
     fn sin_directorio_de_runtime_no_hay_entrega() {
         // 61234 no tiene sesión; su /run/user no existe.
-        let error = ruta_sin_desviar(61234).expect_err("no debería haber ruta");
+        let error = ruta_sin_desviar(61234, c"unlock.sock").expect_err("no debería haber ruta");
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         // Y eso cuenta como «todavía no arrancó», así que se reintenta en lugar
         // de darse por vencido al primer intento del inicio de sesión.
@@ -1075,5 +1270,118 @@ mod tests_datos {
             antes,
             "un puntero nulo no es una reserva: no hay nada que soltar"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_rekey {
+    use super::*;
+
+    /// El contrato con el demonio, igual que el de `unlock.sock`: los dos lados
+    /// arman la cadena por separado y si dejan de coincidir el rekey falla sin
+    /// que nada lo diga. El demonio afirma la misma en `unlock_socket`.
+    #[test]
+    fn la_ruta_del_socket_de_rekey_es_la_que_el_demonio_publica() {
+        assert_eq!(
+            ruta_del_socket_rekey(1000),
+            "/run/user/1000/vasak-keyring/rekey.sock"
+        );
+        assert_ne!(ruta_del_socket_rekey(1000), ruta_del_socket(1000));
+    }
+
+    /// El otro lado del contrato, el que `interpretar_rekey` del demonio parsea.
+    /// Este crate es un `cdylib` y no puede depender del binario del demonio, así
+    /// que el marco se afirma byte a byte acá y el demonio parsea esos mismos
+    /// bytes en `un_marco_de_rekey_armado_por_el_modulo_de_pam_se_interpreta`.
+    #[test]
+    fn el_marco_de_rekey_son_dos_secretos_con_su_largo_u32_little_endian() {
+        let marco = marco_rekey("vieja", "nueva!");
+
+        let mut esperado = Vec::new();
+        esperado.extend_from_slice(&[5, 0, 0, 0]);
+        esperado.extend_from_slice(b"vieja");
+        esperado.extend_from_slice(&[6, 0, 0, 0]);
+        esperado.extend_from_slice(b"nueva!");
+        assert_eq!(&marco[..], &esperado[..]);
+    }
+
+    #[test]
+    fn el_marco_de_rekey_lleva_la_vieja_primero_y_el_largo_cuenta_bytes_y_no_letras() {
+        // «ñ» son dos bytes: si el largo contara caracteres, el demonio leería de
+        // menos y se desfasaría todo lo que viene después.
+        let marco = marco_rekey("ñ", "b");
+
+        assert_eq!(&marco[..4], &2u32.to_le_bytes());
+        assert_eq!(&marco[4..6], "ñ".as_bytes());
+        assert_eq!(&marco[6..10], &1u32.to_le_bytes());
+        assert_eq!(&marco[10..], b"b");
+        assert_eq!(marco.len(), 11);
+    }
+
+    #[test]
+    fn el_marco_de_una_maestra_derivada_cabe_en_el_tope_del_demonio() {
+        // El demonio corta en 4 + 256 + 4 + 256 bytes. Una maestra son 64 dígitos
+        // hex: si la derivación creciera, el rekey dejaría de llegar.
+        let maestra = vasak_keyring_derivacion::derivar_maestra("una contraseña")
+            .expect("la derivación no puede fallar");
+
+        let marco = marco_rekey(&maestra, &maestra);
+
+        assert!(
+            maestra.len() <= 256,
+            "una maestra mide {} bytes",
+            maestra.len()
+        );
+        assert_eq!(marco.len(), 8 + 2 * maestra.len());
+    }
+
+    /// Sin `/run/user/<uid>` no hay a quién entregarle nada: tiene que volver un
+    /// error —que `pam_sm_chauthtok` registra y sigue— y no un «re-cifrado».
+    #[test]
+    fn sin_directorio_de_runtime_el_rekey_no_se_entrega() {
+        // 61234 no tiene sesión; su /run/user no existe.
+        let error = entregar_rekey(61234, "vieja", "nueva").expect_err("no debería entregarse");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn la_comprobacion_de_ruta_del_rekey_mira_su_propio_socket() {
+        let error = ruta_sin_desviar(61234, c"rekey.sock").expect_err("no debería haber ruta");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// El rekey sólo actúa en la fase de actualización, no en la preliminar:
+    /// ahí la contraseña nueva todavía no está puesta.
+    #[test]
+    fn el_rekey_solo_actua_en_la_fase_de_actualizacion() {
+        assert!(es_fase_de_actualizacion(PAM_UPDATE_AUTHTOK));
+        assert!(es_fase_de_actualizacion(PAM_UPDATE_AUTHTOK | 0x4000));
+        // PAM_PRELIM_CHECK (0x4000) sola no es la fase de actualización.
+        assert!(!es_fase_de_actualizacion(0x4000));
+        assert!(!es_fase_de_actualizacion(0));
+    }
+
+    /// Una contraseña vacía no deriva nada: no es la que cifra la base.
+    #[test]
+    fn una_contrasena_vacia_no_deriva_maestra() {
+        assert!(maestras_de("", "nueva").expect("sin error").is_none());
+        assert!(maestras_de("vieja", "").expect("sin error").is_none());
+        assert!(maestras_de("", "").expect("sin error").is_none());
+    }
+
+    /// Con las dos puestas, deriva las dos, y son distintas entre sí y de las
+    /// contraseñas de origen (lo que viaja no es la contraseña de la cuenta).
+    #[test]
+    fn maestras_de_deriva_las_dos_distintas() {
+        let (vieja, nueva) = maestras_de("MiVieja1", "MiNueva2")
+            .expect("sin error")
+            .expect("las dos puestas dan Some");
+        assert_eq!(vieja.len(), 64, "hexadecimal de 32 bytes");
+        assert_eq!(nueva.len(), 64);
+        assert_ne!(*vieja, *nueva);
+        assert_ne!(*vieja, "MiVieja1");
+        assert!(!vieja.contains("Vieja"));
     }
 }

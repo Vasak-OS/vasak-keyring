@@ -290,6 +290,69 @@ fn mismatched_machine_id() -> String {
     }
 }
 
+/// El momento de creación de la colección, al lado de la base:
+/// `keyring.db.created`.
+///
+/// La identidad de una colección para quien la usa —vasak-accounts ata la clave
+/// de cada almacén cifrado a `ruta + Created + dueño en el bus`— tiene que
+/// sobrevivir a un reinicio del demonio. `Created` salía de `now()` al registrar
+/// la colección, así que cada arranque la cambiaba, y todo almacén cifrado
+/// quedaba huérfano aunque el llavero conservara todos los ítems
+/// (vasak-keyring#62). Acá queda el valor de la primera vez, en claro: no es
+/// secreto, y estando fuera de la base se lee **antes** de desbloquearla, que es
+/// cuando el demonio registra la colección y cuando alguien puede preguntarlo.
+fn created_sidecar_path(base: &std::path::Path) -> std::path::PathBuf {
+    let name = base
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "keyring.db".to_string());
+    base.with_file_name(format!("{name}.created"))
+}
+
+/// El `Created` de la colección de la base `base`: el guardado si hay uno
+/// válido, o `ahora` —que queda guardado— si no.
+///
+/// «Válido» es un entero mayor que cero. Una marca vacía, rota o en cero se
+/// trata como ausente y se reemplaza: la alternativa es una colección con
+/// `Created` en cero para siempre. Si no se puede escribir, el valor de esta
+/// vez se devuelve igual —mejor una identidad que dura hasta el próximo
+/// arranque que no registrar la colección—.
+fn collection_created_in(base: &std::path::Path, ahora: u64) -> u64 {
+    let sidecar = created_sidecar_path(base);
+    let guardado = std::fs::read_to_string(&sidecar)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&created| created > 0);
+    if let Some(created) = guardado {
+        return created;
+    }
+    if let Some(parent) = sidecar.parent() {
+        let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::set_permissions(parent, PermissionsExt::from_mode(0o700));
+    }
+    // Con el reloj antes de 1970 `now()` da 0, que la próxima lectura rechaza:
+    // se devuelve sin escribir, y la marca queda para cuando el reloj ande.
+    if ahora == 0 {
+        return ahora;
+    }
+    if let Err(e) = write_atomically(&sidecar, ahora.to_string().as_bytes()) {
+        eprintln!(
+            "vasak-keyring: no se pudo guardar el momento de creación en {}: {e}",
+            sidecar.display()
+        );
+    }
+    ahora
+}
+
+/// El `Created` de la colección por omisión: el de la base de esta persona.
+/// Sin ruta de base —un entorno sin `HOME`— no hay dónde guardarlo y vale `now()`.
+fn default_collection_created() -> u64 {
+    match keyring_path() {
+        Some(base) => collection_created_in(&base, now()),
+        None => now(),
+    }
+}
+
 /// In-memory master password (used to derive the DB key via Argon2). It is set
 /// at login by `pam_vasak_keyring` through the PAM unlock interface and is
 /// NEVER written to disk.
@@ -1192,7 +1255,13 @@ fn write_to(path: &std::path::Path, items: &[ItemInfo]) -> Result<(), String> {
 fn write_atomically(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
-    let temp = path.with_extension("tmp");
+    // Un temporal por archivo: `with_extension("tmp")` reemplaza lo que sigue al
+    // último punto, así que `keyring.db.created` y `keyring.db.machine` caían en
+    // el mismo `keyring.db.tmp` y dos escrituras a la vez se pisaban.
+    let temp = {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        path.with_file_name(format!("{}.tmp", name.as_deref().unwrap_or("keyring.db")))
+    };
 
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -2345,6 +2414,7 @@ impl ServiceInterface {
             "/org/freedesktop/secrets/collection/login",
             "login",
             "Default collection",
+            default_collection_created(),
         )
         .await
     }
@@ -2421,6 +2491,7 @@ impl ServiceInterface {
         path: &str,
         alias: &str,
         label: &str,
+        created: u64,
     ) -> Result<(), zbus::fdo::Error> {
         // Las entradas las decide `items_from_disk`, y su error sube por el `?`:
         // registrar la colección abierta y vacía porque la base no se pudo leer
@@ -2441,7 +2512,7 @@ impl ServiceInterface {
             label: label.to_string(),
             locked: false,
             items: vec![],
-            created: now(),
+            created,
             modified: now(),
         };
         // Las entradas se arman **antes** de insertar la colección, así se
@@ -2618,7 +2689,7 @@ impl ServiceInterface {
             .unwrap_or_else(|| alias.to_string());
 
         let path = format!("/org/freedesktop/secrets/collection/{alias}");
-        self.spawn_collection(&path, alias, &label).await?;
+        self.spawn_collection(&path, alias, &label, now()).await?;
 
         let owned = owned_path_try(&path)?;
         if let Ok(emitter) = SignalEmitter::new(&self.conn, "/org/freedesktop/secrets") {
@@ -3263,6 +3334,20 @@ impl PamUnlockInterface {
         };
         self.publicar(db).await?;
 
+        // `set_aside` quitó la marca: la colección que sigue es otra, y su
+        // `Created` tiene que serlo ya, no recién en el próximo arranque.
+        // Normalmente un desbloqueo conserva el `Created` que ya tiene.
+        let created = default_collection_created();
+        if let Some(col) = self
+            .state
+            .lock()
+            .await
+            .collections
+            .get_mut("/org/freedesktop/secrets/collection/login")
+        {
+            col.created = created;
+        }
+
         Ok(aside.display().to_string())
     }
 
@@ -3479,8 +3564,27 @@ fn set_aside(path: &std::path::Path, seconds: u64) -> Result<std::path::PathBuf,
     if aside.exists() {
         return Err(format!("ya existe {}", aside.display()));
     }
-    std::fs::rename(path, &aside)
-        .map_err(|e| format!("no se pudo apartar {}: {e}", path.display()))?;
+    // La base que viene es otra colección: sin los ítems de la apartada, quien
+    // atara su clave a la identidad vieja tiene que enterarse de que cambió.
+    //
+    // La marca se quita **antes** de mover la base y su fallo corta: si se
+    // quitara después y fallara, la base nueva heredaría la identidad de la
+    // apartada y el `Reset` habría contestado que salió bien. Quitada antes, un
+    // fallo deja todo donde estaba. Si es el movimiento el que falla, se
+    // devuelve la marca, para que la base que sigue ahí conserve su identidad.
+    let sidecar = created_sidecar_path(path);
+    let guardada = std::fs::read(&sidecar).ok();
+    match std::fs::remove_file(&sidecar) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("no se pudo quitar {}: {e}", sidecar.display())),
+    }
+    if let Err(e) = std::fs::rename(path, &aside) {
+        if let Some(guardada) = guardada {
+            let _ = write_atomically(&sidecar, &guardada);
+        }
+        return Err(format!("no se pudo apartar {}: {e}", path.display()));
+    }
     Ok(aside)
 }
 
@@ -7850,6 +7954,161 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(&base).unwrap(), b"la de ahora");
     }
 
+    // ── El `Created` de la colección es estable (#62) ──
+
+    #[test]
+    fn la_primera_vez_el_created_queda_guardado_y_en_0600() {
+        let dir = DirDePrueba::nuevo("created-primera");
+        let base = dir.ruta().join("keyring.db");
+
+        assert_eq!(collection_created_in(&base, 1_000), 1_000);
+
+        let marca = dir.ruta().join("keyring.db.created");
+        assert_eq!(std::fs::read_to_string(&marca).unwrap(), "1000");
+        assert_eq!(
+            std::fs::metadata(&marca).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn las_marcas_de_al_lado_de_la_base_no_comparten_temporal() {
+        // `keyring.db.created` y `keyring.db.machine` caían en el mismo
+        // `keyring.db.tmp`: dos escrituras a la vez se pisaban y una marca
+        // quedaba con el contenido de la otra, o sin archivo.
+        let dir = DirDePrueba::nuevo("marcas-concurrentes");
+        let base = dir.ruta().join("keyring.db");
+        let created = created_sidecar_path(&base);
+        let machine = machine_sidecar_path(&base);
+        let barrera = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        for vuelta in 0..300 {
+            let (c, m) = (format!("{}", 1000 + vuelta), format!("maquina-{vuelta}"));
+            let escritor = |ruta: std::path::PathBuf, contenido: String| {
+                let barrera = barrera.clone();
+                std::thread::spawn(move || {
+                    barrera.wait();
+                    write_atomically(&ruta, contenido.as_bytes())
+                })
+            };
+            let a = escritor(created.clone(), c.clone());
+            let b = escritor(machine.clone(), m.clone());
+            a.join().unwrap().expect("la marca de created se escribe");
+            b.join()
+                .unwrap()
+                .expect("la marca de machine-id se escribe");
+
+            assert_eq!(
+                std::fs::read_to_string(&created).unwrap(),
+                c,
+                "vuelta {vuelta}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&machine).unwrap(),
+                m,
+                "vuelta {vuelta}"
+            );
+        }
+    }
+
+    #[test]
+    fn con_el_reloj_en_cero_no_se_escribe_una_marca_que_no_se_puede_leer() {
+        let dir = DirDePrueba::nuevo("created-reloj-en-cero");
+        let base = dir.ruta().join("keyring.db");
+
+        assert_eq!(collection_created_in(&base, 0), 0);
+        assert!(!created_sidecar_path(&base).exists());
+        // Y cuando el reloj anda, la marca se crea con el valor bueno.
+        assert_eq!(collection_created_in(&base, 5_000), 5_000);
+        assert_eq!(collection_created_in(&base, 9_000), 5_000);
+    }
+
+    #[test]
+    fn un_reinicio_del_demonio_no_cambia_el_created() {
+        // Lo que rompía a vasak-accounts: cada arranque registraba la colección
+        // con `now()`, así que la identidad `ruta + Created` cambiaba aunque
+        // el llavero conservara todos los ítems.
+        let dir = DirDePrueba::nuevo("created-reinicio");
+        let base = dir.ruta().join("keyring.db");
+
+        let primero = collection_created_in(&base, 1_000);
+        let despues_de_reiniciar = collection_created_in(&base, 9_999);
+
+        assert_eq!(primero, 1_000);
+        assert_eq!(despues_de_reiniciar, 1_000);
+    }
+
+    #[test]
+    fn una_marca_vacia_rota_o_en_cero_se_reemplaza() {
+        for contenido in ["", "   \n", "no es un número", "0", "-5", "1.5"] {
+            let dir = DirDePrueba::nuevo("created-rota");
+            let base = dir.ruta().join("keyring.db");
+            std::fs::write(dir.ruta().join("keyring.db.created"), contenido).unwrap();
+
+            assert_eq!(
+                collection_created_in(&base, 2_000),
+                2_000,
+                "con la marca {contenido:?} la identidad no puede quedar en cero"
+            );
+            assert_eq!(collection_created_in(&base, 3_000), 2_000);
+        }
+    }
+
+    #[test]
+    fn la_marca_se_lee_aunque_tenga_un_salto_de_linea() {
+        let dir = DirDePrueba::nuevo("created-salto");
+        let base = dir.ruta().join("keyring.db");
+        std::fs::write(dir.ruta().join("keyring.db.created"), "1234\n").unwrap();
+
+        assert_eq!(collection_created_in(&base, 9_999), 1_234);
+    }
+
+    #[test]
+    fn si_no_se_puede_escribir_la_marca_igual_hay_created() {
+        // Un directorio donde la marca no cabe: el demonio tiene que registrar
+        // la colección igual, con el valor de esta vez.
+        let dir = DirDePrueba::nuevo("created-sin-escribir");
+        let archivo = dir.ruta().join("es-un-archivo");
+        std::fs::write(&archivo, b"x").unwrap();
+        let base = archivo.join("keyring.db");
+
+        assert_eq!(collection_created_in(&base, 4_000), 4_000);
+    }
+
+    #[test]
+    fn apartar_la_base_empieza_otra_identidad() {
+        // La base apartada se lleva sus ítems: la colección de la que viene es
+        // otra, y quien ató su clave a la vieja tiene que verlo.
+        let dir = DirDePrueba::nuevo("created-apartar");
+        let base = dir.ruta().join("keyring.db");
+        std::fs::write(&base, b"la base").unwrap();
+        assert_eq!(collection_created_in(&base, 1_000), 1_000);
+
+        set_aside(&base, 42).expect("apartar");
+
+        assert!(!dir.ruta().join("keyring.db.created").exists());
+        assert_eq!(collection_created_in(&base, 5_000), 5_000);
+    }
+
+    #[tokio::test]
+    async fn re_cifrar_la_base_no_cambia_el_created() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _cerrada = sesion_cerrada();
+        let dir = DirDePrueba::nuevo("created-rekey");
+        let ruta = dir.ruta().join("keyring.db");
+        base_con_una_entrada(&ruta, "la-vieja").await;
+        assert_eq!(collection_created_in(&ruta, 1_000), 1_000);
+
+        let resultado = rekey_en(&ruta, "la-vieja", "la-nueva").await;
+
+        assert!(matches!(resultado, RekeyResultado::Hecho));
+        assert_eq!(
+            collection_created_in(&ruta, 7_000),
+            1_000,
+            "un re-cifrado cambia la clave de la base, no la colección"
+        );
+    }
+
     #[tokio::test]
     async fn reset_no_aparta_nada_con_el_llavero_abierto() {
         let _sesion = estado_de_la_sesion().lock().await;
@@ -7923,6 +8182,92 @@ pub(crate) mod tests {
             .expect("el llavero nuevo se puede escribir");
         let crudo = std::fs::read(base_de_las_pruebas()).unwrap();
         assert!(crypto::decrypt_database(&crudo, "la-nueva").is_ok());
+    }
+
+    #[test]
+    fn si_no_se_puede_quitar_la_marca_no_se_aparta_nada() {
+        // Una marca que no se puede borrar (acá, un directorio con algo
+        // adentro) no puede dejar que `Reset` conteste que salió bien con la
+        // identidad vieja puesta en la base nueva.
+        let dir = DirDePrueba::nuevo("apartar-marca-trabada");
+        let base = dir.ruta().join("keyring.db");
+        std::fs::write(&base, b"la base").unwrap();
+        let marca = dir.ruta().join("keyring.db.created");
+        std::fs::create_dir(&marca).unwrap();
+        std::fs::write(marca.join("x"), b"x").unwrap();
+
+        set_aside(&base, 42).expect_err("sin poder quitar la marca no se aparta");
+
+        assert_eq!(
+            std::fs::read(&base).unwrap(),
+            b"la base",
+            "la base sigue ahí"
+        );
+        assert!(!dir.ruta().join("keyring.db.apartada-42").exists());
+    }
+
+    #[test]
+    fn si_falla_mover_la_base_la_marca_vuelve() {
+        // Ya existe la apartada: el movimiento se niega antes de quitar nada.
+        // Lo que se comprueba es que la base y su identidad quedan como estaban.
+        let dir = DirDePrueba::nuevo("apartar-marca-vuelve");
+        let base = dir.ruta().join("keyring.db");
+        std::fs::write(&base, b"la base").unwrap();
+        std::fs::write(dir.ruta().join("keyring.db.apartada-42"), b"otra").unwrap();
+        assert_eq!(collection_created_in(&base, 1_000), 1_000);
+
+        set_aside(&base, 42).expect_err("ya hay una apartada con ese número");
+
+        assert_eq!(collection_created_in(&base, 9_000), 1_000);
+    }
+
+    #[tokio::test]
+    async fn reset_estrena_un_created_en_la_coleccion_que_ya_esta_en_memoria() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        base_cifrada_con("la-vieja").await;
+        let base = base_de_las_pruebas();
+        std::fs::write(created_sidecar_path(&base), "1000").unwrap();
+        let (desbloqueo, estado, _demonio, _cliente) = desbloqueo().await;
+        // La colección ya registrada en memoria, con la identidad de la base vieja.
+        estado.lock().await.collections.insert(
+            "/org/freedesktop/secrets/collection/login".to_string(),
+            CollectionInfo {
+                label: "Default collection".into(),
+                locked: true,
+                items: vec![],
+                created: 1000,
+                modified: 1000,
+            },
+        );
+        assert!(!desbloqueo
+            .aplicar_desde_el_login("la-nueva", true)
+            .await
+            .unwrap());
+
+        desbloqueo
+            .apartar_y_empezar()
+            .await
+            .expect("con el llavero bloqueado y el login rechazado se aparta");
+
+        let nuevo = estado
+            .lock()
+            .await
+            .collections
+            .get("/org/freedesktop/secrets/collection/login")
+            .map(|c| c.created)
+            .expect("la colección del login está registrada");
+        assert_ne!(
+            nuevo, 1000,
+            "la colección nueva no hereda la identidad vieja"
+        );
+        assert_eq!(
+            std::fs::read_to_string(created_sidecar_path(&base))
+                .unwrap()
+                .trim(),
+            nuevo.to_string(),
+            "lo que se ve por el bus es lo que queda guardado para el próximo arranque"
+        );
     }
 
     #[tokio::test]

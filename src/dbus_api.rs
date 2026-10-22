@@ -3450,11 +3450,17 @@ async fn rekey_en(path: &std::path::Path, vieja: &str, nueva: &str) -> RekeyResu
     // quedó con la nueva, y un guardado posterior con la vieja volvería a cifrar la
     // base con una contraseña que el próximo inicio de sesión no forma. Con el
     // llavero cerrado no se toca la memoria: el próximo login con la nueva lo abre.
-    if master_password()
-        .map(|m| m.as_str() == vieja)
-        .unwrap_or(false)
-    {
-        set_master_password(nueva);
+    //
+    // Se mira y se escribe el `master_store` **directo y bajo un solo candado**, y
+    // no `master_password()`/`set_master_password()`: el primero cae a la variable
+    // de entorno `VASAK_KEYRING_PASSWORD`, así que con el llavero cerrado pero esa
+    // variable igual a la vieja, el rekey abriría la sesión sin login —justo lo que
+    // el comentario de arriba dice que no pasa—. Y tomar el candado dos veces abre
+    // una ventana entre el chequeo y la escritura.
+    if let Ok(mut guard) = master_store().lock() {
+        if guard.as_ref().is_some_and(|m| m.as_str() == vieja) {
+            *guard = Some(Zeroizing::new(nueva.to_string()));
+        }
     }
 
     RekeyResultado::Hecho

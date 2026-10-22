@@ -330,6 +330,11 @@ fn collection_created_in(base: &std::path::Path, ahora: u64) -> u64 {
         let _ = std::fs::create_dir_all(parent);
         let _ = std::fs::set_permissions(parent, PermissionsExt::from_mode(0o700));
     }
+    // Con el reloj antes de 1970 `now()` da 0, que la próxima lectura rechaza:
+    // se devuelve sin escribir, y la marca queda para cuando el reloj ande.
+    if ahora == 0 {
+        return ahora;
+    }
     if let Err(e) = write_atomically(&sidecar, ahora.to_string().as_bytes()) {
         eprintln!(
             "vasak-keyring: no se pudo guardar el momento de creación en {}: {e}",
@@ -1250,7 +1255,13 @@ fn write_to(path: &std::path::Path, items: &[ItemInfo]) -> Result<(), String> {
 fn write_atomically(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
-    let temp = path.with_extension("tmp");
+    // Un temporal por archivo: `with_extension("tmp")` reemplaza lo que sigue al
+    // último punto, así que `keyring.db.created` y `keyring.db.machine` caían en
+    // el mismo `keyring.db.tmp` y dos escrituras a la vez se pisaban.
+    let temp = {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        path.with_file_name(format!("{}.tmp", name.as_deref().unwrap_or("keyring.db")))
+    };
 
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -7958,6 +7969,58 @@ pub(crate) mod tests {
             std::fs::metadata(&marca).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn las_marcas_de_al_lado_de_la_base_no_comparten_temporal() {
+        // `keyring.db.created` y `keyring.db.machine` caían en el mismo
+        // `keyring.db.tmp`: dos escrituras a la vez se pisaban y una marca
+        // quedaba con el contenido de la otra, o sin archivo.
+        let dir = DirDePrueba::nuevo("marcas-concurrentes");
+        let base = dir.ruta().join("keyring.db");
+        let created = created_sidecar_path(&base);
+        let machine = machine_sidecar_path(&base);
+        let barrera = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        for vuelta in 0..300 {
+            let (c, m) = (format!("{}", 1000 + vuelta), format!("maquina-{vuelta}"));
+            let escritor = |ruta: std::path::PathBuf, contenido: String| {
+                let barrera = barrera.clone();
+                std::thread::spawn(move || {
+                    barrera.wait();
+                    write_atomically(&ruta, contenido.as_bytes())
+                })
+            };
+            let a = escritor(created.clone(), c.clone());
+            let b = escritor(machine.clone(), m.clone());
+            a.join().unwrap().expect("la marca de created se escribe");
+            b.join()
+                .unwrap()
+                .expect("la marca de machine-id se escribe");
+
+            assert_eq!(
+                std::fs::read_to_string(&created).unwrap(),
+                c,
+                "vuelta {vuelta}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&machine).unwrap(),
+                m,
+                "vuelta {vuelta}"
+            );
+        }
+    }
+
+    #[test]
+    fn con_el_reloj_en_cero_no_se_escribe_una_marca_que_no_se_puede_leer() {
+        let dir = DirDePrueba::nuevo("created-reloj-en-cero");
+        let base = dir.ruta().join("keyring.db");
+
+        assert_eq!(collection_created_in(&base, 0), 0);
+        assert!(!created_sidecar_path(&base).exists());
+        // Y cuando el reloj anda, la marca se crea con el valor bueno.
+        assert_eq!(collection_created_in(&base, 5_000), 5_000);
+        assert_eq!(collection_created_in(&base, 9_000), 5_000);
     }
 
     #[test]

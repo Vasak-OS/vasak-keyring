@@ -10604,4 +10604,69 @@ pub(crate) mod tests {
             }
         }
     }
+
+    // vasak-keyring#59: borrar un ítem no puede dejar copias del secreto en disco.
+
+    /// Los archivos del directorio, por nombre y ordenados.
+    fn nombres_en(dir: &std::path::Path) -> Vec<String> {
+        let mut nombres: Vec<String> = std::fs::read_dir(dir)
+            .expect("no se pudo listar el directorio de la prueba")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        nombres.sort();
+        nombres
+    }
+
+    /// Sólo `keyring.db` y sus marcas conocidas: ni `.tmp`, ni `.bak`, ni
+    /// `.apartada-*`, que son los lugares donde podría quedar el secreto viejo.
+    fn assert_sin_copias(dir: &std::path::Path) {
+        let permitidos = ["keyring.db", "keyring.db.machine", "keyring.db.created"];
+        for nombre in nombres_en(dir) {
+            assert!(
+                permitidos.contains(&nombre.as_str()),
+                "{nombre} es una copia que no debería quedar en disco tras guardar"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn borrar_un_item_no_deja_copias_del_secreto_en_disco() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        set_master_password("la-de-la-prueba");
+        let dir = DirDePrueba::nuevo("no-remanencia");
+        let base = dir.ruta().join("keyring.db");
+        let secreto = b"secreto-que-debe-desaparecer";
+
+        write_to(&base, &[entrada(secreto), entrada(b"el-que-queda")])
+            .expect("con la sesión abierta se guarda");
+        // Borrar es guardar la colección sin el ítem.
+        write_to(&base, &[entrada(b"el-que-queda")]).expect("se guarda sin el ítem borrado");
+
+        assert_sin_copias(dir.ruta());
+        let db = crypto::decrypt_database(&std::fs::read(&base).unwrap(), "la-de-la-prueba")
+            .expect("la base tiene que abrir");
+        let secretos: Vec<Vec<u8>> = db.items.iter().map(|i| i.secret.clone()).collect();
+        assert_eq!(secretos, vec![b"el-que-queda".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn un_temporal_viejo_de_un_corte_no_sobrevive_a_la_siguiente_escritura() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _estado = EstadoDelLogin::limpio();
+        set_master_password("la-de-la-prueba");
+        let dir = DirDePrueba::nuevo("no-remanencia-tmp");
+        let base = dir.ruta().join("keyring.db");
+        // Lo que dejaría un corte entre escribir el temporal y renombrarlo.
+        std::fs::write(
+            dir.ruta().join("keyring.db.tmp"),
+            b"restos-con-el-secreto-viejo",
+        )
+        .unwrap();
+
+        write_to(&base, &[entrada(b"el-que-queda")]).expect("se guarda");
+
+        assert_sin_copias(dir.ruta());
+    }
 }

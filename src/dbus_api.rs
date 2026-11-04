@@ -10313,4 +10313,257 @@ pub(crate) mod tests {
 
         assert_eq!(marca_en_disco(), None);
     }
+
+    // ── La puerta se re-mira con el candado tomado, y lo protegido se esconde
+    //    (#56, #57) ──
+
+    /// El llavero de la prueba con el bus falso retenido: el sincronizador es
+    /// este mismo proceso y el bus no contesta hasta que se sueltan permisos.
+    async fn almacen_con_el_bus_retenido(compuerta: Arc<tokio::sync::Semaphore>) -> Almacen {
+        let esperado = ejecutable_propio();
+        let bus = BusFalso::nuevo(Some(DEL_SINCRONIZADOR), Some(std::process::id()))
+            .con_compuerta(compuerta);
+        let (demonio, cliente, preguntados, estado) =
+            llavero_con_item_protegido_y_bus(Some(bus), &esperado).await;
+        Almacen {
+            demonio,
+            cliente,
+            preguntados,
+            esperado,
+            estado,
+        }
+    }
+
+    /// Lanza `metodo` sobre el ítem del almacén como el sincronizador, y mientras
+    /// el demonio espera la respuesta del bus —ya decidió con la puerta vieja—
+    /// cambia el esquema del ítem a otro cuya puerta el sincronizador no pasa.
+    /// Si `cambiar` es falso no toca nada (el control).
+    async fn llamar_con_la_puerta_cambiada<B>(
+        almacen: &Almacen,
+        compuerta: &tokio::sync::Semaphore,
+        metodo: &str,
+        cuerpo: &B,
+        cambiar: bool,
+    ) -> zbus::Result<zbus::Message>
+    where
+        B: serde::Serialize + zbus::zvariant::DynamicType,
+    {
+        let llamada = almacen.llamar_como(DEL_SINCRONIZADOR, ITEM, IFACE_ITEM, metodo, cuerpo);
+        let carrera = async {
+            let n_previas = almacen.preguntados().await.len();
+            tokio::time::timeout(test_bus::ESPERA, async {
+                while almacen.preguntados().await.len() == n_previas {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("el demonio no le preguntó al bus por la puerta");
+            if cambiar {
+                almacen
+                    .estado
+                    .lock()
+                    .await
+                    .items
+                    .get_mut(ITEM)
+                    .expect("el ítem del almacén")
+                    .attributes
+                    .insert(ATRIBUTO_ESQUEMA.to_string(), ASSISTANT_SCHEMA.to_string());
+            }
+            compuerta.add_permits(100);
+        };
+        tokio::join!(llamada, carrera).0
+    }
+
+    /// #56: si entre el chequeo de la puerta y la escritura la puerta del ítem
+    /// pasó a una que lo autorizado no cubre, `SetSecret` falla cerrado y no
+    /// escribe. Sin la segunda mirada, escribía con la autorización vieja.
+    #[tokio::test]
+    async fn set_secret_no_escribe_si_la_puerta_cambio_antes_del_candado() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        la_base_es_la_de_las_pruebas();
+        let compuerta = Arc::new(tokio::sync::Semaphore::new(0));
+        let almacen = almacen_con_el_bus_retenido(Arc::clone(&compuerta)).await;
+
+        let error = llamar_con_la_puerta_cambiada(
+            &almacen,
+            &compuerta,
+            "SetSecret",
+            &(secreto("escrita con la puerta vieja"),),
+            true,
+        )
+        .await
+        .expect_err("la puerta cambió: no se escribe con la autorización vieja");
+
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.DBus.Error.AccessDenied"
+        );
+        assert_eq!(
+            almacen.estado.lock().await.items[ITEM].secret,
+            b"la clave del almacen",
+            "el secreto no puede haber cambiado"
+        );
+    }
+
+    /// #56, `Item.Delete`: lo mismo, y el ítem sigue en su colección.
+    #[tokio::test]
+    async fn item_delete_no_borra_si_la_puerta_cambio_antes_del_candado() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        la_base_es_la_de_las_pruebas();
+        let compuerta = Arc::new(tokio::sync::Semaphore::new(0));
+        let almacen = almacen_con_el_bus_retenido(Arc::clone(&compuerta)).await;
+
+        let error = llamar_con_la_puerta_cambiada(&almacen, &compuerta, "Delete", &(), true)
+            .await
+            .expect_err("la puerta cambió: no se borra con la autorización vieja");
+
+        assert_eq!(
+            nombre_del_error(&error),
+            "org.freedesktop.DBus.Error.AccessDenied"
+        );
+        let estado = almacen.estado.lock().await;
+        assert!(estado.items.contains_key(ITEM), "el ítem sigue existiendo");
+        assert!(estado.collections[COLECCION_DEL_LOGIN]
+            .items
+            .contains(&ITEM.to_string()));
+    }
+
+    /// Control de las dos de arriba: con el mismo montaje y la puerta sin
+    /// cambiar, el sincronizador sí escribe y sí borra. Sin esto, una segunda
+    /// mirada que negara siempre dejaría las pruebas rojas en verde.
+    #[tokio::test]
+    async fn con_la_puerta_sin_cambiar_el_sincronizador_escribe_y_borra() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let _abierta = sesion_abierta();
+        la_base_es_la_de_las_pruebas();
+        let compuerta = Arc::new(tokio::sync::Semaphore::new(0));
+        let almacen = almacen_con_el_bus_retenido(Arc::clone(&compuerta)).await;
+
+        llamar_con_la_puerta_cambiada(
+            &almacen,
+            &compuerta,
+            "SetSecret",
+            &(secreto("la nueva"),),
+            false,
+        )
+        .await
+        .expect("el sincronizador escribe su ítem");
+        assert_eq!(almacen.estado.lock().await.items[ITEM].secret, b"la nueva");
+
+        llamar_con_la_puerta_cambiada(&almacen, &compuerta, "Delete", &(), false)
+            .await
+            .expect("el sincronizador borra su ítem");
+        assert!(!almacen.estado.lock().await.items.contains_key(ITEM));
+    }
+
+    /// Las rutas de la propiedad `Items` de la colección, según quién pregunte
+    /// (`None`: un `Get` sin emisor).
+    async fn items_de_la_coleccion(almacen: &Almacen, emisor: Option<&str>) -> Vec<String> {
+        let cuerpo = (IFACE_COLECCION, "Items");
+        let respuesta = match emisor {
+            Some(emisor) => {
+                almacen
+                    .llamar_como(
+                        emisor,
+                        COLECCION_DEL_LOGIN,
+                        IFACE_PROPIEDADES,
+                        "Get",
+                        &cuerpo,
+                    )
+                    .await
+            }
+            None => {
+                llamar(
+                    &almacen.cliente,
+                    COLECCION_DEL_LOGIN,
+                    IFACE_PROPIEDADES,
+                    "Get",
+                    &cuerpo,
+                )
+                .await
+            }
+        }
+        .expect("Properties.Get de Items");
+        let valor: OwnedValue = respuesta.body().deserialize().expect("variante");
+        let rutas: Vec<OwnedObjectPath> = valor.try_into().expect("ao");
+        rutas.iter().map(|r| r.to_string()).collect()
+    }
+
+    /// #57: la propiedad `Items` no enumera lo protegido para quien no pasa la
+    /// puerta, ni sin emisor; al autorizado se lo muestra; el del portal, a nadie.
+    #[tokio::test]
+    async fn la_propiedad_items_esconde_los_protegidos() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        for (emisor, ve_el_almacen) in [
+            (Some(DE_UN_IMPOSTOR), false),
+            (None, false),
+            (Some(DEL_SINCRONIZADOR), true),
+        ] {
+            let rutas = items_de_la_coleccion(&almacen, emisor).await;
+            assert!(
+                rutas.iter().any(|r| r == ITEM_COMUN),
+                "{emisor:?}: {rutas:?}"
+            );
+            assert_eq!(
+                rutas.iter().any(|r| r == ITEM),
+                ve_el_almacen,
+                "Items para {emisor:?}: {rutas:?}"
+            );
+            assert!(!rutas.iter().any(|r| r == ITEM_DEL_PORTAL), "{emisor:?}");
+        }
+    }
+
+    /// #57: `Locked`, `Created` y `Modified` del ítem protegido se niegan a quien
+    /// no pasa la puerta sin nombrar el esquema; al autorizado y, en un ítem sin
+    /// puerta, a cualquiera, se le contestan.
+    #[tokio::test]
+    async fn locked_created_y_modified_siguen_la_puerta_del_item() {
+        let _sesion = estado_de_la_sesion().lock().await;
+        let almacen = Almacen::con_el_sincronizador_propio(Some(DEL_SINCRONIZADOR)).await;
+
+        for propiedad in ["Locked", "Created", "Modified"] {
+            let error = almacen
+                .llamar_como(
+                    DE_UN_IMPOSTOR,
+                    ITEM,
+                    IFACE_PROPIEDADES,
+                    "Get",
+                    &(IFACE_ITEM, propiedad),
+                )
+                .await
+                .expect_err("al impostor no se le dice nada del ítem protegido");
+            assert_eq!(
+                nombre_del_error(&error),
+                "org.freedesktop.DBus.Error.AccessDenied",
+                "{propiedad}"
+            );
+            if let zbus::Error::MethodError(_, Some(texto), _) = &error {
+                assert!(
+                    !texto.contains(ACCOUNTS_STORE_SCHEMA),
+                    "{propiedad}: el texto no nombra el esquema: {texto}"
+                );
+            }
+
+            for (emisor, item) in [
+                (DEL_SINCRONIZADOR, ITEM),
+                (DE_UN_IMPOSTOR, ITEM_COMUN),
+                (DEL_SINCRONIZADOR, ITEM_COMUN),
+            ] {
+                almacen
+                    .llamar_como(
+                        emisor,
+                        item,
+                        IFACE_PROPIEDADES,
+                        "Get",
+                        &(IFACE_ITEM, propiedad),
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("{propiedad} de {item} para {emisor}: {e}"));
+            }
+        }
+    }
 }

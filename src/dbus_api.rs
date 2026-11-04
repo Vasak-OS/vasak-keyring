@@ -4651,6 +4651,26 @@ pub(crate) mod tests {
         }
     }
 
+    /// Regresión de #64: sin la entrada en `PROTECTED_SCHEMAS`, la clave privada
+    /// OpenPGP (y su passphrase) no tenía puerta y la leía cualquier proceso.
+    #[test]
+    fn la_clave_pgp_solo_la_lee_el_sincronizador() {
+        let item = ItemInfo {
+            attributes: HashMap::from([(ATRIBUTO_ESQUEMA.to_string(), PGP_SCHEMA.to_string())]),
+            ..entrada(b"la clave privada pgp")
+        };
+
+        assert!(
+            item_guard(&item).is_some(),
+            "el esquema PgpKey tiene que contar como protegido"
+        );
+        assert!(
+            !access_allowed(&item, &[]),
+            "un proceso que no es el sincronizador no puede leer la clave PGP"
+        );
+        assert!(access_allowed(&item, &[ACCOUNTS_SYNC_GUARD]));
+    }
+
     /// Un ítem sin `xdg:schema` tampoco es un problema, y esto importa porque es
     /// lo que tiene la mayoría: el `CreateItem` de cualquier aplicación trae lo
     /// que la aplicación quiera, y la mayoría no trae nada.
@@ -9466,7 +9486,12 @@ pub(crate) mod tests {
             ASSISTANT_SCHEMA => DEL_ASISTENTE,
             _ => DEL_SINCRONIZADOR,
         };
-        for esquema in [ACCOUNTS_STORE_SCHEMA, SMIME_SCHEMA, ASSISTANT_SCHEMA] {
+        for esquema in [
+            ACCOUNTS_STORE_SCHEMA,
+            SMIME_SCHEMA,
+            PGP_SCHEMA,
+            ASSISTANT_SCHEMA,
+        ] {
             for emisor in EMISORES {
                 for replace in [true, false] {
                     let error = almacen

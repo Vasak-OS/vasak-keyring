@@ -1477,12 +1477,18 @@ impl ItemInterface {
             .ok_or_else(|| dbus_err("item not found"))
     }
 
+    /// El estado de bloqueo. Un ítem protegido (y el del portal) no se lo dice a
+    /// quien no pasa su puerta: `Locked`/`Created`/`Modified` eran el otro camino
+    /// para saber que existe y cuándo cambió (#57). `check_describe` deja pasar a
+    /// los ítems sin puerta —los del navegador los lee cualquiera, como pide la
+    /// especificación— y usa un texto que no nombra el esquema.
     #[zbus(property)]
-    async fn locked(&self) -> Result<bool, zbus::fdo::Error> {
+    async fn locked(
+        &self,
+        #[zbus(header)] cabecera: Option<zbus::message::Header<'_>>,
+    ) -> Result<bool, zbus::fdo::Error> {
+        self.check_describe(cabecera.as_ref()).await?;
         let state = self.state.lock().await;
-        if state.items.get(&self.path).is_some_and(is_portal_item) {
-            return Err(portal_denied());
-        }
         for col in state.collections.values() {
             if col.items.contains(&self.path) {
                 return Ok(effectively_locked(col.locked));
@@ -1492,29 +1498,33 @@ impl ItemInterface {
     }
 
     #[zbus(property)]
-    async fn created(&self) -> Result<u64, zbus::fdo::Error> {
-        let state = self.state.lock().await;
-        let item = state
+    async fn created(
+        &self,
+        #[zbus(header)] cabecera: Option<zbus::message::Header<'_>>,
+    ) -> Result<u64, zbus::fdo::Error> {
+        self.check_describe(cabecera.as_ref()).await?;
+        self.state
+            .lock()
+            .await
             .items
             .get(&self.path)
-            .ok_or_else(|| dbus_err("item not found"))?;
-        if is_portal_item(item) {
-            return Err(portal_denied());
-        }
-        Ok(item.created)
+            .map(|i| i.created)
+            .ok_or_else(|| dbus_err("item not found"))
     }
 
     #[zbus(property)]
-    async fn modified(&self) -> Result<u64, zbus::fdo::Error> {
-        let state = self.state.lock().await;
-        let item = state
+    async fn modified(
+        &self,
+        #[zbus(header)] cabecera: Option<zbus::message::Header<'_>>,
+    ) -> Result<u64, zbus::fdo::Error> {
+        self.check_describe(cabecera.as_ref()).await?;
+        self.state
+            .lock()
+            .await
             .items
             .get(&self.path)
-            .ok_or_else(|| dbus_err("item not found"))?;
-        if is_portal_item(item) {
-            return Err(portal_denied());
-        }
-        Ok(item.modified)
+            .map(|i| i.modified)
+            .ok_or_else(|| dbus_err("item not found"))
     }
 
     /// Returns the secret as a single struct argument.
@@ -1604,13 +1614,29 @@ impl ItemInterface {
             return Err(SecretError::AccessDenied);
         }
         let guard = path_guard(&self.state, &self.path).await;
-        if !passes_guards(&self.conn, &cabecera, &self.state, guard.as_slice()).await {
+        let autorizadas =
+            authorized_guards(&self.conn, &cabecera, &self.state, guard.as_slice()).await;
+        if guard.as_slice().iter().any(|g| !autorizadas.contains(g)) {
             return Err(SecretError::AccessDenied);
         }
         escritura_bloqueada()?;
 
         let col_path = {
             let mut state = self.state.lock().await;
+
+            // Segunda mirada, con el candado tomado (#56): la puerta del ítem que
+            // está ahora tiene que seguir cubierta por lo que se autorizó. Hoy la
+            // puerta no cambia entre las dos tomas del lock —`Attributes` no tiene
+            // setter y las rutas no se reusan—, pero el día que lo tenga, esto es
+            // lo que evita escribir con una autorización vieja. Falla cerrado,
+            // igual que `get_secret`.
+            match state.items.get(&self.path) {
+                Some(item) if !access_allowed(item, &autorizadas) => {
+                    return Err(SecretError::AccessDenied)
+                }
+                None => return Err(dbus_err("item not found").into()),
+                _ => {}
+            }
 
             let plaintext = state
                 .sessions
@@ -1652,7 +1678,9 @@ impl ItemInterface {
             return Err(portal_denied());
         }
         let guard = path_guard(&self.state, &self.path).await;
-        if !passes_guards(&self.conn, &cabecera, &self.state, guard.as_slice()).await {
+        let autorizadas =
+            authorized_guards(&self.conn, &cabecera, &self.state, guard.as_slice()).await;
+        if guard.as_slice().iter().any(|g| !autorizadas.contains(g)) {
             return Err(zbus::fdo::Error::AccessDenied(
                 "el ítem pertenece a un esquema protegido".into(),
             ));
@@ -1660,6 +1688,16 @@ impl ItemInterface {
 
         let col_path = {
             let mut state = self.state.lock().await;
+            // Segunda mirada con el candado tomado (#56): si la puerta del ítem
+            // cambió entre el chequeo y acá y ya no está cubierta, no se borra.
+            // Un ítem que no existe se borra igual (no-op), como antes.
+            if let Some(item) = state.items.get(&self.path) {
+                if !access_allowed(item, &autorizadas) {
+                    return Err(zbus::fdo::Error::AccessDenied(
+                        "el ítem pertenece a un esquema protegido".into(),
+                    ));
+                }
+            }
             state.items.remove(&self.path);
             let mut owner = None;
             for (cp, col) in state.collections.iter_mut() {
@@ -1788,20 +1826,45 @@ impl CollectionInterface {
     }
 
     /// Los ítems de la colección, sin los secretos del portal: para el bus no
-    /// existen (#33).
+    /// existen (#33). Y los de un esquema protegido aparecen sólo para quien
+    /// pasa su puerta, igual que en `SearchItems`: la propiedad `Items` era el
+    /// otro camino que los enumeraba para cualquiera (#57). Sin cabecera —un
+    /// `Get` desde adentro del propio demonio— no se pasa ninguna puerta, así que
+    /// los protegidos no se listan: falla cerrado.
     #[zbus(property)]
-    async fn items(&self) -> Vec<OwnedObjectPath> {
-        let state = self.state.lock().await;
-        state
-            .collections
-            .get(&self.path)
-            .map(|c| {
-                published_paths(&state, &c.items)
-                    .iter()
-                    .filter_map(|ip| owned_path_try(ip).ok())
-                    .collect()
-            })
-            .unwrap_or_default()
+    async fn items(
+        &self,
+        #[zbus(header)] cabecera: Option<zbus::message::Header<'_>>,
+    ) -> Vec<OwnedObjectPath> {
+        let encontrados: Vec<(String, Option<SchemaGuard>)> = {
+            let state = self.state.lock().await;
+            state
+                .collections
+                .get(&self.path)
+                .map(|col| {
+                    col.items
+                        .iter()
+                        .filter_map(|ip| {
+                            let item = state.items.get(ip)?;
+                            if is_portal_item(item) {
+                                return None;
+                            }
+                            Some((ip.clone(), item_guard(item)))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let guards: Vec<SchemaGuard> = encontrados.iter().filter_map(|(_, g)| *g).collect();
+        let autorizadas = match &cabecera {
+            Some(cabecera) => authorized_guards(&self.conn, cabecera, &self.state, &guards).await,
+            None => Vec::new(),
+        };
+        encontrados
+            .into_iter()
+            .filter(|(_, guard)| guard.is_none_or(|g| autorizadas.contains(&g)))
+            .filter_map(|(ip, _)| owned_path_try(&ip).ok())
+            .collect()
     }
 
     // Per the Secret Service spec, Collection.SearchItems returns a single

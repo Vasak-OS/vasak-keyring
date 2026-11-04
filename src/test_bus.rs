@@ -44,6 +44,10 @@ pub struct BusFalso {
     /// Dueño distinto por nombre, para las pruebas con más de una puerta. Un
     /// nombre que no está acá cae en `duenia`.
     por_nombre: std::collections::HashMap<String, String>,
+    /// Si está, `GetNameOwner` no contesta hasta tener un permiso: deja a la
+    /// prueba cambiar el estado del demonio entre el chequeo de la puerta y la
+    /// escritura, que es la carrera de vasak-keyring#56.
+    compuerta: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl BusFalso {
@@ -53,7 +57,14 @@ impl BusFalso {
             pid,
             preguntados: Arc::new(Mutex::new(Vec::new())),
             por_nombre: std::collections::HashMap::new(),
+            compuerta: None,
         }
+    }
+
+    /// El bus contesta `GetNameOwner` sólo cuando la prueba suelta permisos.
+    pub fn con_compuerta(mut self, compuerta: Arc<tokio::sync::Semaphore>) -> Self {
+        self.compuerta = Some(compuerta);
+        self
     }
 
     /// Un bus donde cada nombre tiene su dueño y los demás no tienen ninguno.
@@ -78,6 +89,13 @@ impl BusFalso {
     #[zbus(name = "GetNameOwner")]
     async fn duenia_de(&self, nombre: &str) -> Result<String, zbus::fdo::Error> {
         self.preguntados.lock().await.push(nombre.to_owned());
+        if let Some(compuerta) = &self.compuerta {
+            compuerta
+                .acquire()
+                .await
+                .expect("la compuerta del bus falso no se cierra")
+                .forget();
+        }
         match self.por_nombre.get(nombre).or(self.duenia.as_ref()) {
             Some(duenia) => Ok(duenia.clone()),
             // El error con el que un bus de verdad contesta que nadie tiene el

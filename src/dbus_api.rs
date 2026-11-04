@@ -10606,27 +10606,29 @@ pub(crate) mod tests {
     }
 
     // vasak-keyring#59: borrar un ítem no puede dejar copias del secreto en disco.
+    //
+    // Pasan por el guardado real (`ItemInterface::persist_all`, el de `SetSecret`
+    // y `Delete`) sobre la base de las pruebas, que es un directorio del proceso.
 
-    /// Los archivos del directorio, por nombre y ordenados.
-    fn nombres_en(dir: &std::path::Path) -> Vec<String> {
-        let mut nombres: Vec<String> = std::fs::read_dir(dir)
-            .expect("no se pudo listar el directorio de la prueba")
+    /// Las copias que podrían guardar el secreto viejo: `.tmp`, `.bak` y las
+    /// `.apartada-*`, al lado de la base de las pruebas.
+    fn copias_junto_a_la_base() -> Vec<std::path::PathBuf> {
+        let dir = base_de_las_pruebas().parent().unwrap().to_path_buf();
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
             .filter_map(Result::ok)
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        nombres.sort();
-        nombres
+            .map(|e| e.path())
+            .filter(|p| {
+                let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                n.ends_with(".tmp") || n.ends_with(".bak") || n.contains(".apartada-")
+            })
+            .collect()
     }
 
-    /// Sólo `keyring.db` y sus marcas conocidas: ni `.tmp`, ni `.bak`, ni
-    /// `.apartada-*`, que son los lugares donde podría quedar el secreto viejo.
-    fn assert_sin_copias(dir: &std::path::Path) {
-        let permitidos = ["keyring.db", "keyring.db.machine", "keyring.db.created"];
-        for nombre in nombres_en(dir) {
-            assert!(
-                permitidos.contains(&nombre.as_str()),
-                "{nombre} es una copia que no debería quedar en disco tras guardar"
-            );
+    fn quitar_copias_junto_a_la_base() {
+        for p in copias_junto_a_la_base() {
+            let _ = std::fs::remove_file(p);
         }
     }
 
@@ -10634,19 +10636,31 @@ pub(crate) mod tests {
     async fn borrar_un_item_no_deja_copias_del_secreto_en_disco() {
         let _sesion = estado_de_la_sesion().lock().await;
         let _estado = EstadoDelLogin::limpio();
-        set_master_password("la-de-la-prueba");
-        let dir = DirDePrueba::nuevo("no-remanencia");
-        let base = dir.ruta().join("keyring.db");
-        let secreto = b"secreto-que-debe-desaparecer";
+        quitar_copias_junto_a_la_base();
+        let (_desbloqueo, estado, demonio, _cliente) = llavero_abierto_sin_base().await;
+        let item = ItemInterface {
+            state: Arc::clone(&estado),
+            conn: demonio.clone(),
+            path: "/prueba/items/1".into(),
+        };
+        agregar(&estado, "/prueba/items/1", b"secreto-que-debe-desaparecer").await;
+        agregar(&estado, "/prueba/items/2", b"el-que-queda").await;
+        item.persist_all().await.expect("se guarda con los dos");
 
-        write_to(&base, &[entrada(secreto), entrada(b"el-que-queda")])
-            .expect("con la sesión abierta se guarda");
-        // Borrar es guardar la colección sin el ítem.
-        write_to(&base, &[entrada(b"el-que-queda")]).expect("se guarda sin el ítem borrado");
+        // Borrar es sacar el ítem del estado y guardar.
+        estado.lock().await.items.remove("/prueba/items/1");
+        item.persist_all().await.expect("se guarda sin el borrado");
 
-        assert_sin_copias(dir.ruta());
-        let db = crypto::decrypt_database(&std::fs::read(&base).unwrap(), "la-de-la-prueba")
-            .expect("la base tiene que abrir");
+        assert_eq!(copias_junto_a_la_base(), Vec::<std::path::PathBuf>::new());
+        let crudo = std::fs::read(base_de_las_pruebas()).unwrap();
+        assert!(
+            !crudo
+                .windows(28)
+                .any(|w| w == b"secreto-que-debe-desaparecer"),
+            "el secreto viejo no puede quedar en claro"
+        );
+        let maestra = master_password().expect("el llavero está abierto");
+        let db = crypto::decrypt_database(&crudo, maestra.as_str()).expect("la base abre");
         let secretos: Vec<Vec<u8>> = db.items.iter().map(|i| i.secret.clone()).collect();
         assert_eq!(secretos, vec![b"el-que-queda".to_vec()]);
     }
@@ -10655,18 +10669,20 @@ pub(crate) mod tests {
     async fn un_temporal_viejo_de_un_corte_no_sobrevive_a_la_siguiente_escritura() {
         let _sesion = estado_de_la_sesion().lock().await;
         let _estado = EstadoDelLogin::limpio();
-        set_master_password("la-de-la-prueba");
-        let dir = DirDePrueba::nuevo("no-remanencia-tmp");
-        let base = dir.ruta().join("keyring.db");
+        quitar_copias_junto_a_la_base();
+        let (_desbloqueo, estado, demonio, _cliente) = llavero_abierto_sin_base().await;
+        let item = ItemInterface {
+            state: Arc::clone(&estado),
+            conn: demonio.clone(),
+            path: "/prueba/items/1".into(),
+        };
+        agregar(&estado, "/prueba/items/1", b"el-que-queda").await;
         // Lo que dejaría un corte entre escribir el temporal y renombrarlo.
-        std::fs::write(
-            dir.ruta().join("keyring.db.tmp"),
-            b"restos-con-el-secreto-viejo",
-        )
-        .unwrap();
+        let tmp = base_de_las_pruebas().with_file_name("keyring.db.tmp");
+        std::fs::write(&tmp, b"restos-con-el-secreto-viejo").unwrap();
 
-        write_to(&base, &[entrada(b"el-que-queda")]).expect("se guarda");
+        item.persist_all().await.expect("se guarda");
 
-        assert_sin_copias(dir.ruta());
+        assert_eq!(copias_junto_a_la_base(), Vec::<std::path::PathBuf>::new());
     }
 }

@@ -615,6 +615,18 @@ const ACCOUNTS_STORE_SCHEMA: &str = "ar.net.vasak.os.AccountsStore";
 /// Ver `vasak-mail#78`.
 const SMIME_SCHEMA: &str = "ar.net.vasak.os.SmimeKey";
 
+/// El esquema que protege la clave privada OpenPGP de una identidad (y su
+/// passphrase: dos ítems por cuenta, `secret-key` y `passphrase`).
+///
+/// Misma puerta que [`SMIME_SCHEMA`] —sólo el sincronizador, por nombre de bus y
+/// ejecutable—, pero esquema propio, por lo mismo que S/MIME: es material
+/// distinto y se enumera o retiene aparte. El material y la cripto OpenPGP viven
+/// en `vasak-accounts-sync` (`sync/src/store/pgp_key.rs`), no acá. Es la
+/// precondición de llavero de vasak-accounts#21 PR5: ninguna clave privada
+/// OpenPGP real se guarda antes de que esta puerta exista. Ver
+/// `Vasak-OS/vasak-keyring#64`.
+const PGP_SCHEMA: &str = "ar.net.vasak.os.PgpKey";
+
 /// El esquema de los secretos de vasak-assistant (Lince).
 ///
 /// Cubre la clave del proveedor de modelo (`purpose=provider`, buscada también
@@ -670,6 +682,7 @@ const ASSISTANT_GUARD: SchemaGuard = SchemaGuard {
 const PROTECTED_SCHEMAS: &[(&str, SchemaGuard)] = &[
     (ACCOUNTS_STORE_SCHEMA, ACCOUNTS_SYNC_GUARD),
     (SMIME_SCHEMA, ACCOUNTS_SYNC_GUARD),
+    (PGP_SCHEMA, ACCOUNTS_SYNC_GUARD),
     (ASSISTANT_SCHEMA, ASSISTANT_GUARD),
 ];
 

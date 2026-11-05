@@ -10612,13 +10612,19 @@ pub(crate) mod tests {
 
     /// Las copias que podrían guardar el secreto viejo: `.tmp`, `.bak` y las
     /// `.apartada-*`, al lado de la base de las pruebas.
+    /// Falla cerrado: un `read_dir` que no se puede leer, o una entrada ilegible,
+    /// cortan la prueba en vez de contarse como «no hay copias» —tragarse el error
+    /// dejaría el guard dando un PASS falso—. El dir existe siempre que esto corre
+    /// después de guardar; el caso del dir inexistente lo trata la limpieza inicial.
     fn copias_junto_a_la_base() -> Vec<std::path::PathBuf> {
         let dir = base_de_las_pruebas().parent().unwrap().to_path_buf();
-        std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .map(|e| e.path())
+        std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("no se pudo leer {}: {e}", dir.display()))
+            .map(|entrada| {
+                entrada
+                    .expect("una entrada del directorio de la prueba no se pudo leer")
+                    .path()
+            })
             .filter(|p| {
                 let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 n.ends_with(".tmp") || n.ends_with(".bak") || n.contains(".apartada-")
@@ -10627,6 +10633,12 @@ pub(crate) mod tests {
     }
 
     fn quitar_copias_junto_a_la_base() {
+        // En la limpieza inicial el directorio puede no existir todavía: eso no es
+        // un fallo, a diferencia de un `read_dir` que falla con el dir presente.
+        let dir = base_de_las_pruebas().parent().unwrap().to_path_buf();
+        if !dir.exists() {
+            return;
+        }
         for p in copias_junto_a_la_base() {
             let _ = std::fs::remove_file(p);
         }
